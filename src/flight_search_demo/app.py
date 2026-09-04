@@ -9,7 +9,7 @@ import re
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Mapping, Protocol
+from typing import Any, Callable, Dict, List, Mapping, Protocol
 
 SUPPORTED_CABINS = {
     "economy": "Economy",
@@ -32,11 +32,118 @@ class NormalizedCriteria:
     maximum_points: int
 
 
+@dataclass(frozen=True)
+class ParsedNaturalLanguageRequest:
+    program: str
+    origin: str
+    destination: str
+    departure_date: str
+    cabin: str
+    adults: int
+    trip_type: str
+    maximum_points: int
+
+
+@dataclass(frozen=True)
+class RequestParseResult:
+    requests: List[ParsedNaturalLanguageRequest]
+    clarification: str | None = None
+    unsupported_reason: str | None = None
+    diagnostics: Dict[str, Any] | None = None
+
+
+class ParserFailure(RuntimeError):
+    def __init__(self, message: str, *, diagnostics: Dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.diagnostics = diagnostics or {}
+
+
 class AwardProviderAdapter(Protocol):
     def execute(
         self, criteria: NormalizedCriteria, atomic_task_id: str
     ) -> Dict[str, str]:
         ...
+
+
+class RequestParser(Protocol):
+    def parse(
+        self,
+        *,
+        request_id: str,
+        original_text: str,
+        current_date: date,
+        timezone_name: str,
+    ) -> RequestParseResult:
+        ...
+
+
+class GoogleGenAIRequestParser:
+    def __init__(self, *, client: Any, model: str) -> None:
+        self._client = client
+        self._model = model
+
+    def parse(
+        self,
+        *,
+        request_id: str,
+        original_text: str,
+        current_date: date,
+        timezone_name: str,
+    ) -> RequestParseResult:
+        prompt = (
+            "Parse this award-search request into JSON. "
+            "If the request is ambiguous, missing required fields, uses a city alias, or uses an ambiguous numeric date, "
+            "return clarification or unsupported_reason instead of inventing values. "
+            "Resolve relative dates using the provided timezone and return absolute YYYY-MM-DD dates.\n"
+            f"request_id: {request_id}\n"
+            f"current_date: {current_date.isoformat()}\n"
+            f"timezone: {timezone_name}\n"
+            f"request: {original_text}\n"
+        )
+        try:
+            interaction = self._client.interactions.create(
+                model=self._model,
+                input=prompt,
+                response_format={
+                    "type": "text",
+                    "mime_type": "application/json",
+                    "schema": natural_language_parse_schema(),
+                },
+            )
+            payload = json.loads(interaction.output_text)
+        except Exception as exc:
+            raise ParserFailure(
+                str(exc),
+                diagnostics={"provider": "google_genai", "model": self._model},
+            ) from exc
+
+        try:
+            requests = [
+                ParsedNaturalLanguageRequest(
+                    program=str(item["program"]).strip().lower(),
+                    origin=str(item["origin"]).strip().upper(),
+                    destination=str(item["destination"]).strip().upper(),
+                    departure_date=str(item["departure_date"]).strip(),
+                    cabin=str(item["cabin"]).strip(),
+                    adults=int(item["adults"]),
+                    trip_type=str(item["trip_type"]).strip().lower(),
+                    maximum_points=int(item["maximum_points"]),
+                )
+                for item in payload.get("requests", [])
+            ]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ParserFailure(
+                "parser returned invalid structured data",
+                diagnostics={"provider": "google_genai", "model": self._model},
+            ) from exc
+
+        diagnostics = {"provider": "google_genai", "model": self._model}
+        return RequestParseResult(
+            requests=requests,
+            clarification=payload.get("clarification"),
+            unsupported_reason=payload.get("unsupported_reason"),
+            diagnostics=diagnostics,
+        )
 
 
 class AeroplanFixtureAdapter:
@@ -64,8 +171,19 @@ class AeroplanFixtureAdapter:
         }
 
 
+class AnaFixtureAdapter:
+    def execute(
+        self, criteria: NormalizedCriteria, atomic_task_id: str
+    ) -> Dict[str, str]:
+        return {
+            "status": "NO_AWARD_AVAILABILITY",
+            "detail": f"fixture found no qualifying itinerary via {atomic_task_id}",
+        }
+
+
 DEFAULT_ADAPTER_REGISTRY: Mapping[str, AwardProviderAdapter] = {
     "aeroplan": AeroplanFixtureAdapter(),
+    "ana": AnaFixtureAdapter(),
 }
 
 
@@ -81,6 +199,127 @@ def build_request_hash(
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def build_request_from_parsed_natural_language(
+    request_id: str,
+    original_text: str,
+    parsed_request: ParsedNaturalLanguageRequest,
+) -> Dict[str, Any]:
+    return {
+        "request_id": request_id,
+        "original_text": original_text,
+        "program": parsed_request.program,
+        "origin": parsed_request.origin,
+        "destination": parsed_request.destination,
+        "departure_date": parsed_request.departure_date,
+        "cabin": parsed_request.cabin,
+        "adults": parsed_request.adults,
+        "trip_type": parsed_request.trip_type,
+        "maximum_points": parsed_request.maximum_points,
+    }
+
+
+def build_request_set_hash(
+    request_id: str,
+    original_text: str,
+    criteria_set: List[NormalizedCriteria],
+) -> str:
+    payload = {
+        "request_id": request_id,
+        "original_text": original_text.strip(),
+        "criteria_set": [
+            asdict(criteria)
+            for criteria in sorted(criteria_set, key=lambda item: item.program)
+        ],
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def natural_language_parse_schema() -> Dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "requests": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "program": {"type": "string"},
+                        "origin": {"type": "string"},
+                        "destination": {"type": "string"},
+                        "departure_date": {"type": "string"},
+                        "cabin": {"type": "string"},
+                        "adults": {"type": "integer"},
+                        "trip_type": {"type": "string"},
+                        "maximum_points": {"type": "integer"},
+                    },
+                    "required": [
+                        "program",
+                        "origin",
+                        "destination",
+                        "departure_date",
+                        "cabin",
+                        "adults",
+                        "trip_type",
+                        "maximum_points",
+                    ],
+                },
+            },
+            "clarification": {"type": "string"},
+            "unsupported_reason": {"type": "string"},
+        },
+        "required": ["requests"],
+    }
+
+
+def build_confirmation_request(
+    *,
+    request: Dict[str, Any],
+    parsed_requests: List[ParsedNaturalLanguageRequest],
+) -> Dict[str, Any]:
+    request_id = str(request.get("request_id", "")).strip()
+    original_text = str(request.get("original_text", "")).strip()
+    criteria_set = [
+        normalize_request(
+            build_request_from_parsed_natural_language(
+                request_id,
+                original_text,
+                parsed_request,
+            )
+        )
+        for parsed_request in parsed_requests
+    ]
+    return {
+        "request_id": request_id,
+        "request_hash": build_request_set_hash(request_id, original_text, criteria_set),
+        "confirmed": True,
+    }
+
+
+def execute_confirmed_request(
+    *,
+    request_id: str,
+    original_text: str,
+    criteria: NormalizedCriteria,
+    event_log_path: Path,
+    adapter_registry: Mapping[str, AwardProviderAdapter],
+    clock: Callable[[], datetime] | None = None,
+) -> Dict[str, Any]:
+    request_hash = build_request_hash(request_id, original_text, criteria)
+    atomic_task_id = f"{criteria.program}-{request_hash[:12]}"
+    result = adapter_registry[criteria.program].execute(criteria, atomic_task_id)
+    return emit_event(
+        event_log_path=event_log_path,
+        request_id=request_id,
+        original_text=original_text,
+        atomic_task_id=atomic_task_id,
+        normalized_criteria=asdict(criteria),
+        status=result["status"],
+        detail=result["detail"],
+        clock=clock,
+    )
 
 
 def run_structured_request(
@@ -126,18 +365,166 @@ def run_structured_request(
             clock=clock,
         )
 
-    atomic_task_id = f"{criteria.program}-{request_hash[:12]}"
-    result = adapter_registry[criteria.program].execute(criteria, atomic_task_id)
-    return emit_event(
-        event_log_path=event_log_path,
+    return execute_confirmed_request(
         request_id=request_id,
         original_text=original_text,
-        atomic_task_id=atomic_task_id,
-        normalized_criteria=asdict(criteria),
-        status=result["status"],
-        detail=result["detail"],
+        criteria=criteria,
+        event_log_path=event_log_path,
+        adapter_registry=adapter_registry,
         clock=clock,
     )
+
+
+def run_request(
+    *,
+    request: Dict[str, Any],
+    confirmation: Dict[str, Any],
+    event_log_path: Path,
+    parser: RequestParser | None = None,
+    adapter_registry: Mapping[str, AwardProviderAdapter] = DEFAULT_ADAPTER_REGISTRY,
+    current_date: date | None = None,
+    timezone_name: str = "UTC",
+    clock: Callable[[], datetime] | None = None,
+) -> List[Dict[str, Any]]:
+    if "program" in request:
+        return [
+            run_structured_request(
+                request=request,
+                confirmation=confirmation,
+                event_log_path=event_log_path,
+                adapter_registry=adapter_registry,
+                current_date=current_date,
+                clock=clock,
+            )
+        ]
+
+    request_id = str(request.get("request_id", "")).strip()
+    original_text = str(request.get("original_text", "")).strip()
+    if parser is None:
+        raise ValueError("parser is required for natural-language requests")
+    try:
+        parse_result = parser.parse(
+            request_id=request_id,
+            original_text=original_text,
+            current_date=current_date or date.today(),
+            timezone_name=timezone_name,
+        )
+    except ParserFailure as exc:
+        return [
+            emit_event(
+                event_log_path=event_log_path,
+                request_id=request_id,
+                original_text=original_text,
+                atomic_task_id=None,
+                normalized_criteria=None,
+                status="PARSER_FAILED",
+                detail=str(exc),
+                clock=clock,
+                extra_fields={"diagnostic_metadata": exc.diagnostics},
+            )
+        ]
+    except Exception as exc:
+        return [
+            emit_event(
+                event_log_path=event_log_path,
+                request_id=request_id,
+                original_text=original_text,
+                atomic_task_id=None,
+                normalized_criteria=None,
+                status="PARSER_FAILED",
+                detail=str(exc),
+                clock=clock,
+                extra_fields={"diagnostic_metadata": {"parser_exception": type(exc).__name__}},
+            )
+        ]
+    if parse_result.unsupported_reason is not None:
+        return [
+            emit_event(
+                event_log_path=event_log_path,
+                request_id=request_id,
+                original_text=original_text,
+                atomic_task_id=None,
+                normalized_criteria=None,
+                status="UNSUPPORTED_REQUEST",
+                detail=parse_result.unsupported_reason,
+                clock=clock,
+                extra_fields={"diagnostic_metadata": parse_result.diagnostics or {}},
+            )
+        ]
+    if parse_result.clarification is not None:
+        return [
+            emit_event(
+                event_log_path=event_log_path,
+                request_id=request_id,
+                original_text=original_text,
+                atomic_task_id=None,
+                normalized_criteria=None,
+                status="CLARIFICATION_REQUIRED",
+                detail=parse_result.clarification,
+                clock=clock,
+                extra_fields={"diagnostic_metadata": parse_result.diagnostics or {}},
+            )
+        ]
+    if not parse_result.requests:
+        return [
+            emit_event(
+                event_log_path=event_log_path,
+                request_id=request_id,
+                original_text=original_text,
+                atomic_task_id=None,
+                normalized_criteria=None,
+                status="PARSER_FAILED",
+                detail="parser returned no executable request",
+                clock=clock,
+                extra_fields={"diagnostic_metadata": parse_result.diagnostics or {}},
+            )
+        ]
+
+    structured_requests = [
+        build_request_from_parsed_natural_language(request_id, original_text, parsed_request)
+        for parsed_request in parse_result.requests
+    ]
+    normalized_requests = [
+        normalize_request(
+            structured_request,
+            current_date=current_date,
+            adapter_registry=adapter_registry,
+        )
+        for structured_request in structured_requests
+    ]
+    request_hash = build_request_set_hash(request_id, original_text, normalized_requests)
+    confirmation_error = validate_confirmation(confirmation, request_id, request_hash)
+    if confirmation_error is not None:
+        normalized_criteria_set = [asdict(criteria) for criteria in normalized_requests]
+        return [
+            emit_event(
+                event_log_path=event_log_path,
+                request_id=request_id,
+                original_text=original_text,
+                atomic_task_id=None,
+                normalized_criteria=normalized_criteria_set[0] if len(normalized_criteria_set) == 1 else None,
+                status="CONFIRMATION_REQUIRED",
+                detail=confirmation_error,
+                clock=clock,
+                extra_fields={
+                    "request_hash": request_hash,
+                    "normalized_criteria_set": normalized_criteria_set,
+                    "diagnostic_metadata": parse_result.diagnostics or {},
+                },
+            )
+        ]
+
+    return [
+        execute_confirmed_request(
+            request_id=request_id,
+            original_text=original_text,
+            criteria=criteria,
+            event_log_path=event_log_path,
+            adapter_registry=adapter_registry,
+            clock=clock,
+        )
+        for criteria in normalized_requests
+    ]
 
 
 def normalize_request(
@@ -239,6 +626,7 @@ def emit_event(
     status: str,
     detail: str,
     clock: Callable[[], datetime] | None = None,
+    extra_fields: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     now = clock() if clock is not None else datetime.now(timezone.utc)
     if now.tzinfo is None:
@@ -255,6 +643,8 @@ def emit_event(
     }
     if normalized_criteria is not None:
         event["program"] = normalized_criteria["program"]
+    if extra_fields:
+        event.update(extra_fields)
 
     append_event(event_log_path, event)
 
@@ -303,8 +693,19 @@ def render_terminal_report(event: Dict[str, Any]) -> str:
     )
 
 
+def build_default_request_parser(model: str | None = None) -> GoogleGenAIRequestParser:
+    try:
+        from google import genai
+    except ImportError as exc:
+        raise RuntimeError("google-genai is required for natural-language requests") from exc
+    return GoogleGenAIRequestParser(
+        client=genai.Client(),
+        model=model or os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"),
+    )
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run a confirmed structured award request.")
+    parser = argparse.ArgumentParser(description="Run a confirmed award request.")
     parser.add_argument("--request", required=True, help="Path to the structured JSON request file.")
     parser.add_argument("--confirmation", required=True, help="Path to the structured JSON confirmation file.")
     parser.add_argument("--event-log", required=True, help="Path to the append-only JSONL event log.")
@@ -312,6 +713,11 @@ def parse_args() -> argparse.Namespace:
         "--current-date",
         type=date.fromisoformat,
         help="Override today's date for deterministic fixture/demo runs (YYYY-MM-DD).",
+    )
+    parser.add_argument(
+        "--timezone",
+        default=os.environ.get("REQUEST_TIMEZONE", "UTC"),
+        help="IANA timezone used to resolve relative natural-language dates.",
     )
     return parser.parse_args()
 
@@ -322,13 +728,16 @@ def load_json(path: str) -> Dict[str, Any]:
 
 def main() -> int:
     args = parse_args()
-    event = run_structured_request(
-        request=load_json(args.request),
+    request = load_json(args.request)
+    events = run_request(
+        request=request,
         confirmation=load_json(args.confirmation),
         event_log_path=Path(args.event_log),
+        parser=build_default_request_parser() if "program" not in request else None,
         current_date=args.current_date,
+        timezone_name=args.timezone,
     )
-    return 0 if event["status"] == "MATCH_FOUND" else 1
+    return 0 if all(event["status"] == "MATCH_FOUND" for event in events) else 1
 
 
 if __name__ == "__main__":
