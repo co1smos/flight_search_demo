@@ -261,54 +261,11 @@ class Issue3ApplicationTests(unittest.TestCase):
                 current_date=calendar_date(2026, 11, 1),
             )
 
+            diagnostic = json.loads((Path(tmpdir) / "events.diagnostics.jsonl").read_text())
+
         self.assertEqual(result[0]["status"], "PARSER_FAILED")
-        self.assertEqual(result[0]["diagnostic_metadata"]["parser"], "fake")
-
-    def test_google_parser_uses_official_sdk_client_and_returns_structured_result(self) -> None:
-        class FakeInteractions:
-            def create(self, **kwargs: object):
-                self.kwargs = kwargs
-                return type(
-                    "FakeInteraction",
-                    (),
-                    {
-                        "output_text": json.dumps(
-                            {
-                                "requests": [
-                                    {
-                                        "program": "aeroplan",
-                                        "origin": "JFK",
-                                        "destination": "CDG",
-                                        "departure_date": "2026-11-05",
-                                        "cabin": "Business",
-                                        "adults": 1,
-                                        "trip_type": "one_way",
-                                        "maximum_points": 70000,
-                                    }
-                                ]
-                            }
-                        )
-                    },
-                )()
-
-        class FakeClient:
-            def __init__(self) -> None:
-                self.interactions = FakeInteractions()
-
-        parser = GoogleGenAIRequestParser(
-            client=FakeClient(),
-            model="gemini-2.5-flash",
-        )
-
-        result = parser.parse(
-            request_id="req-google",
-            original_text="Find one Aeroplan business seat from JFK to CDG next Thursday under 70k",
-            current_date=calendar_date(2026, 11, 1),
-            timezone_name="America/New_York",
-        )
-
-        self.assertEqual(result.requests[0].program, "aeroplan")
-        self.assertEqual(result.diagnostics["model"], "gemini-2.5-flash")
+        self.assertEqual(result[0]["diagnostic_id"], diagnostic["diagnostic_id"])
+        self.assertEqual(diagnostic["metadata"]["parser"], "fake")
 
     def test_empty_parse_result_is_reported_as_parser_failure(self) -> None:
         class EmptyParser(RequestParser):

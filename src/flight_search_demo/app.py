@@ -6,10 +6,12 @@ import hashlib
 import json
 import os
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Protocol
+from uuid import uuid4
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 SUPPORTED_CABINS = {
     "economy": "Economy",
@@ -18,6 +20,10 @@ SUPPORTED_CABINS = {
     "first": "First",
 }
 SUPPORTED_AIRPORTS = {"CDG", "JFK"}
+PROGRAM_ALIASES = {
+    "aeroplan": "aeroplan", "air canada aeroplan": "aeroplan", "ac points": "aeroplan",
+    "ana": "ana", "ana mileage club": "ana", "ana miles": "ana",
+}
 
 
 @dataclass(frozen=True)
@@ -104,13 +110,13 @@ class GoogleGenAIRequestParser:
             interaction = self._client.interactions.create(
                 model=self._model,
                 input=prompt,
-                response_format={
-                    "type": "text",
-                    "mime_type": "application/json",
-                    "schema": natural_language_parse_schema(),
-                },
+                response_mime_type="application/json",
+                response_format=natural_language_parse_schema(),
             )
-            payload = json.loads(interaction.output_text)
+            payload = json.loads("".join(
+                output.text for output in interaction.outputs or []
+                if output.type == "text"
+            ))
         except Exception as exc:
             raise ParserFailure(
                 str(exc),
@@ -125,9 +131,9 @@ class GoogleGenAIRequestParser:
                     destination=str(item["destination"]).strip().upper(),
                     departure_date=str(item["departure_date"]).strip(),
                     cabin=str(item["cabin"]).strip(),
-                    adults=int(item["adults"]),
+                    adults=item["adults"],
                     trip_type=str(item["trip_type"]).strip().lower(),
-                    maximum_points=int(item["maximum_points"]),
+                    maximum_points=item["maximum_points"],
                 )
                 for item in payload.get("requests", [])
             ]
@@ -209,7 +215,7 @@ def build_request_from_parsed_natural_language(
     return {
         "request_id": request_id,
         "original_text": original_text,
-        "program": parsed_request.program,
+        "program": PROGRAM_ALIASES.get(str(parsed_request.program).strip().lower(), parsed_request.program),
         "origin": parsed_request.origin,
         "destination": parsed_request.destination,
         "departure_date": parsed_request.departure_date,
@@ -278,6 +284,8 @@ def build_confirmation_request(
     *,
     request: Dict[str, Any],
     parsed_requests: List[ParsedNaturalLanguageRequest],
+    current_date: date | None = None,
+    timezone_name: str = "UTC",
 ) -> Dict[str, Any]:
     request_id = str(request.get("request_id", "")).strip()
     original_text = str(request.get("original_text", "")).strip()
@@ -287,7 +295,9 @@ def build_confirmation_request(
                 request_id,
                 original_text,
                 parsed_request,
-            )
+            ),
+            current_date=current_date,
+            timezone_name=timezone_name,
         )
         for parsed_request in parsed_requests
     ]
@@ -306,6 +316,7 @@ def execute_confirmed_request(
     event_log_path: Path,
     adapter_registry: Mapping[str, AwardProviderAdapter],
     clock: Callable[[], datetime] | None = None,
+    diagnostic_id: str | None = None,
 ) -> Dict[str, Any]:
     request_hash = build_request_hash(request_id, original_text, criteria)
     atomic_task_id = f"{criteria.program}-{request_hash[:12]}"
@@ -319,6 +330,7 @@ def execute_confirmed_request(
         status=result["status"],
         detail=result["detail"],
         clock=clock,
+        extra_fields={"diagnostic_id": diagnostic_id} if diagnostic_id else None,
     )
 
 
@@ -329,10 +341,29 @@ def run_structured_request(
     event_log_path: Path,
     adapter_registry: Mapping[str, AwardProviderAdapter] = DEFAULT_ADAPTER_REGISTRY,
     current_date: date | None = None,
+    timezone_name: str = "UTC",
     clock: Callable[[], datetime] | None = None,
 ) -> Dict[str, Any]:
     request_id = str(request.get("request_id", "")).strip()
     original_text = str(request.get("original_text", "")).strip()
+    try:
+        request_timezone = ZoneInfo(timezone_name)
+    except (ZoneInfoNotFoundError, ValueError, TypeError):
+        return emit_event(
+            event_log_path=event_log_path,
+            request_id=request_id,
+            original_text=original_text,
+            atomic_task_id=None,
+            normalized_criteria=None,
+            status="UNSUPPORTED_REQUEST",
+            detail="timezone must be a valid IANA timezone",
+            clock=clock,
+        )
+    if current_date is None:
+        now = clock() if clock is not None else datetime.now(timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        current_date = now.astimezone(request_timezone).date()
     try:
         criteria = normalize_request(
             request,
@@ -394,134 +425,145 @@ def run_request(
                 event_log_path=event_log_path,
                 adapter_registry=adapter_registry,
                 current_date=current_date,
+                timezone_name=timezone_name,
                 clock=clock,
             )
         ]
 
     request_id = str(request.get("request_id", "")).strip()
     original_text = str(request.get("original_text", "")).strip()
-    if parser is None:
-        raise ValueError("parser is required for natural-language requests")
-    try:
-        parse_result = parser.parse(
-            request_id=request_id,
-            original_text=original_text,
-            current_date=current_date or date.today(),
-            timezone_name=timezone_name,
-        )
-    except ParserFailure as exc:
-        return [
-            emit_event(
-                event_log_path=event_log_path,
-                request_id=request_id,
-                original_text=original_text,
-                atomic_task_id=None,
-                normalized_criteria=None,
-                status="PARSER_FAILED",
-                detail=str(exc),
-                clock=clock,
-                extra_fields={"diagnostic_metadata": exc.diagnostics},
-            )
-        ]
-    except Exception as exc:
-        return [
-            emit_event(
-                event_log_path=event_log_path,
-                request_id=request_id,
-                original_text=original_text,
-                atomic_task_id=None,
-                normalized_criteria=None,
-                status="PARSER_FAILED",
-                detail=str(exc),
-                clock=clock,
-                extra_fields={"diagnostic_metadata": {"parser_exception": type(exc).__name__}},
-            )
-        ]
-    if parse_result.unsupported_reason is not None:
-        return [
-            emit_event(
-                event_log_path=event_log_path,
-                request_id=request_id,
-                original_text=original_text,
-                atomic_task_id=None,
-                normalized_criteria=None,
-                status="UNSUPPORTED_REQUEST",
-                detail=parse_result.unsupported_reason,
-                clock=clock,
-                extra_fields={"diagnostic_metadata": parse_result.diagnostics or {}},
-            )
-        ]
-    if parse_result.clarification is not None:
-        return [
-            emit_event(
-                event_log_path=event_log_path,
-                request_id=request_id,
-                original_text=original_text,
-                atomic_task_id=None,
-                normalized_criteria=None,
-                status="CLARIFICATION_REQUIRED",
-                detail=parse_result.clarification,
-                clock=clock,
-                extra_fields={"diagnostic_metadata": parse_result.diagnostics or {}},
-            )
-        ]
-    if not parse_result.requests:
-        return [
-            emit_event(
-                event_log_path=event_log_path,
-                request_id=request_id,
-                original_text=original_text,
-                atomic_task_id=None,
-                normalized_criteria=None,
-                status="PARSER_FAILED",
-                detail="parser returned no executable request",
-                clock=clock,
-                extra_fields={"diagnostic_metadata": parse_result.diagnostics or {}},
-            )
-        ]
+    diagnostic_id = uuid4().hex
 
-    structured_requests = [
-        build_request_from_parsed_natural_language(request_id, original_text, parsed_request)
-        for parsed_request in parse_result.requests
-    ]
-    normalized_requests = [
-        normalize_request(
-            structured_request,
-            current_date=current_date,
-            adapter_registry=adapter_registry,
+    def diagnostic(metadata: Dict[str, Any], error: str | None = None) -> None:
+        try:
+            json.dumps(metadata)
+        except (TypeError, ValueError):
+            metadata = {"diagnostic_metadata_error": type(metadata).__name__}
+        append_event(event_log_path.with_suffix(".diagnostics.jsonl"), {
+            "diagnostic_id": diagnostic_id, "request_id": request_id,
+            "original_text": original_text, "metadata": metadata, "error": error,
+        })
+
+    def report(status: str, detail: str, criteria=None, **fields) -> List[Dict[str, Any]]:
+        return [emit_event(
+            event_log_path=event_log_path, request_id=request_id,
+            original_text=original_text, atomic_task_id=None,
+            normalized_criteria=criteria, status=status, detail=detail, clock=clock,
+            extra_fields={"diagnostic_id": diagnostic_id, **fields},
+        )]
+
+    try:
+        request_timezone = ZoneInfo(timezone_name)
+    except (ZoneInfoNotFoundError, ValueError, TypeError) as exc:
+        diagnostic({}, str(exc))
+        return report("UNSUPPORTED_REQUEST", "timezone must be a valid IANA timezone")
+
+    if current_date is None:
+        now = clock() if clock is not None else datetime.now(timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        current_date = now.astimezone(request_timezone).date()
+
+    try:
+        if parser is None:
+            parser = build_default_request_parser()
+        parse_result = parser.parse(
+            request_id=request_id, original_text=original_text,
+            current_date=current_date, timezone_name=timezone_name,
         )
-        for structured_request in structured_requests
-    ]
+        if (
+            not isinstance(parse_result, RequestParseResult)
+            or not isinstance(parse_result.requests, list)
+            or any(not isinstance(item, ParsedNaturalLanguageRequest) for item in parse_result.requests)
+            or any(value is not None and (not isinstance(value, str) or not value.strip())
+                   for value in (parse_result.clarification, parse_result.unsupported_reason))
+            or (parse_result.diagnostics is not None and not isinstance(parse_result.diagnostics, dict))
+        ):
+            raise ParserFailure("parser returned invalid structured data")
+    except Exception as exc:
+        diagnostic(getattr(exc, "diagnostics", {"parser_exception": type(exc).__name__}), str(exc))
+        return report("PARSER_FAILED", "request parsing failed; see diagnostics")
+
+    diagnostic(parse_result.diagnostics or {})
+    if re.search(r"\bANA\s+flights?\b", original_text, re.IGNORECASE):
+        return report("CLARIFICATION_REQUIRED", "ANA flight is ambiguous: specify ANA Mileage Club or an operating carrier")
+    if re.search(r"(?<![\d./-])\d{1,2}([./-])\d{1,2}(?:\1\d{2,4})?(?![\d./-])", original_text):
+        return report("CLARIFICATION_REQUIRED", "numeric date is ambiguous; specify YYYY-MM-DD or a named month")
+    if re.search(r"\b(?:United\s+miles|Delta\s+miles|MileagePlus|SkyMiles)\b", original_text, re.IGNORECASE):
+        return report("UNSUPPORTED_REQUEST", "only Aeroplan and ANA Mileage Club loyalty programs are supported")
+    if parse_result.unsupported_reason is not None:
+        return report("UNSUPPORTED_REQUEST", parse_result.unsupported_reason)
+    if parse_result.clarification is not None:
+        return report("CLARIFICATION_REQUIRED", parse_result.clarification)
+    if not parse_result.requests:
+        return report("PARSER_FAILED", "parser returned no executable request")
+
+    stated_programs = {
+        program for alias, program in PROGRAM_ALIASES.items()
+        if re.search(r"\b" + re.escape(alias) + r"\b", original_text, re.IGNORECASE)
+    }
+    if not stated_programs and re.search(
+        r"\b(?:loyalty|frequent[- ]flyer|mileage program|miles program)\b",
+        original_text,
+        re.IGNORECASE,
+    ):
+        return report(
+            "CLARIFICATION_REQUIRED",
+            "specify a supported loyalty program before searching",
+        )
+    parsed_requests = parse_result.requests
+    if not stated_programs:
+        parsed_requests = [replace(item, program="aeroplan") for item in parsed_requests]
+
+    try:
+        normalized_requests = [
+            normalize_request(
+                build_request_from_parsed_natural_language(request_id, original_text, parsed_request),
+                current_date=current_date, adapter_registry=adapter_registry,
+            )
+            for parsed_request in parsed_requests
+        ]
+    except ValueError as exc:
+        return report("UNSUPPORTED_REQUEST", str(exc))
+    if {item.program for item in normalized_requests} != (stated_programs or {"aeroplan"}):
+        return report("CLARIFICATION_REQUIRED", "parsed programs do not match the stated program selection")
+    if len({item.program for item in normalized_requests}) != len(normalized_requests):
+        return report("CLARIFICATION_REQUIRED", "specify exactly one atomic task per program")
+    ceilings, ceiling_syntax_valid = extract_points_ceilings(original_text)
+    if (
+        not ceiling_syntax_valid
+        or len(ceilings) != 1
+        or {item.maximum_points for item in normalized_requests} != ceilings
+    ):
+        return report("CLARIFICATION_REQUIRED", "specify one shared numeric points ceiling for every program")
     request_hash = build_request_set_hash(request_id, original_text, normalized_requests)
     confirmation_error = validate_confirmation(confirmation, request_id, request_hash)
+    criteria_set = [asdict(criteria) for criteria in normalized_requests]
+    airport_expansions = {
+        field: criteria_set[0][field] for field in ("origin", "destination")
+        if not re.search(r"\b" + criteria_set[0][field] + r"\b", original_text, re.IGNORECASE)
+    }
+    if airport_expansions and (
+        confirmation_error is not None or confirmation.get("airport_expansions") != airport_expansions
+    ):
+        return report(
+            "CLARIFICATION_REQUIRED", "explicitly confirm the proposed airport expansion",
+            criteria_set[0] if len(criteria_set) == 1 else None,
+            request_hash=request_hash, normalized_criteria_set=criteria_set,
+            airport_expansions=airport_expansions,
+        )
     if confirmation_error is not None:
-        normalized_criteria_set = [asdict(criteria) for criteria in normalized_requests]
-        return [
-            emit_event(
-                event_log_path=event_log_path,
-                request_id=request_id,
-                original_text=original_text,
-                atomic_task_id=None,
-                normalized_criteria=normalized_criteria_set[0] if len(normalized_criteria_set) == 1 else None,
-                status="CONFIRMATION_REQUIRED",
-                detail=confirmation_error,
-                clock=clock,
-                extra_fields={
-                    "request_hash": request_hash,
-                    "normalized_criteria_set": normalized_criteria_set,
-                    "diagnostic_metadata": parse_result.diagnostics or {},
-                },
-            )
-        ]
+        return report(
+            "CONFIRMATION_REQUIRED", confirmation_error,
+            criteria_set[0] if len(criteria_set) == 1 else None,
+            request_hash=request_hash, normalized_criteria_set=criteria_set,
+        )
 
     return [
         execute_confirmed_request(
-            request_id=request_id,
-            original_text=original_text,
-            criteria=criteria,
-            event_log_path=event_log_path,
-            adapter_registry=adapter_registry,
-            clock=clock,
+            request_id=request_id, original_text=original_text, criteria=criteria,
+            event_log_path=event_log_path, adapter_registry=adapter_registry,
+            clock=clock, diagnostic_id=diagnostic_id,
         )
         for criteria in normalized_requests
     ]
@@ -531,6 +573,7 @@ def normalize_request(
     request: Dict[str, Any],
     *,
     current_date: date | None = None,
+    timezone_name: str = "UTC",
     adapter_registry: Mapping[str, AwardProviderAdapter] = DEFAULT_ADAPTER_REGISTRY,
 ) -> NormalizedCriteria:
     request_id = str(request.get("request_id", "")).strip()
@@ -547,11 +590,13 @@ def normalize_request(
     origin = normalize_airport(request.get("origin"), "origin")
     destination = normalize_airport(request.get("destination"), "destination")
     departure_date = normalize_departure_date(
-        request.get("departure_date"), current_date=current_date
+        request.get("departure_date"),
+        current_date=current_date,
+        timezone_name=timezone_name,
     )
     cabin = normalize_cabin(request.get("cabin"))
     adults = request.get("adults")
-    if adults != 1:
+    if type(adults) is not int or adults != 1:
         raise ValueError("adults must be exactly 1")
     trip_type = str(request.get("trip_type", "")).strip().lower()
     if trip_type != "one_way":
@@ -582,7 +627,12 @@ def normalize_airport(value: Any, field_name: str) -> str:
     return airport
 
 
-def normalize_departure_date(value: Any, *, current_date: date | None = None) -> str:
+def normalize_departure_date(
+    value: Any,
+    *,
+    current_date: date | None = None,
+    timezone_name: str = "UTC",
+) -> str:
     raw = str(value or "").strip()
     if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw, flags=re.ASCII) is None:
         raise ValueError("departure_date must be an exact YYYY-MM-DD date")
@@ -590,7 +640,12 @@ def normalize_departure_date(value: Any, *, current_date: date | None = None) ->
         parsed = date.fromisoformat(raw)
     except ValueError as exc:
         raise ValueError("departure_date must be an exact YYYY-MM-DD date") from exc
-    if parsed < (current_date or date.today()):
+    if current_date is None:
+        try:
+            current_date = datetime.now(ZoneInfo(timezone_name)).date()
+        except (ZoneInfoNotFoundError, ValueError, TypeError) as exc:
+            raise ValueError("timezone must be a valid IANA timezone") from exc
+    if parsed < current_date:
         raise ValueError("departure_date cannot be in the past")
     return parsed.isoformat()
 
@@ -600,6 +655,37 @@ def normalize_cabin(value: Any) -> str:
     if cabin_key not in SUPPORTED_CABINS:
         raise ValueError("cabin must be Economy, Premium Economy, Business, or First")
     return SUPPORTED_CABINS[cabin_key]
+
+
+def extract_points_ceilings(original_text: str) -> tuple[set[int], bool]:
+    tokens = re.findall(
+        r"\b(?:under|below|at\s+most|up\s+to|maximum|max|ceiling)\s+([^\s.;!?]+)"
+        r"|\b([^\s.;!?]+)\s*(?:points|miles)\b",
+        original_text,
+        flags=re.IGNORECASE,
+    )
+    ceilings: set[int] = set()
+    for prefixed, suffixed in tokens:
+        token = prefixed or suffixed
+        if suffixed and not re.match(r"[+-]?\d", token):
+            continue
+        ceiling = parse_points_ceiling_token(token)
+        if ceiling is None:
+            return set(), False
+        ceilings.add(ceiling)
+    return ceilings, True
+
+
+def parse_points_ceiling_token(token: str) -> int | None:
+    if re.fullmatch(r"(?:\d+|\d{1,3}(?:,\d{3})+)(?:k)?", token, flags=re.IGNORECASE) is None:
+        return None
+    compact = token.replace(",", "").lower()
+    multiplier = 1000 if compact.endswith("k") else 1
+    digits = compact[:-1] if multiplier == 1000 else compact
+    try:
+        return int(digits) * multiplier
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
 def validate_confirmation(
@@ -676,10 +762,10 @@ def append_event(event_log_path: Path, event: Dict[str, Any]) -> None:
 
 
 def render_terminal_report(event: Dict[str, Any]) -> str:
-    criteria = event.get("normalized_criteria") or {}
+    criteria_set = event.get("normalized_criteria_set") or [event.get("normalized_criteria")]
     criteria_report = ""
-    if criteria:
-        criteria_report = (
+    for criteria in filter(None, criteria_set):
+        criteria_report += (
             f" program={criteria['program']} origin={criteria['origin']}"
             f" destination={criteria['destination']} departure_date={criteria['departure_date']}"
             f" cabin={criteria['cabin']} adults={criteria['adults']}"
@@ -689,7 +775,7 @@ def render_terminal_report(event: Dict[str, Any]) -> str:
     return (
         f"{event['status']} request={event['request_id']}"
         f" original_text={event['original_text']} task={task}"
-        f"{criteria_report} at {event['timestamp']}"
+        f"{criteria_report} detail={event['detail']} at {event['timestamp']}"
     )
 
 
@@ -733,7 +819,6 @@ def main() -> int:
         request=request,
         confirmation=load_json(args.confirmation),
         event_log_path=Path(args.event_log),
-        parser=build_default_request_parser() if "program" not in request else None,
         current_date=args.current_date,
         timezone_name=args.timezone,
     )
