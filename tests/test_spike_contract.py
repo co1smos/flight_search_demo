@@ -1,12 +1,21 @@
 from pathlib import Path
+import argparse
+import asyncio
+import os
 import tempfile
 from types import SimpleNamespace
 from urllib.parse import urlparse
 import unittest
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from flight_search_demo.models import BrowserStackConfig, HandoffStatus
-from flight_search_demo.live_run import build_agent_llms
-from flight_search_demo.live_run import assert_expected_results, classify_allowlist_rejection
+from flight_search_demo.live_run import (
+    assert_expected_results,
+    build_agent_llms,
+    classify_allowlist_rejection,
+    run_spike,
+)
+from flight_search_demo.models import ControlledPageResult
 from flight_search_demo.spike import (
     build_cdp_url,
     build_debugger_cdp_url,
@@ -22,6 +31,82 @@ from flight_search_demo.live_run import navigate_handoff_session
 
 
 class SpikeContractTests(unittest.TestCase):
+    def test_run_spike_rejects_public_steel_url_before_constructing_client(self) -> None:
+        args = self.make_run_args(steel_base_url="https://steel.example.com")
+
+        with patch.dict(os.environ, {"GOOGLE_API_KEY": "test-key"}, clear=False), patch(
+            "flight_search_demo.live_run.Steel"
+        ) as steel:
+            with self.assertRaisesRegex(ValueError, "private address or loopback"):
+                asyncio.run(run_spike(args))
+
+        steel.assert_not_called()
+
+    def test_run_spike_orchestrates_fresh_sessions_handoff_and_allowlist(self) -> None:
+        args = self.make_run_args()
+        result = ControlledPageResult(
+            page_title="Controlled Browser Stack Test",
+            marker_value=args.marker,
+            marker_persisted=True,
+            current_url="http://127.0.0.1:8765/",
+        )
+        client = MagicMock()
+        handoff_session = SimpleNamespace(
+            id="handoff-session",
+            websocket_url="ws://127.0.0.1:3000/",
+            session_viewer_url="http://127.0.0.1:3000/ui",
+            debug_url="http://127.0.0.1:3000/debug",
+        )
+        client.sessions.create.return_value = handoff_session
+        browser = MagicMock()
+        browser.stop = AsyncMock()
+
+        with patch.dict(os.environ, {"GOOGLE_API_KEY": "test-key"}, clear=False), patch(
+            "flight_search_demo.live_run.Steel", return_value=client
+        ), patch(
+            "flight_search_demo.live_run.run_in_fresh_session",
+            new=AsyncMock(side_effect=[result, result]),
+        ) as fresh_session, patch(
+            "flight_search_demo.live_run.run_offsite_in_fresh_session",
+            new=AsyncMock(return_value="ValueError"),
+        ) as offsite, patch(
+            "flight_search_demo.live_run.BrowserSession", return_value=browser
+        ), patch(
+            "flight_search_demo.live_run.discover_debugger_cdp_url",
+            return_value="ws://127.0.0.1:9223/devtools/browser/test",
+        ), patch(
+            "flight_search_demo.live_run.navigate_handoff_session", new=AsyncMock()
+        ), patch(
+            "flight_search_demo.live_run.write_private_handoff_file"
+        ), patch(
+            "flight_search_demo.live_run.handoff_is_complete", return_value=True
+        ):
+            summary = asyncio.run(run_spike(args))
+
+        self.assertEqual(fresh_session.await_count, 2)
+        offsite.assert_awaited_once()
+        self.assertEqual(summary.offsite_rejection, "ValueError")
+        self.assertEqual(summary.handoff.status, HandoffStatus.COMPLETE)
+        client.sessions.release.assert_called_once_with("handoff-session")
+
+    @staticmethod
+    def make_run_args(**overrides: object) -> argparse.Namespace:
+        values = {
+            "steel_base_url": "http://127.0.0.1:3000",
+            "controlled_page_public_origin": "http://127.0.0.1:8765",
+            "controlled_page_port": 8765,
+            "start_local_controlled_page_server": False,
+            "storage_state_path": ".artifacts/test/storage-state.json",
+            "handoff_file": ".artifacts/test/handoff.json",
+            "marker": "expected-marker",
+            "gemini_model": "gemini-3.5-flash-lite",
+            "fallback_gemini_model": "gemini-3.6-flash",
+            "max_steps": 4,
+            "handoff_timeout": 1,
+        }
+        values.update(overrides)
+        return argparse.Namespace(**values)
+
     def test_only_the_expected_security_policy_error_counts_as_allowlist_rejection(self) -> None:
         rejection = classify_allowlist_rejection(
             ValueError("Navigation to https://example.com/ blocked by security policy")
@@ -35,8 +120,6 @@ class SpikeContractTests(unittest.TestCase):
             classify_allowlist_rejection(ValueError("unrelated browser failure"))
 
     def test_runner_rejects_schema_valid_but_incorrect_results(self) -> None:
-        from flight_search_demo.models import ControlledPageResult
-
         expected_url = "http://controlled.test/"
         good = ControlledPageResult(
             page_title="Controlled Browser Stack Test",

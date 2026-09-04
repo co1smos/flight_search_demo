@@ -25,6 +25,7 @@ from .spike import (
     secure_artifact_file,
     write_private_handoff_file,
 )
+from .security import assert_private_url
 
 
 def parse_args() -> argparse.Namespace:
@@ -183,7 +184,8 @@ async def run_spike(args: argparse.Namespace) -> RunSummary:
     if not google_api_key:
         raise RuntimeError("GOOGLE_API_KEY or GEMINI_API_KEY is required")
 
-    client = Steel(base_url=args.steel_base_url)
+    steel_base_url = assert_private_url(args.steel_base_url)
+    client = Steel(base_url=steel_base_url)
     server = None
     try:
         public_origin = args.controlled_page_public_origin
@@ -195,7 +197,7 @@ async def run_spike(args: argparse.Namespace) -> RunSummary:
         if not public_origin:
             raise RuntimeError("controlled page origin is required when not starting the local server")
         config = BrowserStackConfig(
-            steel_base_url=args.steel_base_url,
+            steel_base_url=steel_base_url,
             controlled_page_url=f"{public_origin}/",
             storage_state_path=Path(args.storage_state_path),
             google_api_key=google_api_key,
