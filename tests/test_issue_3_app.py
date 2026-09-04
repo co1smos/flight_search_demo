@@ -301,6 +301,64 @@ class Issue3ApplicationTests(unittest.TestCase):
         self.assertEqual(event["status"], "MATCH_FOUND")
         self.assertEqual(event["original_text"], request["original_text"])
 
+    def test_cli_fixture_date_remains_executable_after_fixture_date(self) -> None:
+        request = {
+            "request_id": "req-cli-stable-fixture",
+            "original_text": "Find one Aeroplan business seat from JFK to CDG",
+            "program": "aeroplan",
+            "origin": "JFK",
+            "destination": "CDG",
+            "departure_date": "2026-11-05",
+            "cabin": "business",
+            "adults": 1,
+            "trip_type": "one_way",
+            "maximum_points": 70000,
+        }
+        criteria = normalize_request(
+            request,
+            current_date=calendar_date(2026, 11, 1),
+        )
+        confirmation = {
+            "request_id": request["request_id"],
+            "request_hash": build_request_hash(
+                request["request_id"], request["original_text"], criteria
+            ),
+            "confirmed": True,
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            directory = Path(tmpdir)
+            request_path = directory / "request.json"
+            confirmation_path = directory / "confirmation.json"
+            event_log_path = directory / "events.jsonl"
+            request_path.write_text(json.dumps(request), encoding="utf-8")
+            confirmation_path.write_text(json.dumps(confirmation), encoding="utf-8")
+            env = os.environ.copy()
+            env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
+
+            completed = subprocess.run(
+                [
+                    "python3",
+                    "-m",
+                    "flight_search_demo.app",
+                    "--request",
+                    str(request_path),
+                    "--confirmation",
+                    str(confirmation_path),
+                    "--event-log",
+                    str(event_log_path),
+                    "--current-date",
+                    "2026-11-01",
+                ],
+                cwd=directory,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+        self.assertEqual(completed.returncode, 0)
+
     def test_cli_domain_failure_is_reported_recorded_and_exits_nonzero(self) -> None:
         request = {
             "request_id": "req-cli-failure",

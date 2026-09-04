@@ -308,6 +308,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--request", required=True, help="Path to the structured JSON request file.")
     parser.add_argument("--confirmation", required=True, help="Path to the structured JSON confirmation file.")
     parser.add_argument("--event-log", required=True, help="Path to the append-only JSONL event log.")
+    parser.add_argument(
+        "--current-date",
+        type=date.fromisoformat,
+        help="Override today's date for deterministic fixture/demo runs (YYYY-MM-DD).",
+    )
     return parser.parse_args()
 
 
@@ -321,6 +326,7 @@ def main() -> int:
         request=load_json(args.request),
         confirmation=load_json(args.confirmation),
         event_log_path=Path(args.event_log),
+        current_date=args.current_date,
     )
     return 0 if event["status"] == "MATCH_FOUND" else 1
 
