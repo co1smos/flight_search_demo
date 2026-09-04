@@ -24,6 +24,7 @@ pnpm-debug.log*
 
 # Sandcastle runtime files
 .sandcastle/logs/
+.artifacts/
 
 # C extensions
 *.so
