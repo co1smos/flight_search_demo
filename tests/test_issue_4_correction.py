@@ -273,6 +273,22 @@ class Issue4CorrectionTests(unittest.TestCase):
             'points using StarMiles',
             'JFK to CDG, StarMiles on 2026-11-05 business for one adult '
             'under 70000 points',
+            'JFK to CDG on 2026-11-05 business for one adult under 70000 '
+            'points United MileagePlus',
+            'JFK to CDG on 2026-11-05 business for one adult under 70000 '
+            'points via United MileagePlus',
+            'JFK to CDG on 2026-11-05 business for one adult under 70000 '
+            'points, United MileagePlus',
+            'JFK to CDG on 2026-11-05 business for one adult under 70000 '
+            'points; via United MileagePlus!',
+            'JFK to CDG on 2026-11-05 business for one adult under 70000 '
+            'points. Redeem JetBlue points',
+            'JFK to CDG on 2026-11-05 business for one adult under 70000 '
+            'points, StarMiles:',
+            'JFK to CDG on 2026-11-05 business for one adult under 70000 '
+            'points XYZ',
+            'JFK to CDG on 2026-11-05 business for one adult under 70000 '
+            'points 123',
             'Flying Blue from JFK to CDG on 2026-11-05 business for one adult '
             'under 70000 points',
             'Emirates Skywards from JFK to CDG on 2026-11-05 business '
@@ -512,11 +528,11 @@ class Issue4CorrectionTests(unittest.TestCase):
         self.assertIsNone(event['atomic_task_id'])
         self.adapter.execute.assert_not_called()
 
-    def test_cli_allowlisted_exact_codes_execute_and_fixture_nonmatch_is_deterministic(self):
+    def test_exact_dataset_codes_execute_and_fixture_nonmatch_is_deterministic(self):
         from unittest.mock import patch
         from flight_search_demo.app import build_request_hash, main, normalize_request
 
-        for origin, destination in (('LHR', 'NRT'), ('NRT', 'SFO'), ('SFO', 'LHR')):
+        for origin, destination in (('LAX', 'JFK'), ('ORD', 'CDG'), ('HND', 'LAX')):
             with self.subTest(origin=origin, destination=destination):
                 request = {
                     'request_id': f'cli-{origin.lower()}-{destination.lower()}',
@@ -557,6 +573,14 @@ class Issue4CorrectionTests(unittest.TestCase):
                 self.assertIsNotNone(event['atomic_task_id'])
                 self.assertEqual(event['normalized_criteria']['origin'], origin)
                 self.assertEqual(event['normalized_criteria']['destination'], destination)
+
+    def test_unknown_and_non_ascii_airport_codes_are_rejected(self):
+        from flight_search_demo.app import normalize_airport
+
+        for airport in ('QQQ', 'ABC', 'ÅBC', 'ＡＢＣ'):
+            with self.subTest(airport=airport):
+                with self.assertRaisesRegex(ValueError, 'supported three-letter IATA'):
+                    normalize_airport(airport, 'origin')
 
     def test_sdk_numeric_fields_are_never_coerced(self):
         from dataclasses import asdict

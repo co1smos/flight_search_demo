@@ -8,6 +8,7 @@ version = "0.1.0"
 description = "Controlled-page browser stack spike for Gemini, browser-use, and self-hosted Steel."
 requires-python = ">=3.11"
 dependencies = [
+  "airportsdata>=20241001,<20270000",
   "browser-use>=0.8.0",
   "google-genai>=1.60,<2",
   "pydantic>=2.11,<3",

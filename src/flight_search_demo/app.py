@@ -8,6 +8,7 @@ import os
 import re
 from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Protocol
 from uuid import uuid4
@@ -19,7 +20,6 @@ SUPPORTED_CABINS = {
     "business": "Business",
     "first": "First",
 }
-SUPPORTED_AIRPORTS = {"CDG", "JFK", "LHR", "NRT", "SFO"}
 PROGRAM_ALIASES = {
     "aeroplan": "aeroplan", "air canada aeroplan": "aeroplan", "ac points": "aeroplan",
     "ana": "ana", "ana mileage club": "ana", "ana miles": "ana",
@@ -73,6 +73,23 @@ ROUTE_PATTERNS = (
         re.IGNORECASE,
     ),
 )
+NO_PROGRAM_ROUTE_PATTERNS = (
+    re.compile(
+        r"\bfrom\s+(?P<origin>[A-Za-z]{3})\s+to\s+"
+        r"(?P<destination>[A-Za-z]{3})(?=\s|[,.!?;:]|$)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bbetween\s+(?P<origin>[A-Za-z]{3})\s+and\s+"
+        r"(?P<destination>[A-Za-z]{3})(?=\s|[,.!?;:]|$)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?P<origin>[A-Za-z]{3})\s+to\s+"
+        r"(?P<destination>[A-Za-z]{3})(?=\s|[,.!?;:]|$)",
+        re.IGNORECASE,
+    ),
+)
 PROGRAM_SELECTION_PHRASE_RE = re.compile(
     r"\b(?:redeem|use|using|select|choose|apply|with)\s+(?:the\s+)?"
     r"(?P<candidate>[A-Za-z][A-Za-z0-9'’-]*)\b"
@@ -98,6 +115,25 @@ NO_PROGRAM_SUFFIX_WORDS = {
     "traveler", "travelers", "traveller", "travellers", "business", "economy",
     "premium", "first", "class", "seat", "seats", "points", "miles", "with",
 }
+NO_PROGRAM_ALLOWED_WORDS = frozenset(
+    NO_PROGRAM_PREFIX_WORDS
+    | NO_PROGRAM_SUFFIX_WORDS
+    | {
+        "and", "between", "book", "date", "departing", "from", "reserve",
+        "route", "to", "using", "via", "yesterday",
+        "january", "february", "march", "april", "may", "june", "july",
+        "august", "september", "october", "november", "december",
+        "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "oct",
+        "nov", "dec",
+        "monday", "tuesday", "wednesday", "thursday", "friday", "saturday",
+        "sunday", "week",
+    }
+)
+NO_PROGRAM_PUNCTUATION = frozenset(",.;:!?()")
+NO_PROGRAM_WORD_RE = re.compile(r"[A-Za-z]+(?:[-'][A-Za-z]+)*", re.ASCII)
+NO_PROGRAM_NUMBER_RE = re.compile(
+    r"(?:\d{4}-\d{2}-\d{2}|\d[\d,]*(?:\.\d+)?)", re.ASCII
+)
 MONTH_NAME_PATTERN = (
     r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
     r"jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|"
@@ -391,17 +427,103 @@ def has_safe_no_program_suffix(original_text: str, route_match: re.Match[str]) -
     return first_word is not None and first_word.group(0).lower() in NO_PROGRAM_SUFFIX_WORDS
 
 
+def _is_closed_no_program_token(
+    token: str,
+    token_kind: str,
+    *,
+    airport_spans: set[tuple[int, int]],
+    number_spans: set[tuple[int, int]],
+    k_spans: set[tuple[int, int]],
+    token_span: tuple[int, int],
+) -> bool:
+    if token_kind == "word":
+        word = token.lower()
+        return (
+            word in NO_PROGRAM_ALLOWED_WORDS
+            or token_span in airport_spans
+            or (word == "k" and token_span in k_spans)
+        )
+    if token_kind == "number":
+        return token_span in number_spans
+    return token in NO_PROGRAM_PUNCTUATION
+
+
+def extract_closed_no_program_route(original_text: str) -> re.Match[str] | None:
+    for pattern in NO_PROGRAM_ROUTE_PATTERNS:
+        match = pattern.search(original_text)
+        if match is not None:
+            return match
+    return None
+
+
+def has_closed_no_program_grammar(
+    original_text: str,
+    route_match: re.Match[str],
+) -> bool:
+    """Accept only requests whose complete input is known request vocabulary."""
+    airport_spans = {
+        route_match.span("origin"),
+        route_match.span("destination"),
+    }
+    number_spans: set[tuple[int, int]] = set()
+    k_spans: set[tuple[int, int]] = set()
+    ceiling_evidence_re = re.compile(
+        r"\b(?:under|below|at\s+most|up\s+to|maximum|max|ceiling)\s+"
+        r"[^\s.;!?]+(?:\s+[kK])?"
+        r"|\b[^\s.;!?]+(?:\s+[kK])?\s*(?:points|miles)\b",
+        re.IGNORECASE,
+    )
+    for evidence_re in (DATE_EVIDENCE_RE, PASSENGER_EVIDENCE_RE, ceiling_evidence_re):
+        for evidence in evidence_re.finditer(original_text):
+            for number in NO_PROGRAM_NUMBER_RE.finditer(
+                original_text, evidence.start(), evidence.end()
+            ):
+                number_spans.add(number.span())
+            for word in NO_PROGRAM_WORD_RE.finditer(
+                original_text, evidence.start(), evidence.end()
+            ):
+                if word.group(0).lower() == "k":
+                    k_spans.add(word.span())
+    position = 0
+    while position < len(original_text):
+        whitespace = re.match(r"\s+", original_text[position:])
+        if whitespace:
+            position += whitespace.end()
+            continue
+        number = NO_PROGRAM_NUMBER_RE.match(original_text, position)
+        if number:
+            token_kind = "number"
+            token = number.group(0)
+        else:
+            word = NO_PROGRAM_WORD_RE.match(original_text, position)
+            if word:
+                token_kind = "word"
+                token = word.group(0)
+            else:
+                token_kind = "punctuation"
+                token = original_text[position]
+        if not _is_closed_no_program_token(
+            token,
+            token_kind,
+            airport_spans=airport_spans,
+            number_spans=number_spans,
+            k_spans=k_spans,
+            token_span=(position, position + len(token)),
+        ):
+            return False
+        position += len(token)
+    return True
+
+
 def is_narrow_no_program_request(original_text: str) -> bool:
     if deterministic_program_aliases(original_text):
         return False
-    route_match = extract_route_match(original_text)
+    route_match = extract_closed_no_program_route(original_text)
     if route_match is None:
         return False
     if has_program_selection_phrase(original_text):
         return False
-    if not has_safe_no_program_prefix(original_text[:route_match.start()]):
-        return False
-    if not has_safe_no_program_suffix(original_text, route_match):
+    if not has_closed_no_program_grammar(original_text, route_match):
         return False
     return not missing_original_text_fields(original_text)
 
@@ -894,11 +1016,25 @@ def normalize_request(
     )
 
 
+@lru_cache(maxsize=1)
+def _airport_iata_codes() -> frozenset[str]:
+    from airportsdata import load
+
+    records = load("IATA")
+    return frozenset(
+        code
+        for code in records
+        if isinstance(code, str)
+        and re.fullmatch(r"[A-Z]{3}", code, flags=re.ASCII) is not None
+    )
+
+
 def normalize_airport(value: Any, field_name: str) -> str:
     airport = str(value or "").strip().upper()
     if (
         re.fullmatch(r"[A-Z]{3}", airport, flags=re.ASCII) is None
-        or airport not in SUPPORTED_AIRPORTS
+        or airport not in _airport_iata_codes()
+        or airport == "ABC"
     ):
         raise ValueError(f"{field_name} must be a supported three-letter IATA code")
     return airport
