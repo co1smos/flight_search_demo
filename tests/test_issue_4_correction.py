@@ -423,6 +423,69 @@ class Issue4CorrectionTests(unittest.TestCase):
                 self.assertIsNone(event['atomic_task_id'])
         self.adapter.execute.assert_not_called()
 
+    def test_semantic_binding_rejects_parser_changes_even_with_confirmation(self):
+        from flight_search_demo.app import build_confirmation_request
+
+        cases = (
+            (
+                'route',
+                replace(self.criteria, origin='CDG', destination='JFK'),
+                replace(self.criteria, origin='CDG', destination='JFK'),
+                ('origin', 'destination'),
+            ),
+            (
+                'exact date',
+                replace(self.criteria, departure_date='2026-11-06'),
+                replace(self.criteria, departure_date='2026-11-06'),
+                ('departure_date',),
+            ),
+            (
+                'cabin',
+                replace(self.criteria, cabin='Economy'),
+                replace(self.criteria, cabin='Economy'),
+                ('cabin',),
+            ),
+            (
+                'adults',
+                replace(self.criteria, adults=2),
+                self.criteria,
+                ('adults',),
+            ),
+            (
+                'points ceiling',
+                replace(self.criteria, maximum_points=60000),
+                replace(self.criteria, maximum_points=60000),
+                ('ceiling',),
+            ),
+        )
+        for label, parsed, confirmed_criteria, detail_terms in cases:
+            with self.subTest(label=label):
+                confirmation = build_confirmation_request(
+                    request=self.request,
+                    parsed_requests=[confirmed_criteria],
+                    current_date=date(2026, 11, 1),
+                )
+                parser = Mock()
+                parser.parse.return_value = RequestParseResult(
+                    [parsed], program_selection='supported'
+                )
+                self.adapter.reset_mock()
+                with redirect_stdout(io.StringIO()):
+                    event = run_request(
+                        request=self.request,
+                        confirmation=confirmation,
+                        event_log_path=self.log,
+                        parser=parser,
+                        adapter_registry={'aeroplan': self.adapter},
+                        current_date=date(2026, 11, 1),
+                    )[0]
+                self.assertEqual(event['status'], 'CLARIFICATION_REQUIRED')
+                for term in detail_terms:
+                    self.assertIn(term, event['detail'])
+                self.assertNotIn('request_hash', event)
+                self.assertIsNone(event['atomic_task_id'])
+                self.adapter.execute.assert_not_called()
+
     def test_missing_endpoint_provenance_cannot_be_authorized_by_city_expansion(self):
         from flight_search_demo.app import build_confirmation_request
 
@@ -722,6 +785,10 @@ class Issue4CorrectionTests(unittest.TestCase):
             ('America/Los_Angeles', date(2026, 11, 1), 'CONFIRMATION_REQUIRED'),
             ('Asia/Tokyo', date(2026, 11, 2), 'UNSUPPORTED_REQUEST'),
         ):
+            self.request['original_text'] = (
+                'Aeroplan JFK to CDG on 2026-11-01 business for one adult '
+                'under 70000 points'
+            )
             with self.subTest(zone=zone), redirect_stdout(io.StringIO()):
                 event = run_request(request=self.request, confirmation={}, event_log_path=self.log,
                                     parser=parser, timezone_name=zone,

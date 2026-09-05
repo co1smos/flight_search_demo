@@ -152,11 +152,25 @@ CABIN_EVIDENCE_RE = re.compile(
     re.IGNORECASE,
 )
 PASSENGER_EVIDENCE_RE = re.compile(
-    r"\b(?:one|1|a|single)\s+(?:adult|adults|passenger|passengers|"
-    r"traveler|travelers|traveller|travellers)\b"
-    r"|\b(?:one|1|a|single)\s+(?:[A-Za-z]+\s+){0,3}seat\b",
+    r"\b(?P<count>\d+|one|single|a|two|three|four|five|six|seven|eight|"
+    r"nine|ten)\s+(?:adult|adults|passenger|passengers|traveler|travelers|"
+    r"traveller|travellers|(?:[A-Za-z]+\s+){0,3}seat)\b",
     re.IGNORECASE,
 )
+PASSENGER_COUNT_WORDS = {
+    "a": 1,
+    "single": 1,
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+}
 
 
 @dataclass(frozen=True)
@@ -893,6 +907,11 @@ def run_request(
             + ", ".join(labels),
         )
     parsed_requests = parse_result.requests
+    binding_error = semantic_binding_error(
+        original_text, parsed_requests, fields={"adults"}
+    )
+    if binding_error is not None:
+        return report("CLARIFICATION_REQUIRED", binding_error)
     if parse_result.program_selection == "omitted":
         parsed_requests = [replace(item, program="aeroplan") for item in parsed_requests]
 
@@ -920,6 +939,9 @@ def run_request(
     criteria_consistency_error = validate_multi_program_criteria(normalized_requests)
     if criteria_consistency_error is not None:
         return report("CLARIFICATION_REQUIRED", criteria_consistency_error)
+    binding_error = semantic_binding_error(original_text, normalized_requests)
+    if binding_error is not None:
+        return report("CLARIFICATION_REQUIRED", binding_error)
     request_hash = build_request_set_hash(request_id, original_text, normalized_requests)
     confirmation_error = validate_confirmation(confirmation, request_id, request_hash)
     criteria_set = [asdict(criteria) for criteria in normalized_requests]
@@ -1089,6 +1111,93 @@ def missing_original_text_fields(original_text: str) -> set[str]:
     if not syntax_valid or len(ceilings) != 1:
         missing.add("maximum_points")
     return missing
+
+
+def _exact_iata_route_evidence(original_text: str) -> tuple[str, str] | None:
+    route_match = extract_route_match(original_text)
+    if route_match is None:
+        return None
+    origin = route_match.group("origin").strip()
+    destination = route_match.group("destination").strip()
+    if not all(re.fullmatch(r"[A-Za-z]{3}", value, flags=re.ASCII)
+               for value in (origin, destination)):
+        return None
+    return origin.upper(), destination.upper()
+
+
+def _stated_passenger_counts(original_text: str) -> set[int]:
+    counts: set[int] = set()
+    for match in PASSENGER_EVIDENCE_RE.finditer(original_text):
+        raw_count = match.group("count").lower()
+        if raw_count.isdigit():
+            counts.add(int(raw_count))
+        elif raw_count in PASSENGER_COUNT_WORDS:
+            counts.add(PASSENGER_COUNT_WORDS[raw_count])
+    return counts
+
+
+def semantic_binding_error(
+    original_text: str,
+    parsed_requests: List[Any],
+    *,
+    fields: set[str] | None = None,
+) -> str | None:
+    """Reject parser values that disagree with deterministic text evidence."""
+    if fields is None:
+        fields = {
+            "origin", "destination", "departure_date", "cabin", "adults", "maximum_points"
+        }
+    exact_route = _exact_iata_route_evidence(original_text)
+    exact_dates = {
+        match.group(0)
+        for match in re.finditer(r"\b\d{4}-\d{2}-\d{2}\b", original_text)
+    }
+    stated_cabins = {
+        re.sub(r"[\s_-]+class$", "", match.group(0), flags=re.IGNORECASE)
+        .replace("-", " ").replace("_", " ").strip().lower()
+        for match in CABIN_EVIDENCE_RE.finditer(original_text)
+    }
+    stated_adults = _stated_passenger_counts(original_text)
+    ceilings, ceiling_syntax_valid = extract_points_ceilings(original_text)
+
+    mismatches: set[str] = set()
+    for parsed_request in parsed_requests:
+        if exact_route is not None and {"origin", "destination"} & fields:
+            parsed_route = (
+                str(parsed_request.origin).strip().upper(),
+                str(parsed_request.destination).strip().upper(),
+            )
+            if all(re.fullmatch(r"[A-Z]{3}", value, flags=re.ASCII) for value in parsed_route) \
+                    and parsed_route != exact_route:
+                mismatches.update(("origin", "destination"))
+        parsed_date = str(parsed_request.departure_date).strip()
+        if "departure_date" in fields and exact_dates \
+                and re.fullmatch(r"\d{4}-\d{2}-\d{2}", parsed_date) \
+                and (len(exact_dates) != 1 or parsed_date not in exact_dates):
+            mismatches.add("departure_date")
+        if "cabin" in fields and stated_cabins:
+            try:
+                parsed_cabin = normalize_cabin(parsed_request.cabin).lower()
+            except ValueError:
+                parsed_cabin = None
+            if parsed_cabin is not None \
+                    and (len(stated_cabins) != 1 or parsed_cabin not in stated_cabins):
+                mismatches.add("cabin")
+        if "adults" in fields and stated_adults and type(parsed_request.adults) is int \
+                and (len(stated_adults) != 1 or parsed_request.adults not in stated_adults):
+            mismatches.add("adults")
+        if "maximum_points" in fields and ceiling_syntax_valid and len(ceilings) == 1 \
+                and type(parsed_request.maximum_points) is int \
+                and parsed_request.maximum_points not in ceilings:
+            mismatches.add("maximum_points")
+
+    if not mismatches:
+        return None
+    labels = [
+        "maximum_points (points ceiling)" if field == "maximum_points" else field
+        for field in sorted(mismatches)
+    ]
+    return "parsed values do not match original text evidence: " + ", ".join(labels)
 
 
 def parse_points_ceiling_token(token: str) -> int | None:

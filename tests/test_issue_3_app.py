@@ -419,8 +419,8 @@ class Issue3ApplicationTests(unittest.TestCase):
                 current_date=calendar_date(2026, 11, 1),
             )
 
-        self.assertEqual(result[0]["status"], "CONFIRMATION_REQUIRED")
-        self.assertIn("request_hash", result[0])
+        self.assertEqual(result[0]["status"], "CLARIFICATION_REQUIRED")
+        self.assertNotIn("request_hash", result[0])
 
     def test_structured_json_path_bypasses_parser_calls(self) -> None:
         class RaisingParser(RequestParser):
