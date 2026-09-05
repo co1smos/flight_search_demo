@@ -271,6 +271,8 @@ class Issue4CorrectionTests(unittest.TestCase):
             'under 70000 points',
             'JFK to CDG on 2026-11-05 business for one adult under 70000 '
             'points using StarMiles',
+            'JFK to CDG on 2026-11-05 business for one adult under 70000 '
+            'points via miles',
             'JFK to CDG, StarMiles on 2026-11-05 business for one adult '
             'under 70000 points',
             'JFK to CDG on 2026-11-05 business for one adult under 70000 '
@@ -577,10 +579,15 @@ class Issue4CorrectionTests(unittest.TestCase):
     def test_unknown_and_non_ascii_airport_codes_are_rejected(self):
         from flight_search_demo.app import normalize_airport
 
-        for airport in ('QQQ', 'ABC', 'ÅBC', 'ＡＢＣ'):
+        for airport in ('QQQ', 'ÅBC', 'ＡＢＣ'):
             with self.subTest(airport=airport):
                 with self.assertRaisesRegex(ValueError, 'supported three-letter IATA'):
                     normalize_airport(airport, 'origin')
+
+    def test_dataset_member_ABC_is_accepted_as_an_airport_code(self):
+        from flight_search_demo.app import normalize_airport
+
+        self.assertEqual(normalize_airport('ABC', 'origin'), 'ABC')
 
     def test_sdk_numeric_fields_are_never_coerced(self):
         from dataclasses import asdict
@@ -783,6 +790,7 @@ class Issue4CorrectionTests(unittest.TestCase):
     def test_narrow_no_program_grammar_preserves_natural_request_forms(self):
         for original_text in (
             'JFK to CDG on 2026-11-05 business for one adult under 70000 points',
+            'JFK to CDG on 2026-11-05 business for one adult under 70000 miles',
             'Find one business seat from JFK to CDG next Thursday under 70k',
         ):
             with self.subTest(original_text=original_text):

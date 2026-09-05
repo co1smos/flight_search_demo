@@ -113,14 +113,14 @@ NO_PROGRAM_SUFFIX_WORDS = {
     "max", "ceiling", "next", "this", "coming", "today", "tomorrow", "one",
     "single", "a", "an", "adult", "adults", "passenger", "passengers",
     "traveler", "travelers", "traveller", "travellers", "business", "economy",
-    "premium", "first", "class", "seat", "seats", "points", "miles", "with",
+    "premium", "first", "class", "seat", "seats", "with",
 }
 NO_PROGRAM_ALLOWED_WORDS = frozenset(
     NO_PROGRAM_PREFIX_WORDS
     | NO_PROGRAM_SUFFIX_WORDS
     | {
         "and", "between", "book", "date", "departing", "from", "reserve",
-        "route", "to", "using", "via", "yesterday",
+        "route", "to", "yesterday",
         "january", "february", "march", "april", "may", "june", "july",
         "august", "september", "october", "november", "december",
         "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "oct",
@@ -431,20 +431,16 @@ def _is_closed_no_program_token(
     token: str,
     token_kind: str,
     *,
-    airport_spans: set[tuple[int, int]],
-    number_spans: set[tuple[int, int]],
-    k_spans: set[tuple[int, int]],
+    consumed_spans: set[tuple[int, int]],
     token_span: tuple[int, int],
 ) -> bool:
+    if any(
+        consumed_start <= token_span[0] and token_span[1] <= consumed_end
+        for consumed_start, consumed_end in consumed_spans
+    ):
+        return True
     if token_kind == "word":
-        word = token.lower()
-        return (
-            word in NO_PROGRAM_ALLOWED_WORDS
-            or token_span in airport_spans
-            or (word == "k" and token_span in k_spans)
-        )
-    if token_kind == "number":
-        return token_span in number_spans
+        return token.lower() in NO_PROGRAM_ALLOWED_WORDS
     return token in NO_PROGRAM_PUNCTUATION
 
 
@@ -461,29 +457,20 @@ def has_closed_no_program_grammar(
     route_match: re.Match[str],
 ) -> bool:
     """Accept only requests whose complete input is known request vocabulary."""
-    airport_spans = {
-        route_match.span("origin"),
-        route_match.span("destination"),
-    }
-    number_spans: set[tuple[int, int]] = set()
-    k_spans: set[tuple[int, int]] = set()
+    consumed_spans = {route_match.span()}
     ceiling_evidence_re = re.compile(
         r"\b(?:under|below|at\s+most|up\s+to|maximum|max|ceiling)\s+"
-        r"[^\s.;!?]+(?:\s+[kK])?"
-        r"|\b[^\s.;!?]+(?:\s+[kK])?\s*(?:points|miles)\b",
+        r"\d[\d,]*(?:\.\d+)?(?:[kK]|\s+[kK])?(?:\s+(?:points|miles))?\b"
+        r"|\b\d[\d,]*(?:\.\d+)?(?:[kK]|\s+[kK])?\s+(?:points|miles)\b",
         re.IGNORECASE,
     )
-    for evidence_re in (DATE_EVIDENCE_RE, PASSENGER_EVIDENCE_RE, ceiling_evidence_re):
-        for evidence in evidence_re.finditer(original_text):
-            for number in NO_PROGRAM_NUMBER_RE.finditer(
-                original_text, evidence.start(), evidence.end()
-            ):
-                number_spans.add(number.span())
-            for word in NO_PROGRAM_WORD_RE.finditer(
-                original_text, evidence.start(), evidence.end()
-            ):
-                if word.group(0).lower() == "k":
-                    k_spans.add(word.span())
+    for evidence_re in (
+        DATE_EVIDENCE_RE,
+        CABIN_EVIDENCE_RE,
+        PASSENGER_EVIDENCE_RE,
+        ceiling_evidence_re,
+    ):
+        consumed_spans.update(match.span() for match in evidence_re.finditer(original_text))
     position = 0
     while position < len(original_text):
         whitespace = re.match(r"\s+", original_text[position:])
@@ -505,9 +492,7 @@ def has_closed_no_program_grammar(
         if not _is_closed_no_program_token(
             token,
             token_kind,
-            airport_spans=airport_spans,
-            number_spans=number_spans,
-            k_spans=k_spans,
+            consumed_spans=consumed_spans,
             token_span=(position, position + len(token)),
         ):
             return False
@@ -1034,7 +1019,6 @@ def normalize_airport(value: Any, field_name: str) -> str:
     if (
         re.fullmatch(r"[A-Z]{3}", airport, flags=re.ASCII) is None
         or airport not in _airport_iata_codes()
-        or airport == "ABC"
     ):
         raise ValueError(f"{field_name} must be a supported three-letter IATA code")
     return airport
