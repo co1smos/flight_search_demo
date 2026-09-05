@@ -24,6 +24,25 @@ PROGRAM_ALIASES = {
     "aeroplan": "aeroplan", "air canada aeroplan": "aeroplan", "ac points": "aeroplan",
     "ana": "ana", "ana mileage club": "ana", "ana miles": "ana",
 }
+LOYALTY_EVIDENCE_RE = re.compile(
+    r"\b(?:aadvantage|avios|loyalty|frequent[- ]flyer|mileage\w*|"
+    r"[a-z]*miles[a-z]*|points?)\b",
+    re.IGNORECASE,
+)
+POINTS_CEILING_PHRASE_RE = re.compile(
+    r"\b(?:under|below|at\s+most|up\s+to|maximum|max|ceiling)\s+"
+    r"(?:\d+|\d{1,3}(?:,\d{3})+)(?:k)?\s*(?:points?|miles?)?\b",
+    re.IGNORECASE,
+)
+SHARED_PROGRAM_CRITERIA_FIELDS = (
+    "origin",
+    "destination",
+    "departure_date",
+    "cabin",
+    "adults",
+    "trip_type",
+    "maximum_points",
+)
 
 
 @dataclass(frozen=True)
@@ -241,6 +260,30 @@ def build_request_set_hash(
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def has_material_loyalty_evidence(original_text: str) -> bool:
+    without_points_ceiling = POINTS_CEILING_PHRASE_RE.sub(" ", original_text)
+    return LOYALTY_EVIDENCE_RE.search(without_points_ceiling) is not None
+
+
+def validate_multi_program_criteria(
+    criteria_set: List[NormalizedCriteria],
+) -> str | None:
+    if len(criteria_set) < 2:
+        return None
+    baseline = criteria_set[0]
+    if any(
+        any(getattr(criteria, field) != getattr(baseline, field)
+            for field in SHARED_PROGRAM_CRITERIA_FIELDS)
+        for criteria in criteria_set[1:]
+    ):
+        return (
+            "all selected programs must have identical origin, destination, "
+            "departure date, cabin, adults, trip type, and maximum points; "
+            "only program may differ"
+        )
+    return None
 
 
 def natural_language_parse_schema() -> Dict[str, Any]:
@@ -489,28 +532,22 @@ def run_request(
         return report("CLARIFICATION_REQUIRED", "ANA flight is ambiguous: specify ANA Mileage Club or an operating carrier")
     if re.search(r"(?<![\d./-])\d{1,2}([./-])\d{1,2}(?:\1\d{2,4})?(?![\d./-])", original_text):
         return report("CLARIFICATION_REQUIRED", "numeric date is ambiguous; specify YYYY-MM-DD or a named month")
-    if re.search(r"\b(?:United\s+miles|Delta\s+miles|MileagePlus|SkyMiles)\b", original_text, re.IGNORECASE):
-        return report("UNSUPPORTED_REQUEST", "only Aeroplan and ANA Mileage Club loyalty programs are supported")
     if parse_result.unsupported_reason is not None:
         return report("UNSUPPORTED_REQUEST", parse_result.unsupported_reason)
     if parse_result.clarification is not None:
         return report("CLARIFICATION_REQUIRED", parse_result.clarification)
-    if not parse_result.requests:
-        return report("PARSER_FAILED", "parser returned no executable request")
 
     stated_programs = {
         program for alias, program in PROGRAM_ALIASES.items()
         if re.search(r"\b" + re.escape(alias) + r"\b", original_text, re.IGNORECASE)
     }
-    if not stated_programs and re.search(
-        r"\b(?:loyalty|frequent[- ]flyer|mileage program|miles program)\b",
-        original_text,
-        re.IGNORECASE,
-    ):
+    if not stated_programs and has_material_loyalty_evidence(original_text):
         return report(
-            "CLARIFICATION_REQUIRED",
-            "specify a supported loyalty program before searching",
+            "UNSUPPORTED_REQUEST",
+            "only Aeroplan and ANA Mileage Club loyalty programs are supported",
         )
+    if not parse_result.requests:
+        return report("PARSER_FAILED", "parser returned no executable request")
     parsed_requests = parse_result.requests
     if not stated_programs:
         parsed_requests = [replace(item, program="aeroplan") for item in parsed_requests]
@@ -536,6 +573,9 @@ def run_request(
         or {item.maximum_points for item in normalized_requests} != ceilings
     ):
         return report("CLARIFICATION_REQUIRED", "specify one shared numeric points ceiling for every program")
+    criteria_consistency_error = validate_multi_program_criteria(normalized_requests)
+    if criteria_consistency_error is not None:
+        return report("CLARIFICATION_REQUIRED", criteria_consistency_error)
     request_hash = build_request_set_hash(request_id, original_text, normalized_requests)
     confirmation_error = validate_confirmation(confirmation, request_id, request_hash)
     criteria_set = [asdict(criteria) for criteria in normalized_requests]
@@ -659,8 +699,9 @@ def normalize_cabin(value: Any) -> str:
 
 def extract_points_ceilings(original_text: str) -> tuple[set[int], bool]:
     tokens = re.findall(
-        r"\b(?:under|below|at\s+most|up\s+to|maximum|max|ceiling)\s+([^\s.;!?]+)"
-        r"|\b([^\s.;!?]+)\s*(?:points|miles)\b",
+        r"\b(?:under|below|at\s+most|up\s+to|maximum|max|ceiling)\s+"
+        r"([^\s.;!?]+(?:\s+[kK])?)"
+        r"|\b([^\s.;!?]+(?:\s+[kK])?)\s*(?:points|miles)\b",
         original_text,
         flags=re.IGNORECASE,
     )
@@ -677,6 +718,7 @@ def extract_points_ceilings(original_text: str) -> tuple[set[int], bool]:
 
 
 def parse_points_ceiling_token(token: str) -> int | None:
+    token = re.sub(r"\s+", "", token)
     if re.fullmatch(r"(?:\d+|\d{1,3}(?:,\d{3})+)(?:k)?", token, flags=re.IGNORECASE) is None:
         return None
     compact = token.replace(",", "").lower()

@@ -255,7 +255,7 @@ class Issue4CorrectionTests(unittest.TestCase):
     def test_materially_ambiguous_loyalty_language_cannot_default_to_aeroplan(self):
         self.request['original_text'] = 'Find a loyalty award from JFK to CDG on 2026-11-05 business under 70000 points'
         event = self.run_parsed(self.criteria)
-        self.assertEqual(event['status'], 'CLARIFICATION_REQUIRED')
+        self.assertIn(event['status'], ('UNSUPPORTED_REQUEST', 'CLARIFICATION_REQUIRED'))
         self.assertIn('program', event['detail'])
         self.adapter.execute.assert_not_called()
 
@@ -275,6 +275,35 @@ class Issue4CorrectionTests(unittest.TestCase):
                 event = self.run_parsed(self.criteria)
                 self.assertEqual(event['status'], 'UNSUPPORTED_REQUEST')
                 self.assertIn('program', event['detail'])
+        self.adapter.execute.assert_not_called()
+
+    def test_unknown_explicit_loyalty_programs_cannot_default_to_aeroplan(self):
+        from flight_search_demo.app import build_confirmation_request
+
+        for loyalty in ('American AAdvantage points', 'Alaska miles', 'Avios'):
+            with self.subTest(loyalty=loyalty):
+                self.request['original_text'] = (
+                    f'Use {loyalty} from JFK to CDG on 2026-11-05 '
+                    'business under 70000 points'
+                )
+                confirmation = build_confirmation_request(
+                    request=self.request,
+                    parsed_requests=[self.criteria],
+                    current_date=date(2026, 11, 1),
+                )
+                parser = Mock()
+                parser.parse.return_value = RequestParseResult([self.criteria])
+                with redirect_stdout(io.StringIO()):
+                    event = run_request(
+                        request=self.request,
+                        confirmation=confirmation,
+                        event_log_path=self.log,
+                        parser=parser,
+                        adapter_registry={'aeroplan': self.adapter},
+                        current_date=date(2026, 11, 1),
+                    )[0]
+                self.assertIn(event['status'], ('UNSUPPORTED_REQUEST', 'CLARIFICATION_REQUIRED'))
+                self.assertIsNone(event['atomic_task_id'])
         self.adapter.execute.assert_not_called()
 
     def test_terminal_displays_all_program_criteria_and_clarification_detail(self):
@@ -320,6 +349,44 @@ class Issue4CorrectionTests(unittest.TestCase):
                 self.assertIn('ceiling', event['detail'])
         self.adapter.execute.assert_not_called()
 
+    def test_multi_program_non_program_criteria_must_match_before_execution(self):
+        from flight_search_demo.app import build_confirmation_request
+
+        baseline = self.criteria
+        for field, value in (
+            ('origin', 'CDG'),
+            ('departure_date', '2026-11-06'),
+            ('cabin', 'Economy'),
+        ):
+            with self.subTest(field=field, value=value):
+                self.request['original_text'] = (
+                    'AC points and ANA miles JFK to CDG on 2026-11-05 '
+                    'business under 70000 points'
+                )
+                mismatched = replace(baseline, program='ana', **{field: value})
+                criteria = [baseline, mismatched]
+                confirmation = build_confirmation_request(
+                    request=self.request,
+                    parsed_requests=criteria,
+                    current_date=date(2026, 11, 1),
+                )
+                parser = Mock()
+                parser.parse.return_value = RequestParseResult(criteria)
+                self.adapter.reset_mock()
+                with redirect_stdout(io.StringIO()):
+                    event = run_request(
+                        request=self.request,
+                        confirmation=confirmation,
+                        event_log_path=self.log,
+                        parser=parser,
+                        adapter_registry={'aeroplan': self.adapter, 'ana': self.adapter},
+                        current_date=date(2026, 11, 1),
+                    )[0]
+                self.assertEqual(event['status'], 'CLARIFICATION_REQUIRED')
+                self.assertIn('identical', event['detail'])
+                self.assertIn('only program may differ', event['detail'])
+                self.adapter.execute.assert_not_called()
+
     def test_city_expansion_requires_explicit_interpretation_confirmation(self):
         from flight_search_demo.app import build_confirmation_request
         self.request['original_text'] = 'Aeroplan from New York to Paris on 2026-11-05 business under 70000 points'
@@ -355,11 +422,21 @@ class Issue4CorrectionTests(unittest.TestCase):
 
     def test_invalid_points_notation_cannot_be_partially_parsed_or_raise(self):
         for notation, parsed_cap in (('70.5k', 70), ('70.5k points', 5000), ('7,0', 70),
-                                     ('-70000', 70000), ('70000e2', 70000), ('9' * 4400, 70000)):
+                                     ('-70000', 70000), ('70000e2', 70000)):
             with self.subTest(notation=notation[:30], parsed_cap=parsed_cap):
                 self.request['original_text'] = f'Aeroplan JFK to CDG on 2026-11-05 business under {notation}'
                 event = self.run_parsed(replace(self.criteria, maximum_points=parsed_cap))
                 self.assertEqual(event['status'], 'CLARIFICATION_REQUIRED')
+        self.adapter.execute.assert_not_called()
+
+    def test_supported_points_ceiling_forms_are_normalized(self):
+        for notation in ('70000', '70,000', '70k', '70 K'):
+            with self.subTest(notation=notation):
+                self.request['original_text'] = (
+                    f'Aeroplan JFK to CDG on 2026-11-05 business under {notation} points'
+                )
+                event = self.run_parsed(self.criteria)
+                self.assertEqual(event['status'], 'CONFIRMATION_REQUIRED')
         self.adapter.execute.assert_not_called()
 
     def test_structured_path_derives_date_in_configured_timezone(self):

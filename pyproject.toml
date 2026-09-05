@@ -9,7 +9,7 @@ description = "Controlled-page browser stack spike for Gemini, browser-use, and 
 requires-python = ">=3.11"
 dependencies = [
   "browser-use>=0.8.0",
-  "google-genai>=1.0.0",
+  "google-genai>=1.60,<2",
   "pydantic>=2.11,<3",
   "python-dotenv>=1.0.1,<2",
   "steel-sdk>=0.6.0",
