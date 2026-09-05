@@ -24,9 +24,11 @@ class Issue4CorrectionTests(unittest.TestCase):
         self.request = {'request_id': 'correction', 'original_text':
                         'Aeroplan JFK to CDG on 2026-11-05 business for one adult under 70000 points'}
 
-    def run_parsed(self, criteria):
+    def run_parsed(self, criteria, *, program_selection='supported'):
         parser = Mock()
-        parser.parse.return_value = RequestParseResult([criteria], diagnostics={'parser': 'offline'})
+        parser.parse.return_value = RequestParseResult(
+            [criteria], program_selection=program_selection, diagnostics={'parser': 'offline'}
+        )
         with redirect_stdout(io.StringIO()):
             return run_request(request=self.request, confirmation={'confirmed': True},
                                event_log_path=self.log, parser=parser,
@@ -59,7 +61,11 @@ class Issue4CorrectionTests(unittest.TestCase):
             return httpx.Response(200, json={
                 'id': 'offline-interaction', 'status': 'completed',
                 'created': '2026-11-01T00:00:00Z', 'updated': '2026-11-01T00:00:00Z',
-                'outputs': [{'type': 'text', 'text': json.dumps({'requests': [asdict(self.criteria)]})}],
+                'outputs': [{'type': 'text', 'text': json.dumps({
+                    'program_selection': 'supported',
+                    'stated_program': 'Aeroplan',
+                    'requests': [asdict(self.criteria)],
+                })}],
             })
 
         with httpx.Client(transport=httpx.MockTransport(respond)) as transport:
@@ -72,8 +78,201 @@ class Issue4CorrectionTests(unittest.TestCase):
                                          current_date=date(2026, 11, 1))
         self.assertEqual(wire[0].get('response_mime_type'), 'application/json')
         self.assertEqual(wire[0]['response_format'], natural_language_parse_schema())
+        self.assertIn('program_selection', wire[0]['input'])
+        self.assertEqual(wire[0]['response_format']['properties']['program_selection']['enum'],
+                         ['omitted', 'supported', 'unsupported', 'ambiguous'])
+        self.assertIn('program_selection', wire[0]['response_format']['required'])
         self.assertEqual(events[0]['status'], 'CONFIRMATION_REQUIRED')
         self.assertEqual(events[0]['normalized_criteria']['maximum_points'], 70000)
+
+    def test_unsupported_program_provenance_cannot_execute_with_confirmation(self):
+        self.request['original_text'] = (
+            'Use Flying Blue from JFK to CDG on 2026-11-05 business under 70000 points'
+        )
+        parser = Mock()
+        parser.parse.return_value = RequestParseResult(
+            [self.criteria],
+            program_selection='unsupported',
+            stated_program='Flying Blue',
+        )
+        with redirect_stdout(io.StringIO()):
+            event = run_request(
+                request=self.request,
+                confirmation={'confirmed': True},
+                event_log_path=self.log,
+                parser=parser,
+                adapter_registry={'aeroplan': self.adapter},
+                current_date=date(2026, 11, 1),
+            )[0]
+
+        self.assertEqual(event['status'], 'UNSUPPORTED_REQUEST')
+        self.assertIsNone(event['atomic_task_id'])
+        self.adapter.execute.assert_not_called()
+
+    def test_ambiguous_program_provenance_cannot_execute_with_confirmation(self):
+        self.request['original_text'] = (
+            'Find an ANA flight from JFK to CDG on 2026-11-05 business under 70000 points'
+        )
+        parser = Mock()
+        parser.parse.return_value = RequestParseResult(
+            [self.criteria],
+            program_selection='ambiguous',
+            stated_program='ANA flight',
+        )
+        with redirect_stdout(io.StringIO()):
+            event = run_request(
+                request=self.request,
+                confirmation={'confirmed': True},
+                event_log_path=self.log,
+                parser=parser,
+                adapter_registry={'aeroplan': self.adapter},
+                current_date=date(2026, 11, 1),
+            )[0]
+
+        self.assertEqual(event['status'], 'CLARIFICATION_REQUIRED')
+        self.assertIsNone(event['atomic_task_id'])
+        self.adapter.execute.assert_not_called()
+
+    def test_supported_program_provenance_must_match_aliases_and_tasks(self):
+        self.request['original_text'] = (
+            'Use ANA miles from JFK to CDG on 2026-11-05 business under 70000 points'
+        )
+        parser = Mock()
+        parser.parse.return_value = RequestParseResult(
+            [self.criteria],
+            program_selection='supported',
+            stated_program='ANA miles',
+        )
+        with redirect_stdout(io.StringIO()):
+            event = run_request(
+                request=self.request,
+                confirmation={'confirmed': True},
+                event_log_path=self.log,
+                parser=parser,
+                adapter_registry={'aeroplan': self.adapter},
+                current_date=date(2026, 11, 1),
+            )[0]
+
+        self.assertEqual(event['status'], 'CLARIFICATION_REQUIRED')
+        self.assertIn('program', event['detail'])
+        self.assertIsNone(event['atomic_task_id'])
+        self.adapter.execute.assert_not_called()
+
+    def test_omitted_program_provenance_cannot_override_an_explicit_supported_alias(self):
+        self.request['original_text'] = (
+            'Use ANA miles from JFK to CDG on 2026-11-05 business under 70000 points'
+        )
+        parser = Mock()
+        parser.parse.return_value = RequestParseResult(
+            [self.criteria],
+            program_selection='omitted',
+        )
+        with redirect_stdout(io.StringIO()):
+            event = run_request(
+                request=self.request,
+                confirmation={'confirmed': True},
+                event_log_path=self.log,
+                parser=parser,
+                adapter_registry={'aeroplan': self.adapter},
+                current_date=date(2026, 11, 1),
+            )[0]
+
+        self.assertEqual(event['status'], 'CLARIFICATION_REQUIRED')
+        self.assertIn('provenance', event['detail'])
+        self.assertIsNone(event['atomic_task_id'])
+        self.adapter.execute.assert_not_called()
+
+    def test_supported_program_provenance_must_match_stated_program_text(self):
+        from flight_search_demo.app import build_confirmation_request
+
+        parser = Mock()
+        parser.parse.return_value = RequestParseResult(
+            [self.criteria],
+            program_selection='supported',
+            stated_program='ANA Mileage Club',
+        )
+        with redirect_stdout(io.StringIO()):
+            event = run_request(
+                request=self.request,
+                confirmation=build_confirmation_request(
+                    request=self.request, parsed_requests=[self.criteria]
+                ),
+                event_log_path=self.log,
+                parser=parser,
+                adapter_registry={'aeroplan': self.adapter},
+                current_date=date(2026, 11, 1),
+            )[0]
+
+        self.assertEqual(event['status'], 'CLARIFICATION_REQUIRED')
+        self.assertIn('program', event['detail'])
+        self.assertIsNone(event['atomic_task_id'])
+        self.adapter.execute.assert_not_called()
+
+    def test_invalid_program_selection_provenance_is_parser_failure(self):
+        parser = Mock()
+        parser.parse.return_value = RequestParseResult(
+            [self.criteria],
+            program_selection='maybe',
+        )
+        with redirect_stdout(io.StringIO()):
+            event = run_request(
+                request=self.request,
+                confirmation={'confirmed': True},
+                event_log_path=self.log,
+                parser=parser,
+                adapter_registry={'aeroplan': self.adapter},
+                current_date=date(2026, 11, 1),
+            )[0]
+
+        self.assertEqual(event['status'], 'PARSER_FAILED')
+        self.assertIsNone(event['atomic_task_id'])
+        self.adapter.execute.assert_not_called()
+
+    def test_cli_allowlisted_exact_codes_execute_and_fixture_nonmatch_is_deterministic(self):
+        from unittest.mock import patch
+        from flight_search_demo.app import build_request_hash, main, normalize_request
+
+        for origin, destination in (('LHR', 'NRT'), ('NRT', 'SFO'), ('SFO', 'LHR')):
+            with self.subTest(origin=origin, destination=destination):
+                request = {
+                    'request_id': f'cli-{origin.lower()}-{destination.lower()}',
+                    'original_text': f'Find Aeroplan from {origin} to {destination}',
+                    'program': 'aeroplan',
+                    'origin': origin,
+                    'destination': destination,
+                    'departure_date': '2026-11-05',
+                    'cabin': 'business',
+                    'adults': 1,
+                    'trip_type': 'one_way',
+                    'maximum_points': 70000,
+                }
+                criteria = normalize_request(request, current_date=date(2026, 11, 1))
+                confirmation = {
+                    'request_id': request['request_id'],
+                    'request_hash': build_request_hash(
+                        request['request_id'], request['original_text'], criteria
+                    ),
+                    'confirmed': True,
+                }
+                request_path = self.log.parent / f'{origin}-{destination}-request.json'
+                confirmation_path = self.log.parent / f'{origin}-{destination}-confirmation.json'
+                event_log_path = self.log.parent / f'{origin}-{destination}-events.jsonl'
+                request_path.write_text(json.dumps(request), encoding='utf-8')
+                confirmation_path.write_text(json.dumps(confirmation), encoding='utf-8')
+                with patch('sys.argv', [
+                    'flight_search_demo.app', '--request', str(request_path),
+                    '--confirmation', str(confirmation_path),
+                    '--event-log', str(event_log_path),
+                    '--current-date', '2026-11-01',
+                ]):
+                    exit_code = main()
+
+                event = json.loads(event_log_path.read_text(encoding='utf-8'))
+                self.assertEqual(exit_code, 1)
+                self.assertEqual(event['status'], 'NO_AWARD_AVAILABILITY')
+                self.assertIsNotNone(event['atomic_task_id'])
+                self.assertEqual(event['normalized_criteria']['origin'], origin)
+                self.assertEqual(event['normalized_criteria']['destination'], destination)
 
     def test_sdk_numeric_fields_are_never_coerced(self):
         from dataclasses import asdict
@@ -86,7 +285,11 @@ class Issue4CorrectionTests(unittest.TestCase):
                     client = Mock()
                     item = asdict(replace(self.criteria, **{field: value}))
                     client.interactions.create.return_value = SimpleNamespace(outputs=[
-                        SimpleNamespace(type='text', text=json.dumps({'requests': [item]}))])
+                        SimpleNamespace(type='text', text=json.dumps({
+                            'program_selection': 'supported',
+                            'stated_program': 'Aeroplan',
+                            'requests': [item],
+                        }))])
                     parser = GoogleGenAIRequestParser(client=client, model='offline')
                     with redirect_stdout(io.StringIO()):
                         event = run_request(request=self.request, confirmation={},
@@ -100,7 +303,8 @@ class Issue4CorrectionTests(unittest.TestCase):
         from flight_search_demo.app import ParserFailure, build_confirmation_request
         parser = Mock()
         parser.parse.side_effect = [
-            RequestParseResult([self.criteria], diagnostics={'model': 'offline-model'}),
+            RequestParseResult([self.criteria], program_selection='supported',
+                               diagnostics={'model': 'offline-model'}),
             ParserFailure('internal-sdk-detail', diagnostics={'model': 'offline-model'}),
         ]
         self.adapter.execute.return_value = {'status': 'MATCH_FOUND', 'detail': 'fixture'}
@@ -143,9 +347,12 @@ class Issue4CorrectionTests(unittest.TestCase):
 
     def test_malformed_parser_result_is_a_linked_nonexecuting_failure(self):
         from types import SimpleNamespace
-        for result in (None, {}, RequestParseResult([{}]),
-                       RequestParseResult(None), RequestParseResult([self.criteria], clarification=True),
-                       RequestParseResult([SimpleNamespace(program='aeroplan')])):
+        for result in (None, {}, RequestParseResult([{}], program_selection='supported'),
+                       RequestParseResult(None, program_selection='supported'),
+                       RequestParseResult([self.criteria], program_selection='supported',
+                                           clarification=True),
+                       RequestParseResult([SimpleNamespace(program='aeroplan')],
+                                           program_selection='supported')):
             with self.subTest(result=result):
                 parser = Mock()
                 parser.parse.return_value = result
@@ -161,7 +368,7 @@ class Issue4CorrectionTests(unittest.TestCase):
     def test_unserializable_parser_diagnostics_do_not_escape_application(self):
         parser = Mock()
         parser.parse.return_value = RequestParseResult(
-            [self.criteria], diagnostics={'provider': object()}
+            [self.criteria], program_selection='supported', diagnostics={'provider': object()}
         )
         with redirect_stdout(io.StringIO()):
             event = run_request(
@@ -179,7 +386,7 @@ class Issue4CorrectionTests(unittest.TestCase):
 
     def test_invalid_timezone_is_nonexecuting_and_never_reaches_parser(self):
         parser = Mock()
-        parser.parse.return_value = RequestParseResult([self.criteria])
+        parser.parse.return_value = RequestParseResult([self.criteria], program_selection='supported')
         with redirect_stdout(io.StringIO()):
             event = run_request(request=self.request, confirmation={}, event_log_path=self.log,
                                 parser=parser, timezone_name='Mars/Olympus',
@@ -192,7 +399,10 @@ class Issue4CorrectionTests(unittest.TestCase):
     def test_clock_date_is_derived_in_configured_timezone_for_parse_and_validation(self):
         from datetime import datetime, timezone
         parser = Mock()
-        parser.parse.return_value = RequestParseResult([replace(self.criteria, departure_date='2026-11-01')])
+        parser.parse.return_value = RequestParseResult(
+            [replace(self.criteria, departure_date='2026-11-01')],
+            program_selection='supported',
+        )
         for zone, expected_date, status in (
             ('America/Los_Angeles', date(2026, 11, 1), 'CONFIRMATION_REQUIRED'),
             ('Asia/Tokyo', date(2026, 11, 2), 'UNSUPPORTED_REQUEST'),
@@ -209,7 +419,8 @@ class Issue4CorrectionTests(unittest.TestCase):
         self.request['original_text'] = 'Find an ANA flight from JFK to CDG on 2026-11-05 business under 70000 points'
         confirmation = build_confirmation_request(request=self.request, parsed_requests=[self.criteria])
         parser = Mock()
-        parser.parse.return_value = RequestParseResult([self.criteria])
+        parser.parse.return_value = RequestParseResult([self.criteria], program_selection='ambiguous',
+                                                       stated_program='ANA flight')
         with redirect_stdout(io.StringIO()):
             event = run_request(request=self.request, confirmation=confirmation, parser=parser,
                                 event_log_path=self.log, adapter_registry={'aeroplan': self.adapter},
@@ -234,7 +445,11 @@ class Issue4CorrectionTests(unittest.TestCase):
             with self.subTest(alias=alias):
                 self.request['original_text'] = f'Use {alias} from JFK to CDG on 2026-11-05 business under 70000'
                 parser = Mock()
-                parser.parse.return_value = RequestParseResult([replace(self.criteria, program=alias)])
+                parser.parse.return_value = RequestParseResult(
+                    [replace(self.criteria, program=alias)],
+                    program_selection='supported',
+                    stated_program=alias,
+                )
                 with redirect_stdout(io.StringIO()):
                     event = run_request(request=self.request, confirmation={}, parser=parser,
                                         event_log_path=self.log, current_date=date(2026, 11, 1))[0]
@@ -245,16 +460,21 @@ class Issue4CorrectionTests(unittest.TestCase):
         self.request['original_text'] = 'JFK to CDG on 2026-11-05 business one adult under 70000 points'
         for parsed_program in ('', 'ana'):
             with self.subTest(parsed_program=parsed_program):
-                event = self.run_parsed(replace(self.criteria, program=parsed_program))
+                event = self.run_parsed(
+                    replace(self.criteria, program=parsed_program),
+                    program_selection='omitted',
+                )
                 self.assertEqual(event['status'], 'CONFIRMATION_REQUIRED')
                 self.assertEqual(event['normalized_criteria']['program'], 'aeroplan')
-        event = self.run_parsed(replace(self.criteria, program='', cabin=None))
+        event = self.run_parsed(
+            replace(self.criteria, program='', cabin=None), program_selection='omitted'
+        )
         self.assertIn(event['status'], ('CLARIFICATION_REQUIRED', 'UNSUPPORTED_REQUEST'))
         self.adapter.execute.assert_not_called()
 
     def test_materially_ambiguous_loyalty_language_cannot_default_to_aeroplan(self):
         self.request['original_text'] = 'Find a loyalty award from JFK to CDG on 2026-11-05 business under 70000 points'
-        event = self.run_parsed(self.criteria)
+        event = self.run_parsed(self.criteria, program_selection='ambiguous')
         self.assertIn(event['status'], ('UNSUPPORTED_REQUEST', 'CLARIFICATION_REQUIRED'))
         self.assertIn('program', event['detail'])
         self.adapter.execute.assert_not_called()
@@ -263,7 +483,7 @@ class Issue4CorrectionTests(unittest.TestCase):
         for selection in ('ANA miles', 'AC points and ANA miles'):
             with self.subTest(selection=selection):
                 self.request['original_text'] = f'{selection} JFK to CDG on 2026-11-05 business under 70000 points'
-                event = self.run_parsed(self.criteria)
+                event = self.run_parsed(self.criteria, program_selection='supported')
                 self.assertEqual(event['status'], 'CLARIFICATION_REQUIRED')
                 self.assertIn('program', event['detail'])
         self.adapter.execute.assert_not_called()
@@ -272,7 +492,7 @@ class Issue4CorrectionTests(unittest.TestCase):
         for loyalty in ('United miles', 'United MileagePlus', 'Delta SkyMiles', 'Delta miles'):
             with self.subTest(loyalty=loyalty):
                 self.request['original_text'] = f'Use {loyalty} JFK to CDG on 2026-11-05 business under 70000'
-                event = self.run_parsed(self.criteria)
+                event = self.run_parsed(self.criteria, program_selection='unsupported')
                 self.assertEqual(event['status'], 'UNSUPPORTED_REQUEST')
                 self.assertIn('program', event['detail'])
         self.adapter.execute.assert_not_called()
@@ -280,7 +500,15 @@ class Issue4CorrectionTests(unittest.TestCase):
     def test_unknown_explicit_loyalty_programs_cannot_default_to_aeroplan(self):
         from flight_search_demo.app import build_confirmation_request
 
-        for loyalty in ('American AAdvantage points', 'Alaska miles', 'Avios'):
+        for loyalty in (
+            'Flying Blue',
+            'Emirates Skywards',
+            'British Airways Executive Club',
+            'KrisFlyer',
+            'AAdvantage',
+            'Alaska miles',
+            'Avios',
+        ):
             with self.subTest(loyalty=loyalty):
                 self.request['original_text'] = (
                     f'Use {loyalty} from JFK to CDG on 2026-11-05 '
@@ -292,7 +520,11 @@ class Issue4CorrectionTests(unittest.TestCase):
                     current_date=date(2026, 11, 1),
                 )
                 parser = Mock()
-                parser.parse.return_value = RequestParseResult([self.criteria])
+                parser.parse.return_value = RequestParseResult(
+                    [self.criteria],
+                    program_selection='unsupported',
+                    stated_program=loyalty,
+                )
                 with redirect_stdout(io.StringIO()):
                     event = run_request(
                         request=self.request,
@@ -310,8 +542,10 @@ class Issue4CorrectionTests(unittest.TestCase):
         self.request['original_text'] = 'AC points and ANA miles JFK to CDG on 2026-11-05 business under 70000'
         parser = Mock()
         parser.parse.side_effect = [
-            RequestParseResult([self.criteria, replace(self.criteria, program='ana')]),
-            RequestParseResult([], clarification='Specify an exact departure date'),
+            RequestParseResult([self.criteria, replace(self.criteria, program='ana')],
+                               program_selection='supported'),
+            RequestParseResult([], program_selection='ambiguous',
+                               clarification='Specify an exact departure date'),
         ]
         stdout = io.StringIO()
         with redirect_stdout(stdout):
@@ -339,7 +573,9 @@ class Issue4CorrectionTests(unittest.TestCase):
                             replace(self.criteria, program='ana', maximum_points=ana_cap)]
                 confirmation = build_confirmation_request(request=self.request, parsed_requests=criteria)
                 parser = Mock()
-                parser.parse.return_value = RequestParseResult(criteria)
+                parser.parse.return_value = RequestParseResult(
+                    criteria, program_selection='supported'
+                )
                 with redirect_stdout(io.StringIO()):
                     event = run_request(request=self.request, confirmation=confirmation, parser=parser,
                                         event_log_path=self.log,
@@ -371,7 +607,9 @@ class Issue4CorrectionTests(unittest.TestCase):
                     current_date=date(2026, 11, 1),
                 )
                 parser = Mock()
-                parser.parse.return_value = RequestParseResult(criteria)
+                parser.parse.return_value = RequestParseResult(
+                    criteria, program_selection='supported'
+                )
                 self.adapter.reset_mock()
                 with redirect_stdout(io.StringIO()):
                     event = run_request(
@@ -392,7 +630,7 @@ class Issue4CorrectionTests(unittest.TestCase):
         self.request['original_text'] = 'Aeroplan from New York to Paris on 2026-11-05 business under 70000 points'
         confirmation = build_confirmation_request(request=self.request, parsed_requests=[self.criteria])
         parser = Mock()
-        parser.parse.return_value = RequestParseResult([self.criteria])
+        parser.parse.return_value = RequestParseResult([self.criteria], program_selection='supported')
         with redirect_stdout(io.StringIO()):
             first = run_request(request=self.request, confirmation=confirmation, parser=parser,
                                 event_log_path=self.log, adapter_registry={'aeroplan': self.adapter},
@@ -411,7 +649,9 @@ class Issue4CorrectionTests(unittest.TestCase):
     def test_duplicate_program_entries_cannot_execute_multiple_tasks(self):
         from flight_search_demo.app import build_confirmation_request
         parser = Mock()
-        parser.parse.return_value = RequestParseResult([self.criteria, self.criteria])
+        parser.parse.return_value = RequestParseResult(
+            [self.criteria, self.criteria], program_selection='supported'
+        )
         confirmation = build_confirmation_request(request=self.request, parsed_requests=[self.criteria, self.criteria])
         with redirect_stdout(io.StringIO()):
             event = run_request(request=self.request, confirmation=confirmation, parser=parser,

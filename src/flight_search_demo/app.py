@@ -19,21 +19,12 @@ SUPPORTED_CABINS = {
     "business": "Business",
     "first": "First",
 }
-SUPPORTED_AIRPORTS = {"CDG", "JFK"}
+SUPPORTED_AIRPORTS = {"CDG", "JFK", "LHR", "NRT", "SFO"}
 PROGRAM_ALIASES = {
     "aeroplan": "aeroplan", "air canada aeroplan": "aeroplan", "ac points": "aeroplan",
     "ana": "ana", "ana mileage club": "ana", "ana miles": "ana",
 }
-LOYALTY_EVIDENCE_RE = re.compile(
-    r"\b(?:aadvantage|avios|loyalty|frequent[- ]flyer|mileage\w*|"
-    r"[a-z]*miles[a-z]*|points?)\b",
-    re.IGNORECASE,
-)
-POINTS_CEILING_PHRASE_RE = re.compile(
-    r"\b(?:under|below|at\s+most|up\s+to|maximum|max|ceiling)\s+"
-    r"(?:\d+|\d{1,3}(?:,\d{3})+)(?:k)?\s*(?:points?|miles?)?\b",
-    re.IGNORECASE,
-)
+PROGRAM_SELECTION_STATES = {"omitted", "supported", "unsupported", "ambiguous"}
 SHARED_PROGRAM_CRITERIA_FIELDS = (
     "origin",
     "destination",
@@ -72,6 +63,8 @@ class ParsedNaturalLanguageRequest:
 @dataclass(frozen=True)
 class RequestParseResult:
     requests: List[ParsedNaturalLanguageRequest]
+    program_selection: str
+    stated_program: str | None = None
     clarification: str | None = None
     unsupported_reason: str | None = None
     diagnostics: Dict[str, Any] | None = None
@@ -117,6 +110,8 @@ class GoogleGenAIRequestParser:
     ) -> RequestParseResult:
         prompt = (
             "Parse this award-search request into JSON. "
+            "Set program_selection to exactly omitted, supported, unsupported, or ambiguous. "
+            "Return stated_program when the request names or implies a loyalty program. "
             "If the request is ambiguous, missing required fields, uses a city alias, or uses an ambiguous numeric date, "
             "return clarification or unsupported_reason instead of inventing values. "
             "Resolve relative dates using the provided timezone and return absolute YYYY-MM-DD dates.\n"
@@ -143,6 +138,8 @@ class GoogleGenAIRequestParser:
             ) from exc
 
         try:
+            program_selection = payload["program_selection"]
+            stated_program = payload.get("stated_program")
             requests = [
                 ParsedNaturalLanguageRequest(
                     program=str(item["program"]).strip().lower(),
@@ -165,6 +162,8 @@ class GoogleGenAIRequestParser:
         diagnostics = {"provider": "google_genai", "model": self._model}
         return RequestParseResult(
             requests=requests,
+            program_selection=program_selection,
+            stated_program=stated_program,
             clarification=payload.get("clarification"),
             unsupported_reason=payload.get("unsupported_reason"),
             diagnostics=diagnostics,
@@ -262,9 +261,16 @@ def build_request_set_hash(
     return hashlib.sha256(encoded).hexdigest()
 
 
-def has_material_loyalty_evidence(original_text: str) -> bool:
-    without_points_ceiling = POINTS_CEILING_PHRASE_RE.sub(" ", original_text)
-    return LOYALTY_EVIDENCE_RE.search(without_points_ceiling) is not None
+def deterministic_program_aliases(original_text: str) -> set[str]:
+    return {
+        program
+        for alias, program in PROGRAM_ALIASES.items()
+        if re.search(r"(?<!\w)" + re.escape(alias) + r"(?!\w)", original_text, re.IGNORECASE)
+    }
+
+
+def has_material_program_ambiguity(original_text: str) -> bool:
+    return re.search(r"\bANA\s+flights?\b", original_text, re.IGNORECASE) is not None
 
 
 def validate_multi_program_criteria(
@@ -316,10 +322,15 @@ def natural_language_parse_schema() -> Dict[str, Any]:
                     ],
                 },
             },
+            "program_selection": {
+                "type": "string",
+                "enum": ["omitted", "supported", "unsupported", "ambiguous"],
+            },
+            "stated_program": {"type": "string"},
             "clarification": {"type": "string"},
             "unsupported_reason": {"type": "string"},
         },
-        "required": ["requests"],
+        "required": ["requests", "program_selection"],
     }
 
 
@@ -523,13 +534,40 @@ def run_request(
             or (parse_result.diagnostics is not None and not isinstance(parse_result.diagnostics, dict))
         ):
             raise ParserFailure("parser returned invalid structured data")
+        if parse_result.program_selection not in PROGRAM_SELECTION_STATES:
+            raise ParserFailure("parser returned invalid program selection state")
+        if parse_result.stated_program is not None and (
+            not isinstance(parse_result.stated_program, str)
+            or not parse_result.stated_program.strip()
+        ):
+            raise ParserFailure("parser returned invalid stated program")
     except Exception as exc:
         diagnostic(getattr(exc, "diagnostics", {"parser_exception": type(exc).__name__}), str(exc))
         return report("PARSER_FAILED", "request parsing failed; see diagnostics")
 
     diagnostic(parse_result.diagnostics or {})
-    if re.search(r"\bANA\s+flights?\b", original_text, re.IGNORECASE):
-        return report("CLARIFICATION_REQUIRED", "ANA flight is ambiguous: specify ANA Mileage Club or an operating carrier")
+    if parse_result.program_selection == "unsupported":
+        return report(
+            "UNSUPPORTED_REQUEST",
+            parse_result.unsupported_reason
+            or f"program is not supported: {parse_result.stated_program or 'stated program'}",
+        )
+    if parse_result.program_selection == "ambiguous":
+        return report(
+            "CLARIFICATION_REQUIRED",
+            parse_result.clarification
+            or (
+                f"program selection is ambiguous ({parse_result.stated_program}); "
+                "specify one supported loyalty program"
+                if parse_result.stated_program
+                else "program selection is ambiguous; specify one supported loyalty program"
+            ),
+        )
+    if has_material_program_ambiguity(original_text):
+        return report(
+            "CLARIFICATION_REQUIRED",
+            "ANA flight is ambiguous: specify ANA Mileage Club or an operating carrier",
+        )
     if re.search(r"(?<![\d./-])\d{1,2}([./-])\d{1,2}(?:\1\d{2,4})?(?![\d./-])", original_text):
         return report("CLARIFICATION_REQUIRED", "numeric date is ambiguous; specify YYYY-MM-DD or a named month")
     if parse_result.unsupported_reason is not None:
@@ -537,19 +575,32 @@ def run_request(
     if parse_result.clarification is not None:
         return report("CLARIFICATION_REQUIRED", parse_result.clarification)
 
-    stated_programs = {
-        program for alias, program in PROGRAM_ALIASES.items()
-        if re.search(r"\b" + re.escape(alias) + r"\b", original_text, re.IGNORECASE)
-    }
-    if not stated_programs and has_material_loyalty_evidence(original_text):
-        return report(
-            "UNSUPPORTED_REQUEST",
-            "only Aeroplan and ANA Mileage Club loyalty programs are supported",
-        )
+    stated_programs = deterministic_program_aliases(original_text)
+    if parse_result.program_selection == "omitted":
+        if stated_programs or parse_result.stated_program or has_material_program_ambiguity(original_text):
+            return report(
+                "CLARIFICATION_REQUIRED",
+                "program selection provenance conflicts with the original request",
+            )
+        expected_programs = {"aeroplan"}
+    else:
+        if not stated_programs:
+            return report(
+                "CLARIFICATION_REQUIRED",
+                "supported program selection has no deterministic supported alias",
+            )
+        expected_programs = stated_programs
+        if parse_result.stated_program and (
+            deterministic_program_aliases(parse_result.stated_program) != expected_programs
+        ):
+            return report(
+                "CLARIFICATION_REQUIRED",
+                "supported program selection does not match the stated program",
+            )
     if not parse_result.requests:
         return report("PARSER_FAILED", "parser returned no executable request")
     parsed_requests = parse_result.requests
-    if not stated_programs:
+    if parse_result.program_selection == "omitted":
         parsed_requests = [replace(item, program="aeroplan") for item in parsed_requests]
 
     try:
@@ -562,7 +613,7 @@ def run_request(
         ]
     except ValueError as exc:
         return report("UNSUPPORTED_REQUEST", str(exc))
-    if {item.program for item in normalized_requests} != (stated_programs or {"aeroplan"}):
+    if {item.program for item in normalized_requests} != expected_programs:
         return report("CLARIFICATION_REQUIRED", "parsed programs do not match the stated program selection")
     if len({item.program for item in normalized_requests}) != len(normalized_requests):
         return report("CLARIFICATION_REQUIRED", "specify exactly one atomic task per program")

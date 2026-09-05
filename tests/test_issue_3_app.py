@@ -62,6 +62,7 @@ class Issue3ApplicationTests(unittest.TestCase):
                             maximum_points=70000,
                         )
                     ],
+                    program_selection="supported",
                     diagnostics={"parser": "fake"},
                 )
 
@@ -109,6 +110,7 @@ class Issue3ApplicationTests(unittest.TestCase):
             ) -> RequestParseResult:
                 return RequestParseResult(
                     requests=[],
+                    program_selection="ambiguous",
                     clarification="'ANA flight' is ambiguous; confirm ANA Mileage Club or a flight operated by ANA.",
                     diagnostics={"parser": "fake"},
                 )
@@ -165,6 +167,7 @@ class Issue3ApplicationTests(unittest.TestCase):
                             maximum_points=70000,
                         ),
                     ],
+                    program_selection="supported",
                     diagnostics={"parser": "fake"},
                 )
 
@@ -277,7 +280,9 @@ class Issue3ApplicationTests(unittest.TestCase):
                 current_date: calendar_date,
                 timezone_name: str,
             ) -> RequestParseResult:
-                return RequestParseResult(requests=[], diagnostics={"parser": "fake"})
+                return RequestParseResult(
+                    requests=[], program_selection="omitted", diagnostics={"parser": "fake"}
+                )
 
         with tempfile.TemporaryDirectory() as tmpdir:
             result = run_request(
@@ -317,7 +322,8 @@ class Issue3ApplicationTests(unittest.TestCase):
                             trip_type="one_way",
                             maximum_points=70000,
                         )
-                    ]
+                    ],
+                    program_selection="supported",
                 )
 
         parser = TimezoneParser()
@@ -380,7 +386,8 @@ class Issue3ApplicationTests(unittest.TestCase):
                             trip_type="one_way",
                             maximum_points=70000,
                         )
-                    ]
+                    ],
+                    program_selection="supported",
                 )
 
         request = {
@@ -793,7 +800,7 @@ class Issue3ApplicationTests(unittest.TestCase):
             "original_text": "Use an unsupported airport",
             "program": "aeroplan",
             "origin": "JFK",
-            "destination": "LHR",
+            "destination": "QQQ",
             "departure_date": "2026-11-05",
             "cabin": "business",
             "adults": 1,
