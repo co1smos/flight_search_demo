@@ -42,29 +42,85 @@ PARSER_REQUIRED_FIELDS = (
     "adults",
     "maximum_points",
 )
-MATERIAL_PROGRAM_PHRASES = (
-    r"\bflying\s+blue\b",
-    r"\bemirates\s+skywards\b",
-    r"\bbritish\s+airways\s+executive\s+club\b",
-    r"\bkrisflyer\b",
-    r"\b(?:aadvantage|avios)\b",
-    r"\balaska\s+miles\b",
-    r"\bunited\s+(?:miles|mileageplus)\b",
-    r"\bdelta\s+(?:miles|skymiles)\b",
-    r"\b(?:my|your|our)\s+(?:airline\s+)?(?:miles?|points?)\b",
-    r"\bloyalty\s+(?:award|program|miles?|points?)\b",
+ROUTE_ENDPOINT_TOKEN = r"[A-Za-z][A-Za-z'’]*(?:-[A-Za-z][A-Za-z'’]*)?"
+ROUTE_ENDPOINT_EXPRESSION = (
+    rf"{ROUTE_ENDPOINT_TOKEN}(?:\s+{ROUTE_ENDPOINT_TOKEN}){{0,3}}"
 )
-PROGRAM_SLOT_RE = re.compile(
-    r"\b(?:use|with|search(?:\s+(?:for|using|with))?)\s+"
-    r"(?P<name>[a-z][a-z0-9]*(?:[ '\-][a-z][a-z0-9]*){0,4})"
-    r"(?=\s+(?:from|between|on|for|under|departing|to)\b)",
+ROUTE_ENDPOINT_EXPRESSION_LAZY = (
+    rf"{ROUTE_ENDPOINT_TOKEN}(?:\s+{ROUTE_ENDPOINT_TOKEN}){{0,3}}?"
+)
+ROUTE_BOUNDARY = (
+    r"(?=\s+(?:on|for|in|under|below|at\s+most|up\s+to|maximum|max|"
+    r"ceiling|next|this|coming|today|tomorrow|yesterday|"
+    r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|"
+    r"jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|"
+    r"nov(?:ember)?|dec(?:ember)?)\b|[,.!?]|$))"
+)
+ROUTE_PATTERNS = (
+    re.compile(
+        rf"\bfrom\s+(?P<origin>{ROUTE_ENDPOINT_EXPRESSION})\s+to\s+"
+        rf"(?P<destination>{ROUTE_ENDPOINT_EXPRESSION_LAZY}){ROUTE_BOUNDARY}",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"\bbetween\s+(?P<origin>{ROUTE_ENDPOINT_EXPRESSION})\s+and\s+"
+        rf"(?P<destination>{ROUTE_ENDPOINT_EXPRESSION_LAZY}){ROUTE_BOUNDARY}",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?P<origin>[A-Za-z]{3})\s+to\s+"
+        r"(?P<destination>[A-Za-z]{3})" + ROUTE_BOUNDARY,
+        re.IGNORECASE,
+    ),
+)
+PROGRAM_SELECTION_PHRASE_RE = re.compile(
+    r"\b(?:redeem|use|using|select|choose|apply|with)\s+(?:the\s+)?"
+    r"(?P<candidate>[A-Za-z][A-Za-z0-9'’-]*)\b"
+    r"|\b(?:book|reserve)\b[^.!?]{0,120}\b(?:using|with)\b",
     re.IGNORECASE,
 )
-NON_PROGRAM_SLOT_STARTS = {
-    "a", "an", "the", "this", "that", "one", "adult", "adults",
-    "business", "economy", "first", "premium", "flight", "flights",
-    "award", "awards", "seat", "seats",
+NO_PROGRAM_PREFIX_WORDS = {
+    "a", "an", "the", "this", "that", "one", "single", "adult", "adults",
+    "passenger", "passengers", "traveler", "travelers", "business", "economy",
+    "premium", "first", "class", "flight", "flights", "award", "awards",
+    "seat", "seats", "find", "search", "look", "for", "show", "me", "check",
+    "monitor", "get", "please", "availability", "one-way", "way", "trip", "with",
 }
+NON_PROGRAM_SELECTION_WORDS = {
+    "a", "an", "one", "single", "the", "this", "that", "adult", "adults",
+    "passenger", "passengers", "traveler", "travelers", "traveller", "travellers",
+    "seat", "seats", "business", "economy", "premium", "first", "class",
+}
+NO_PROGRAM_SUFFIX_WORDS = {
+    "on", "for", "in", "under", "below", "at", "most", "up", "to", "maximum",
+    "max", "ceiling", "next", "this", "coming", "today", "tomorrow", "one",
+    "single", "a", "an", "adult", "adults", "passenger", "passengers",
+    "traveler", "travelers", "traveller", "travellers", "business", "economy",
+    "premium", "first", "class", "seat", "seats", "points", "miles", "with",
+}
+MONTH_NAME_PATTERN = (
+    r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
+    r"jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|"
+    r"dec(?:ember)?)"
+)
+DATE_EVIDENCE_RE = re.compile(
+    rf"\b(?:\d{{4}}-\d{{2}}-\d{{2}}|"
+    rf"{MONTH_NAME_PATTERN}\s+\d{{1,2}}(?:,?\s+\d{{4}})?|"
+    rf"\d{{1,2}}\s+{MONTH_NAME_PATTERN}(?:\s+\d{{4}})?|"
+    r"(?:next|this|coming)\s+(?:monday|tuesday|wednesday|thursday|friday|"
+    r"saturday|sunday|week)|today|tomorrow)\b",
+    re.IGNORECASE,
+)
+CABIN_EVIDENCE_RE = re.compile(
+    r"\b(?:premium[\s_-]+economy|economy|business|first)(?:\s+class)?\b",
+    re.IGNORECASE,
+)
+PASSENGER_EVIDENCE_RE = re.compile(
+    r"\b(?:one|1|a|single)\s+(?:adult|adults|passenger|passengers|"
+    r"traveler|travelers|traveller|travellers)\b"
+    r"|\b(?:one|1|a|single)\s+(?:[A-Za-z]+\s+){0,3}seat\b",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -303,19 +359,51 @@ def deterministic_program_aliases(original_text: str) -> set[str]:
     }
 
 
-def has_material_program_provenance(original_text: str) -> bool:
-    if deterministic_program_aliases(original_text):
-        return True
-    if any(
-        re.search(pattern, original_text, re.IGNORECASE)
-        for pattern in MATERIAL_PROGRAM_PHRASES
-    ):
-        return True
-    for match in PROGRAM_SLOT_RE.finditer(original_text):
-        candidate = match.group("name").strip().lower()
-        if candidate.split()[0] not in NON_PROGRAM_SLOT_STARTS:
+def extract_route_match(original_text: str) -> re.Match[str] | None:
+    for pattern in ROUTE_PATTERNS:
+        match = pattern.search(original_text)
+        if match is not None:
+            return match
+    return None
+
+
+def has_program_selection_phrase(original_text: str) -> bool:
+    for match in PROGRAM_SELECTION_PHRASE_RE.finditer(original_text):
+        candidate = match.groupdict().get("candidate")
+        if candidate is None or candidate.lower() not in NON_PROGRAM_SELECTION_WORDS:
             return True
     return False
+
+
+def has_safe_no_program_prefix(prefix: str) -> bool:
+    words = re.findall(r"[A-Za-z]+(?:[-'][A-Za-z]+)*", prefix.lower())
+    return bool(words or not prefix.strip()) and all(
+        word in NO_PROGRAM_PREFIX_WORDS for word in words
+    )
+
+
+def has_safe_no_program_suffix(original_text: str, route_match: re.Match[str]) -> bool:
+    suffix = original_text[route_match.end():].strip()
+    if not suffix:
+        return True
+    suffix = re.sub(r"^[,;:]+\s*", "", suffix)
+    first_word = re.search(r"[A-Za-z]+(?:[-'][A-Za-z]+)*", suffix)
+    return first_word is not None and first_word.group(0).lower() in NO_PROGRAM_SUFFIX_WORDS
+
+
+def is_narrow_no_program_request(original_text: str) -> bool:
+    if deterministic_program_aliases(original_text):
+        return False
+    route_match = extract_route_match(original_text)
+    if route_match is None:
+        return False
+    if has_program_selection_phrase(original_text):
+        return False
+    if not has_safe_no_program_prefix(original_text[:route_match.start()]):
+        return False
+    if not has_safe_no_program_suffix(original_text, route_match):
+        return False
+    return not missing_original_text_fields(original_text)
 
 
 def has_material_program_ambiguity(original_text: str) -> bool:
@@ -652,16 +740,15 @@ def run_request(
     if parse_result.clarification is not None:
         return report("CLARIFICATION_REQUIRED", parse_result.clarification)
 
+    if not parse_result.requests and parse_result.program_selection == "omitted":
+        return report("PARSER_FAILED", "parser returned no executable request")
     stated_programs = deterministic_program_aliases(original_text)
     if parse_result.program_selection == "omitted":
-        if (
-            has_material_program_provenance(original_text)
-            or parse_result.stated_program
-            or has_material_program_ambiguity(original_text)
-        ):
+        if parse_result.stated_program or not is_narrow_no_program_request(original_text):
             return report(
                 "CLARIFICATION_REQUIRED",
-                "program selection provenance conflicts with the original request",
+                "program selection provenance is omitted, but the original request is not "
+                "a complete unambiguous no-program request",
             )
         expected_programs = {"aeroplan"}
     else:
@@ -680,6 +767,24 @@ def run_request(
             )
     if not parse_result.requests:
         return report("PARSER_FAILED", "parser returned no executable request")
+    if parse_result.program_selection != "omitted":
+        raw_programs = {
+            PROGRAM_ALIASES.get(str(item.program).strip().lower(), str(item.program).strip().lower())
+            for item in parse_result.requests
+        }
+        if raw_programs != expected_programs:
+            return report("CLARIFICATION_REQUIRED", "parsed programs do not match the stated program selection")
+    original_text_missing = missing_original_text_fields(original_text)
+    if original_text_missing:
+        labels = [
+            f"{field} (points ceiling)" if field == "maximum_points" else field
+            for field in sorted(original_text_missing)
+        ]
+        return report(
+            "CLARIFICATION_REQUIRED",
+            "original request lacks independent evidence for required fields: "
+            + ", ".join(labels),
+        )
     parsed_requests = parse_result.requests
     if parse_result.program_selection == "omitted":
         parsed_requests = [replace(item, program="aeroplan") for item in parsed_requests]
@@ -847,6 +952,23 @@ def extract_points_ceilings(original_text: str) -> tuple[set[int], bool]:
             return set(), False
         ceilings.add(ceiling)
     return ceilings, True
+
+
+def missing_original_text_fields(original_text: str) -> set[str]:
+    missing: set[str] = set()
+    route_match = extract_route_match(original_text)
+    if route_match is None:
+        missing.update(("origin", "destination"))
+    if DATE_EVIDENCE_RE.search(original_text) is None:
+        missing.add("departure_date")
+    if CABIN_EVIDENCE_RE.search(original_text) is None:
+        missing.add("cabin")
+    if PASSENGER_EVIDENCE_RE.search(original_text) is None:
+        missing.add("adults")
+    ceilings, syntax_valid = extract_points_ceilings(original_text)
+    if not syntax_valid or len(ceilings) != 1:
+        missing.add("maximum_points")
+    return missing
 
 
 def parse_points_ceiling_token(token: str) -> int | None:

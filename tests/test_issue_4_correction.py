@@ -257,6 +257,61 @@ class Issue4CorrectionTests(unittest.TestCase):
                 self.assertIsNone(event['atomic_task_id'])
         self.adapter.execute.assert_not_called()
 
+    def test_omitted_program_requires_narrow_no_program_grammar(self):
+        from flight_search_demo.app import build_confirmation_request
+
+        unsafe_requests = (
+            'Redeem JetBlue points from JFK to CDG on 2026-11-05 business '
+            'for one adult under 70000 points',
+            'Use StarMiles, from JFK to CDG on 2026-11-05 business '
+            'for one adult under 70000 points',
+            'Book route using StarMiles: JFK to CDG on 2026-11-05 business '
+            'for one adult under 70000 points',
+            'StarMiles: JFK to CDG on 2026-11-05 business for one adult '
+            'under 70000 points',
+            'JFK to CDG on 2026-11-05 business for one adult under 70000 '
+            'points using StarMiles',
+            'JFK to CDG, StarMiles on 2026-11-05 business for one adult '
+            'under 70000 points',
+            'Flying Blue from JFK to CDG on 2026-11-05 business for one adult '
+            'under 70000 points',
+            'Emirates Skywards from JFK to CDG on 2026-11-05 business '
+            'for one adult under 70000 points',
+            'British Airways Executive Club from JFK to CDG on 2026-11-05 '
+            'business for one adult under 70000 points',
+            'KrisFlyer from JFK to CDG on 2026-11-05 business for one adult '
+            'under 70000 points',
+            'my miles from JFK to CDG on 2026-11-05 business for one adult '
+            'under 70000 points',
+            'loyalty award from JFK to CDG on 2026-11-05 business for one adult '
+            'under 70000 points',
+        )
+        for original_text in unsafe_requests:
+            with self.subTest(original_text=original_text):
+                self.request['original_text'] = original_text
+                confirmation = build_confirmation_request(
+                    request=self.request,
+                    parsed_requests=[self.criteria],
+                    current_date=date(2026, 11, 1),
+                )
+                parser = Mock()
+                parser.parse.return_value = RequestParseResult(
+                    [self.criteria], program_selection='omitted'
+                )
+                with redirect_stdout(io.StringIO()):
+                    event = run_request(
+                        request=self.request,
+                        confirmation=confirmation,
+                        event_log_path=self.log,
+                        parser=parser,
+                        adapter_registry={'aeroplan': self.adapter},
+                        current_date=date(2026, 11, 1),
+                    )[0]
+                self.assertEqual(event['status'], 'CLARIFICATION_REQUIRED')
+                self.assertIn('program', event['detail'])
+                self.assertIsNone(event['atomic_task_id'])
+        self.adapter.execute.assert_not_called()
+
     def test_missing_parser_field_provenance_cannot_execute_with_valid_confirmation(self):
         from flight_search_demo.app import build_confirmation_request
 
@@ -292,6 +347,62 @@ class Issue4CorrectionTests(unittest.TestCase):
                 self.assertIn(missing_field, event['detail'])
                 self.assertIsNone(event['atomic_task_id'])
                 self.assertNotIn('request_hash', event)
+        self.adapter.execute.assert_not_called()
+
+    def test_original_text_evidence_gate_rejects_overconfident_parser(self):
+        from flight_search_demo.app import build_confirmation_request
+
+        cases = (
+            (
+                'origin',
+                'Aeroplan to CDG on 2026-11-05 business for one adult under 70000 points',
+            ),
+            (
+                'destination',
+                'Aeroplan from JFK on 2026-11-05 business for one adult under 70000 points',
+            ),
+            (
+                'departure_date',
+                'Aeroplan JFK to CDG business for one adult under 70000 points',
+            ),
+            (
+                'cabin',
+                'Aeroplan JFK to CDG on 2026-11-05 for one adult under 70000 points',
+            ),
+            (
+                'adults',
+                'Aeroplan JFK to CDG on 2026-11-05 business under 70000 points',
+            ),
+            (
+                'maximum_points',
+                'Aeroplan JFK to CDG on 2026-11-05 business for one adult',
+            ),
+        )
+        for missing_field, original_text in cases:
+            with self.subTest(missing_field=missing_field):
+                self.request['original_text'] = original_text
+                confirmation = build_confirmation_request(
+                    request=self.request,
+                    parsed_requests=[self.criteria],
+                    current_date=date(2026, 11, 1),
+                )
+                parser = Mock()
+                parser.parse.return_value = RequestParseResult(
+                    [self.criteria], program_selection='supported'
+                )
+                self.adapter.reset_mock()
+                with redirect_stdout(io.StringIO()):
+                    event = run_request(
+                        request=self.request,
+                        confirmation=confirmation,
+                        event_log_path=self.log,
+                        parser=parser,
+                        adapter_registry={'aeroplan': self.adapter},
+                        current_date=date(2026, 11, 1),
+                    )[0]
+                self.assertEqual(event['status'], 'CLARIFICATION_REQUIRED')
+                self.assertIn(missing_field, event['detail'])
+                self.assertIsNone(event['atomic_task_id'])
         self.adapter.execute.assert_not_called()
 
     def test_missing_endpoint_provenance_cannot_be_authorized_by_city_expansion(self):
@@ -616,7 +727,7 @@ class Issue4CorrectionTests(unittest.TestCase):
                                ('Aeroplan', 'aeroplan'), ('ANA miles', 'ana'),
                                ('ANA Mileage Club', 'ana'), ('ANA', 'ana')):
             with self.subTest(alias=alias):
-                self.request['original_text'] = f'Use {alias} from JFK to CDG on 2026-11-05 business under 70000'
+                self.request['original_text'] = f'Use {alias} from JFK to CDG on 2026-11-05 business for one adult under 70000'
                 parser = Mock()
                 parser.parse.return_value = RequestParseResult(
                     [replace(self.criteria, program=alias)],
@@ -643,6 +754,30 @@ class Issue4CorrectionTests(unittest.TestCase):
             replace(self.criteria, program='', cabin=None), program_selection='omitted'
         )
         self.assertIn(event['status'], ('CLARIFICATION_REQUIRED', 'UNSUPPORTED_REQUEST'))
+        self.adapter.execute.assert_not_called()
+
+    def test_narrow_no_program_grammar_preserves_natural_request_forms(self):
+        for original_text in (
+            'JFK to CDG on 2026-11-05 business for one adult under 70000 points',
+            'Find one business seat from JFK to CDG next Thursday under 70k',
+        ):
+            with self.subTest(original_text=original_text):
+                self.request['original_text'] = original_text
+                parser = Mock()
+                parser.parse.return_value = RequestParseResult(
+                    [self.criteria], program_selection='omitted'
+                )
+                with redirect_stdout(io.StringIO()):
+                    event = run_request(
+                        request=self.request,
+                        confirmation={},
+                        event_log_path=self.log,
+                        parser=parser,
+                        adapter_registry={'aeroplan': self.adapter},
+                        current_date=date(2026, 11, 1),
+                    )[0]
+                self.assertEqual(event['status'], 'CONFIRMATION_REQUIRED')
+                self.assertEqual(event['normalized_criteria']['program'], 'aeroplan')
         self.adapter.execute.assert_not_called()
 
     def test_materially_ambiguous_loyalty_language_cannot_default_to_aeroplan(self):
@@ -712,7 +847,7 @@ class Issue4CorrectionTests(unittest.TestCase):
         self.adapter.execute.assert_not_called()
 
     def test_terminal_displays_all_program_criteria_and_clarification_detail(self):
-        self.request['original_text'] = 'AC points and ANA miles JFK to CDG on 2026-11-05 business under 70000'
+        self.request['original_text'] = 'AC points and ANA miles JFK to CDG on 2026-11-05 business for one adult under 70000'
         parser = Mock()
         parser.parse.side_effect = [
             RequestParseResult([self.criteria, replace(self.criteria, program='ana')],
@@ -734,10 +869,10 @@ class Issue4CorrectionTests(unittest.TestCase):
     def test_conflicting_or_missing_shared_ceiling_cannot_execute(self):
         from flight_search_demo.app import build_confirmation_request
         cases = [
-            ('Aeroplan and ANA JFK to CDG on 2026-11-05 business under 70000 points', 70000, 90000),
-            ('Aeroplan under 70000 points and ANA under 90000 miles JFK to CDG on 2026-11-05 business', 70000, 70000),
-            ('Aeroplan and ANA JFK to CDG on 2026-11-05 business under 70000 points', 90000, 90000),
-            ('Aeroplan and ANA JFK to CDG on 2026-11-05 business', 70000, 70000),
+            ('Aeroplan and ANA JFK to CDG on 2026-11-05 business for one adult under 70000 points', 70000, 90000),
+            ('Aeroplan under 70000 points and ANA under 90000 miles JFK to CDG on 2026-11-05 business for one adult', 70000, 70000),
+            ('Aeroplan and ANA JFK to CDG on 2026-11-05 business for one adult under 70000 points', 90000, 90000),
+            ('Aeroplan and ANA JFK to CDG on 2026-11-05 business for one adult', 70000, 70000),
         ]
         for text, aeroplan_cap, ana_cap in cases:
             with self.subTest(text=text, caps=(aeroplan_cap, ana_cap)):
@@ -770,7 +905,7 @@ class Issue4CorrectionTests(unittest.TestCase):
             with self.subTest(field=field, value=value):
                 self.request['original_text'] = (
                     'AC points and ANA miles JFK to CDG on 2026-11-05 '
-                    'business under 70000 points'
+                    'business for one adult under 70000 points'
                 )
                 mismatched = replace(baseline, program='ana', **{field: value})
                 criteria = [baseline, mismatched]
@@ -800,7 +935,7 @@ class Issue4CorrectionTests(unittest.TestCase):
 
     def test_city_expansion_requires_explicit_interpretation_confirmation(self):
         from flight_search_demo.app import build_confirmation_request
-        self.request['original_text'] = 'Aeroplan from New York to Paris on 2026-11-05 business under 70000 points'
+        self.request['original_text'] = 'Aeroplan from New York to Paris on 2026-11-05 business for one adult under 70000 points'
         confirmation = build_confirmation_request(request=self.request, parsed_requests=[self.criteria])
         parser = Mock()
         parser.parse.return_value = RequestParseResult([self.criteria], program_selection='supported')
@@ -846,7 +981,7 @@ class Issue4CorrectionTests(unittest.TestCase):
         for notation in ('70000', '70,000', '70k', '70 K'):
             with self.subTest(notation=notation):
                 self.request['original_text'] = (
-                    f'Aeroplan JFK to CDG on 2026-11-05 business under {notation} points'
+                    f'Aeroplan JFK to CDG on 2026-11-05 business for one adult under {notation} points'
                 )
                 event = self.run_parsed(self.criteria)
                 self.assertEqual(event['status'], 'CONFIRMATION_REQUIRED')

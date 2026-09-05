@@ -187,7 +187,7 @@ class Issue3ApplicationTests(unittest.TestCase):
         adapter_registry = {"aeroplan": aeroplan, "ana": ana}
         request = {
             "request_id": "req-nl-multi",
-            "original_text": "Monitor Aeroplan and ANA from JFK to CDG on November 5 2026 in business under 70000 points",
+            "original_text": "Monitor Aeroplan and ANA from JFK to CDG on November 5 2026 in business for one adult under 70000 points",
         }
         confirmation = build_confirmation_request(
             request=request,
