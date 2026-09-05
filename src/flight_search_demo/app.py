@@ -6,7 +6,7 @@ import hashlib
 import json
 import os
 import re
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Protocol
@@ -34,6 +34,37 @@ SHARED_PROGRAM_CRITERIA_FIELDS = (
     "trip_type",
     "maximum_points",
 )
+PARSER_REQUIRED_FIELDS = (
+    "origin",
+    "destination",
+    "departure_date",
+    "cabin",
+    "adults",
+    "maximum_points",
+)
+MATERIAL_PROGRAM_PHRASES = (
+    r"\bflying\s+blue\b",
+    r"\bemirates\s+skywards\b",
+    r"\bbritish\s+airways\s+executive\s+club\b",
+    r"\bkrisflyer\b",
+    r"\b(?:aadvantage|avios)\b",
+    r"\balaska\s+miles\b",
+    r"\bunited\s+(?:miles|mileageplus)\b",
+    r"\bdelta\s+(?:miles|skymiles)\b",
+    r"\b(?:my|your|our)\s+(?:airline\s+)?(?:miles?|points?)\b",
+    r"\bloyalty\s+(?:award|program|miles?|points?)\b",
+)
+PROGRAM_SLOT_RE = re.compile(
+    r"\b(?:use|with|search(?:\s+(?:for|using|with))?)\s+"
+    r"(?P<name>[a-z][a-z0-9]*(?:[ '\-][a-z][a-z0-9]*){0,4})"
+    r"(?=\s+(?:from|between|on|for|under|departing|to)\b)",
+    re.IGNORECASE,
+)
+NON_PROGRAM_SLOT_STARTS = {
+    "a", "an", "the", "this", "that", "one", "adult", "adults",
+    "business", "economy", "first", "premium", "flight", "flights",
+    "award", "awards", "seat", "seats",
+}
 
 
 @dataclass(frozen=True)
@@ -58,6 +89,7 @@ class ParsedNaturalLanguageRequest:
     adults: int
     trip_type: str
     maximum_points: int
+    missing_fields: List[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -113,7 +145,8 @@ class GoogleGenAIRequestParser:
             "Set program_selection to exactly omitted, supported, unsupported, or ambiguous. "
             "Return stated_program when the request names or implies a loyalty program. "
             "If the request is ambiguous, missing required fields, uses a city alias, or uses an ambiguous numeric date, "
-            "return clarification or unsupported_reason instead of inventing values. "
+            "return clarification or unsupported_reason instead of inventing values; for each request, list every "
+            "required field that was not present in missing_fields even if a placeholder value is returned. "
             "Resolve relative dates using the provided timezone and return absolute YYYY-MM-DD dates.\n"
             f"request_id: {request_id}\n"
             f"current_date: {current_date.isoformat()}\n"
@@ -150,6 +183,7 @@ class GoogleGenAIRequestParser:
                     adults=item["adults"],
                     trip_type=str(item["trip_type"]).strip().lower(),
                     maximum_points=item["maximum_points"],
+                    missing_fields=item["missing_fields"],
                 )
                 for item in payload.get("requests", [])
             ]
@@ -269,6 +303,21 @@ def deterministic_program_aliases(original_text: str) -> set[str]:
     }
 
 
+def has_material_program_provenance(original_text: str) -> bool:
+    if deterministic_program_aliases(original_text):
+        return True
+    if any(
+        re.search(pattern, original_text, re.IGNORECASE)
+        for pattern in MATERIAL_PROGRAM_PHRASES
+    ):
+        return True
+    for match in PROGRAM_SLOT_RE.finditer(original_text):
+        candidate = match.group("name").strip().lower()
+        if candidate.split()[0] not in NON_PROGRAM_SLOT_STARTS:
+            return True
+    return False
+
+
 def has_material_program_ambiguity(original_text: str) -> bool:
     return re.search(r"\bANA\s+flights?\b", original_text, re.IGNORECASE) is not None
 
@@ -309,6 +358,13 @@ def natural_language_parse_schema() -> Dict[str, Any]:
                         "adults": {"type": "integer"},
                         "trip_type": {"type": "string"},
                         "maximum_points": {"type": "integer"},
+                        "missing_fields": {
+                            "type": "array",
+                            "items": {
+                                "type": "string",
+                                "enum": list(PARSER_REQUIRED_FIELDS),
+                            },
+                        },
                     },
                     "required": [
                         "program",
@@ -319,6 +375,7 @@ def natural_language_parse_schema() -> Dict[str, Any]:
                         "adults",
                         "trip_type",
                         "maximum_points",
+                        "missing_fields",
                     ],
                 },
             },
@@ -529,6 +586,16 @@ def run_request(
             not isinstance(parse_result, RequestParseResult)
             or not isinstance(parse_result.requests, list)
             or any(not isinstance(item, ParsedNaturalLanguageRequest) for item in parse_result.requests)
+            or any(
+                not isinstance(item.missing_fields, list)
+                or len(set(item.missing_fields)) != len(item.missing_fields)
+                or any(
+                    type(field_name) is not str
+                    or field_name not in PARSER_REQUIRED_FIELDS
+                    for field_name in item.missing_fields
+                )
+                for item in parse_result.requests
+            )
             or any(value is not None and (not isinstance(value, str) or not value.strip())
                    for value in (parse_result.clarification, parse_result.unsupported_reason))
             or (parse_result.diagnostics is not None and not isinstance(parse_result.diagnostics, dict))
@@ -546,6 +613,16 @@ def run_request(
         return report("PARSER_FAILED", "request parsing failed; see diagnostics")
 
     diagnostic(parse_result.diagnostics or {})
+    missing_fields = sorted({
+        field_name
+        for item in parse_result.requests
+        for field_name in item.missing_fields
+    })
+    if missing_fields:
+        return report(
+            "CLARIFICATION_REQUIRED",
+            "parser marked required fields missing: " + ", ".join(missing_fields),
+        )
     if parse_result.program_selection == "unsupported":
         return report(
             "UNSUPPORTED_REQUEST",
@@ -577,7 +654,11 @@ def run_request(
 
     stated_programs = deterministic_program_aliases(original_text)
     if parse_result.program_selection == "omitted":
-        if stated_programs or parse_result.stated_program or has_material_program_ambiguity(original_text):
+        if (
+            has_material_program_provenance(original_text)
+            or parse_result.stated_program
+            or has_material_program_ambiguity(original_text)
+        ):
             return report(
                 "CLARIFICATION_REQUIRED",
                 "program selection provenance conflicts with the original request",

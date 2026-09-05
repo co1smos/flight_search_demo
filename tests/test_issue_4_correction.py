@@ -82,6 +82,10 @@ class Issue4CorrectionTests(unittest.TestCase):
         self.assertEqual(wire[0]['response_format']['properties']['program_selection']['enum'],
                          ['omitted', 'supported', 'unsupported', 'ambiguous'])
         self.assertIn('program_selection', wire[0]['response_format']['required'])
+        request_schema = wire[0]['response_format']['properties']['requests']['items']
+        self.assertIn('missing_fields', request_schema['properties'])
+        self.assertIn('missing_fields', request_schema['required'])
+        self.assertEqual(asdict(self.criteria)['missing_fields'], [])
         self.assertEqual(events[0]['status'], 'CONFIRMATION_REQUIRED')
         self.assertEqual(events[0]['normalized_criteria']['maximum_points'], 70000)
 
@@ -180,6 +184,175 @@ class Issue4CorrectionTests(unittest.TestCase):
         self.assertEqual(event['status'], 'CLARIFICATION_REQUIRED')
         self.assertIn('provenance', event['detail'])
         self.assertIsNone(event['atomic_task_id'])
+        self.adapter.execute.assert_not_called()
+
+    def test_omitted_program_provenance_cannot_default_on_material_loyalty_language(self):
+        from flight_search_demo.app import build_confirmation_request
+
+        for loyalty in (
+            'Flying Blue',
+            'Emirates Skywards',
+            'British Airways Executive Club',
+            'KrisFlyer',
+            'my miles',
+            'loyalty award',
+        ):
+            with self.subTest(loyalty=loyalty):
+                self.request['original_text'] = (
+                    f'Use {loyalty} from JFK to CDG on 2026-11-05 '
+                    'business under 70000 points'
+                )
+                confirmation = build_confirmation_request(
+                    request=self.request,
+                    parsed_requests=[self.criteria],
+                    current_date=date(2026, 11, 1),
+                )
+                parser = Mock()
+                parser.parse.return_value = RequestParseResult(
+                    [self.criteria], program_selection='omitted'
+                )
+                with redirect_stdout(io.StringIO()):
+                    event = run_request(
+                        request=self.request,
+                        confirmation=confirmation,
+                        event_log_path=self.log,
+                        parser=parser,
+                        adapter_registry={'aeroplan': self.adapter},
+                        current_date=date(2026, 11, 1),
+                    )[0]
+                self.assertEqual(event['status'], 'CLARIFICATION_REQUIRED')
+                self.assertIn('program', event['detail'])
+                self.assertIsNone(event['atomic_task_id'])
+        self.adapter.execute.assert_not_called()
+
+    def test_omitted_program_provenance_cannot_default_on_unknown_explicit_program_slot(self):
+        from flight_search_demo.app import build_confirmation_request
+
+        for prefix in ('Use', 'with', 'search', 'search for', 'search using'):
+            with self.subTest(prefix=prefix):
+                self.request['original_text'] = (
+                    f'{prefix} StarMiles from JFK to CDG on 2026-11-05 '
+                    'business under 70000 points'
+                )
+                confirmation = build_confirmation_request(
+                    request=self.request,
+                    parsed_requests=[self.criteria],
+                    current_date=date(2026, 11, 1),
+                )
+                parser = Mock()
+                parser.parse.return_value = RequestParseResult(
+                    [self.criteria], program_selection='omitted'
+                )
+                with redirect_stdout(io.StringIO()):
+                    event = run_request(
+                        request=self.request,
+                        confirmation=confirmation,
+                        event_log_path=self.log,
+                        parser=parser,
+                        adapter_registry={'aeroplan': self.adapter},
+                        current_date=date(2026, 11, 1),
+                    )[0]
+                self.assertEqual(event['status'], 'CLARIFICATION_REQUIRED')
+                self.assertIn('program', event['detail'])
+                self.assertIsNone(event['atomic_task_id'])
+        self.adapter.execute.assert_not_called()
+
+    def test_missing_parser_field_provenance_cannot_execute_with_valid_confirmation(self):
+        from flight_search_demo.app import build_confirmation_request
+
+        for missing_field in (
+            'origin', 'destination', 'departure_date', 'cabin', 'adults', 'maximum_points'
+        ):
+            with self.subTest(missing_field=missing_field):
+                self.request['original_text'] = (
+                    'Aeroplan JFK to CDG on 2026-11-05 business for one adult '
+                    'under 70000 points'
+                )
+                parsed = replace(self.criteria, missing_fields=[missing_field])
+                confirmation = build_confirmation_request(
+                    request=self.request,
+                    parsed_requests=[parsed],
+                    current_date=date(2026, 11, 1),
+                )
+                parser = Mock()
+                parser.parse.return_value = RequestParseResult(
+                    [parsed], program_selection='supported'
+                )
+                self.adapter.reset_mock()
+                with redirect_stdout(io.StringIO()):
+                    event = run_request(
+                        request=self.request,
+                        confirmation=confirmation,
+                        event_log_path=self.log,
+                        parser=parser,
+                        adapter_registry={'aeroplan': self.adapter},
+                        current_date=date(2026, 11, 1),
+                    )[0]
+                self.assertEqual(event['status'], 'CLARIFICATION_REQUIRED')
+                self.assertIn(missing_field, event['detail'])
+                self.assertIsNone(event['atomic_task_id'])
+                self.assertNotIn('request_hash', event)
+        self.adapter.execute.assert_not_called()
+
+    def test_missing_endpoint_provenance_cannot_be_authorized_by_city_expansion(self):
+        from flight_search_demo.app import build_confirmation_request
+
+        for missing_field, original_text in (
+            (
+                'origin',
+                'Aeroplan to CDG on 2026-11-05 business for one adult under 70000 points',
+            ),
+            (
+                'destination',
+                'Aeroplan from JFK on 2026-11-05 business for one adult under 70000 points',
+            ),
+        ):
+            with self.subTest(missing_field=missing_field):
+                self.request['original_text'] = original_text
+                parsed = replace(self.criteria, missing_fields=[missing_field])
+                confirmation = build_confirmation_request(
+                    request=self.request,
+                    parsed_requests=[parsed],
+                    current_date=date(2026, 11, 1),
+                )
+                parser = Mock()
+                parser.parse.return_value = RequestParseResult(
+                    [parsed], program_selection='supported'
+                )
+                self.adapter.reset_mock()
+                with redirect_stdout(io.StringIO()):
+                    event = run_request(
+                        request=self.request,
+                        confirmation=confirmation,
+                        event_log_path=self.log,
+                        parser=parser,
+                        adapter_registry={'aeroplan': self.adapter},
+                        current_date=date(2026, 11, 1),
+                    )[0]
+                self.assertEqual(event['status'], 'CLARIFICATION_REQUIRED')
+                self.assertIn(missing_field, event['detail'])
+                self.assertNotIn('airport_expansions', event)
+                self.adapter.execute.assert_not_called()
+
+    def test_malformed_parser_field_presence_provenance_is_parser_failure(self):
+        for missing_fields in ('origin', ['origin', 1], ['not_a_required_field']):
+            with self.subTest(missing_fields=missing_fields):
+                parser = Mock()
+                parser.parse.return_value = RequestParseResult(
+                    [replace(self.criteria, missing_fields=missing_fields)],
+                    program_selection='supported',
+                )
+                with redirect_stdout(io.StringIO()):
+                    event = run_request(
+                        request=self.request,
+                        confirmation={'confirmed': True},
+                        event_log_path=self.log,
+                        parser=parser,
+                        adapter_registry={'aeroplan': self.adapter},
+                        current_date=date(2026, 11, 1),
+                    )[0]
+                self.assertEqual(event['status'], 'PARSER_FAILED')
+                self.assertIsNone(event['atomic_task_id'])
         self.adapter.execute.assert_not_called()
 
     def test_supported_program_provenance_must_match_stated_program_text(self):
