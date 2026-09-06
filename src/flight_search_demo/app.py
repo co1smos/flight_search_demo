@@ -101,7 +101,7 @@ NO_PROGRAM_PREFIX_WORDS = {
     "passenger", "passengers", "traveler", "travelers", "business", "economy",
     "premium", "first", "class", "flight", "flights", "award", "awards",
     "seat", "seats", "find", "search", "look", "for", "show", "me", "check",
-    "monitor", "get", "please", "availability", "one-way", "way", "trip", "with",
+    "monitor", "get", "please", "availability", "one-way", "way", "trip", "with", "use",
 }
 NON_PROGRAM_SELECTION_WORDS = {
     "a", "an", "one", "single", "the", "this", "that", "adult", "adults",
@@ -147,6 +147,20 @@ DATE_EVIDENCE_RE = re.compile(
     r"saturday|sunday|week)|today|tomorrow)\b",
     re.IGNORECASE,
 )
+NAMED_ABSOLUTE_DATE_RE = re.compile(
+    rf"\b(?:"
+    rf"(?P<month_first>{MONTH_NAME_PATTERN})\s+(?P<day_first>\d{{1,2}}),?\s+(?P<year_first>\d{{4}})"
+    rf"|(?P<day_second>\d{{1,2}})\s+(?P<month_second>{MONTH_NAME_PATTERN})\s+(?P<year_second>\d{{4}})"
+    rf")\b",
+    re.IGNORECASE,
+)
+MONTH_NUMBERS = {
+    "jan": 1, "january": 1, "feb": 2, "february": 2,
+    "mar": 3, "march": 3, "apr": 4, "april": 4, "may": 5,
+    "jun": 6, "june": 6, "jul": 7, "july": 7, "aug": 8, "august": 8,
+    "sep": 9, "september": 9, "oct": 10, "october": 10,
+    "nov": 11, "november": 11, "dec": 12, "december": 12,
+}
 CABIN_EVIDENCE_RE = re.compile(
     r"\b(?:premium[\s_-]+economy|economy|business|first)(?:\s+class)?\b",
     re.IGNORECASE,
@@ -409,6 +423,15 @@ def deterministic_program_aliases(original_text: str) -> set[str]:
     }
 
 
+def remove_supported_program_aliases(original_text: str) -> str:
+    aliases = sorted(PROGRAM_ALIASES, key=len, reverse=True)
+    alias_re = re.compile(
+        r"(?<!\w)(?:" + "|".join(re.escape(alias) for alias in aliases) + r")(?!\w)",
+        re.IGNORECASE,
+    )
+    return alias_re.sub(lambda match: " " * len(match.group(0)), original_text)
+
+
 def extract_route_match(original_text: str) -> re.Match[str] | None:
     for pattern in ROUTE_PATTERNS:
         match = pattern.search(original_text)
@@ -525,6 +548,19 @@ def is_narrow_no_program_request(original_text: str) -> bool:
     if not has_closed_no_program_grammar(original_text, route_match):
         return False
     return not missing_original_text_fields(original_text)
+
+
+def is_narrow_supported_program_request(original_text: str) -> bool:
+    """Accept explicit supported programs only when the whole input is known grammar."""
+    if not deterministic_program_aliases(original_text):
+        return False
+    alias_free_text = remove_supported_program_aliases(original_text)
+    route_match = extract_route_match(alias_free_text)
+    if route_match is None:
+        return False
+    if not has_closed_no_program_grammar(alias_free_text, route_match):
+        return False
+    return not missing_original_text_fields(alias_free_text)
 
 
 def has_material_program_ambiguity(original_text: str) -> bool:
@@ -906,6 +942,12 @@ def run_request(
             "original request lacks independent evidence for required fields: "
             + ", ".join(labels),
         )
+    if parse_result.program_selection != "omitted" \
+            and not is_narrow_supported_program_request(original_text):
+        return report(
+            "CLARIFICATION_REQUIRED",
+            "original request contains unsupported or unrecognized instructions",
+        )
     parsed_requests = parse_result.requests
     binding_error = semantic_binding_error(
         original_text, parsed_requests, fields={"adults"}
@@ -1136,6 +1178,29 @@ def _stated_passenger_counts(original_text: str) -> set[int]:
     return counts
 
 
+def _stated_named_absolute_dates(original_text: str) -> tuple[set[str], bool, bool]:
+    dates: set[str] = set()
+    saw_date = False
+    syntax_valid = True
+    for match in NAMED_ABSOLUTE_DATE_RE.finditer(original_text):
+        saw_date = True
+        if match.group("month_first") is not None:
+            month_name = match.group("month_first")
+            day = match.group("day_first")
+            year = match.group("year_first")
+        else:
+            month_name = match.group("month_second")
+            day = match.group("day_second")
+            year = match.group("year_second")
+        try:
+            dates.add(date(
+                int(year), MONTH_NUMBERS[month_name.lower()], int(day)
+            ).isoformat())
+        except (KeyError, TypeError, ValueError):
+            syntax_valid = False
+    return dates, saw_date, syntax_valid
+
+
 def semantic_binding_error(
     original_text: str,
     parsed_requests: List[Any],
@@ -1152,6 +1217,10 @@ def semantic_binding_error(
         match.group(0)
         for match in re.finditer(r"\b\d{4}-\d{2}-\d{2}\b", original_text)
     }
+    named_dates, named_date_evidence, named_date_syntax_valid = _stated_named_absolute_dates(
+        original_text
+    )
+    absolute_dates = exact_dates | named_dates
     stated_cabins = {
         re.sub(r"[\s_-]+class$", "", match.group(0), flags=re.IGNORECASE)
         .replace("-", " ").replace("_", " ").strip().lower()
@@ -1171,9 +1240,13 @@ def semantic_binding_error(
                     and parsed_route != exact_route:
                 mismatches.update(("origin", "destination"))
         parsed_date = str(parsed_request.departure_date).strip()
-        if "departure_date" in fields and exact_dates \
+        if "departure_date" in fields and (exact_dates or named_date_evidence) \
                 and re.fullmatch(r"\d{4}-\d{2}-\d{2}", parsed_date) \
-                and (len(exact_dates) != 1 or parsed_date not in exact_dates):
+                and (
+                    not named_date_syntax_valid
+                    or len(absolute_dates) != 1
+                    or parsed_date not in absolute_dates
+                ):
             mismatches.add("departure_date")
         if "cabin" in fields and stated_cabins:
             try:

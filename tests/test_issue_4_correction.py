@@ -838,6 +838,89 @@ class Issue4CorrectionTests(unittest.TestCase):
                 self.assertEqual(event['status'], 'CONFIRMATION_REQUIRED')
                 self.assertEqual(event['normalized_criteria']['program'], program)
 
+    def test_explicit_supported_program_requests_reject_extra_instructions(self):
+        for alias, extra in (
+            ('Aeroplan', 'and book a hotel'),
+            ('ANA miles', 'and arrange a car rental'),
+            ('Aeroplan', 'and tell me an unrelated joke'),
+        ):
+            with self.subTest(alias=alias, extra=extra):
+                self.request['original_text'] = (
+                    f'Use {alias} from JFK to CDG on 2026-11-05 business '
+                    f'for one adult under 90000 points {extra}'
+                )
+                parser = Mock()
+                parser.parse.return_value = RequestParseResult(
+                    [replace(self.criteria, maximum_points=90000, program=alias)],
+                    program_selection='supported',
+                    stated_program=alias,
+                )
+                with redirect_stdout(io.StringIO()):
+                    event = run_request(
+                        request=self.request,
+                        confirmation={'confirmed': True},
+                        event_log_path=self.log,
+                        parser=parser,
+                        adapter_registry={'aeroplan': self.adapter, 'ana': self.adapter},
+                        current_date=date(2026, 11, 1),
+                    )[0]
+                self.assertIn(event['status'], ('CLARIFICATION_REQUIRED', 'UNSUPPORTED_REQUEST'))
+                self.assertIsNone(event['atomic_task_id'])
+                self.adapter.execute.assert_not_called()
+
+    def test_named_absolute_dates_bind_parser_to_original_text(self):
+        for date_text in ('November 5, 2026', '5 November 2026'):
+            with self.subTest(date_text=date_text):
+                self.request['original_text'] = (
+                    f'Use Aeroplan from JFK to CDG on {date_text} business '
+                    'for one adult under 70000 points'
+                )
+                parser = Mock()
+                parser.parse.return_value = RequestParseResult(
+                    [replace(self.criteria, departure_date='2026-11-06')],
+                    program_selection='supported',
+                    stated_program='Aeroplan',
+                )
+                with redirect_stdout(io.StringIO()):
+                    event = run_request(
+                        request=self.request,
+                        confirmation={'confirmed': True},
+                        event_log_path=self.log,
+                        parser=parser,
+                        adapter_registry={'aeroplan': self.adapter},
+                        current_date=date(2026, 11, 1),
+                    )[0]
+                self.assertEqual(event['status'], 'CLARIFICATION_REQUIRED')
+                self.assertIn('departure_date', event['detail'])
+                self.assertIsNone(event['atomic_task_id'])
+                self.adapter.execute.assert_not_called()
+
+    def test_valid_named_absolute_dates_reach_confirmation(self):
+        for date_text in ('November 5, 2026', '5 November 2026'):
+            with self.subTest(date_text=date_text):
+                self.request['original_text'] = (
+                    f'Use Aeroplan from JFK to CDG on {date_text} business '
+                    'for one adult under 70000 points'
+                )
+                parser = Mock()
+                parser.parse.return_value = RequestParseResult(
+                    [self.criteria],
+                    program_selection='supported',
+                    stated_program='Aeroplan',
+                )
+                with redirect_stdout(io.StringIO()):
+                    event = run_request(
+                        request=self.request,
+                        confirmation={},
+                        event_log_path=self.log,
+                        parser=parser,
+                        adapter_registry={'aeroplan': self.adapter},
+                        current_date=date(2026, 11, 1),
+                    )[0]
+                self.assertEqual(event['status'], 'CONFIRMATION_REQUIRED')
+                self.assertEqual(event['normalized_criteria']['departure_date'], '2026-11-05')
+                self.adapter.execute.assert_not_called()
+
     def test_no_stated_program_defaults_to_aeroplan_after_validation(self):
         self.request['original_text'] = 'JFK to CDG on 2026-11-05 business one adult under 70000 points'
         for parsed_program in ('', 'ana'):

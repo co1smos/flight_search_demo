@@ -13,6 +13,8 @@ dependencies = [
   # Interactions is experimental; keep the tested 1.75 minor line reversible.
   "google-genai>=1.75,<1.76",
   "pydantic>=2.11,<3",
+  # browser-use imports pydantic-settings without declaring it in its base install.
+  "pydantic-settings>=2.7,<3",
   "python-dotenv>=1.0.1,<2",
   "steel-sdk>=0.6.0",
 ]

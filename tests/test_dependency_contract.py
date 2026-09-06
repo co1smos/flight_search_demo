@@ -14,8 +14,12 @@ class DependencyContractTests(unittest.TestCase):
             if item.startswith("google-genai")
         )
         airportsdata = next(item for item in dependencies if item.startswith("airportsdata"))
+        pydantic_settings = next(
+            item for item in dependencies if item.startswith("pydantic-settings")
+        )
         self.assertEqual(google_genai, "google-genai>=1.75,<1.76")
         self.assertEqual(airportsdata, "airportsdata==20260905")
+        self.assertEqual(pydantic_settings, "pydantic-settings>=2.7,<3")
 
 
 if __name__ == "__main__":
