@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
+import contextlib
 import io
 import json
+import sqlite3
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stdout
 from dataclasses import asdict
@@ -11,11 +15,12 @@ from datetime import date
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 from flight_search_demo.app import (
     ParsedNaturalLanguageRequest,
     GoogleGenAIRequestParser,
+    ParserFailure,
     RequestParseResult,
     run_request,
 )
@@ -86,6 +91,52 @@ class Issue14GeminiPolicyTests(unittest.TestCase):
         self.assertEqual(events[0]["gemini_usage"]["successful_calls"], 1)
         self.assertEqual(events[0]["gemini_usage"]["model"], "gemini-test")
 
+    def test_natural_language_provider_receives_the_remaining_sdk_timeout(self) -> None:
+        request = {
+            "request_id": "req-sdk-timeout",
+            "original_text": "Find one Aeroplan business seat from JFK to CDG on 2026-11-05 under 70000 points",
+        }
+        parsed = ParsedNaturalLanguageRequest(
+            "aeroplan", "JFK", "CDG", "2026-11-05", "Business", 1, "one_way", 70000
+        )
+        calls = []
+
+        def create(**kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(
+                outputs=[SimpleNamespace(type="text", text=json.dumps({
+                    "program_selection": "supported",
+                    "stated_program": "Aeroplan",
+                    "requests": [asdict(parsed)],
+                }))]
+            )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            policy = GeminiCallPolicy(
+                db_path=Path(tmpdir) / "usage.sqlite3",
+                config=GeminiPolicyConfig(
+                    run_call_limit=1,
+                    daily_call_limits={"gemini-test": 1},
+                    operation_deadline_seconds=0.75,
+                ),
+            )
+            parser = GoogleGenAIRequestParser(
+                client=SimpleNamespace(interactions=SimpleNamespace(create=create)),
+                model="gemini-test",
+                policy=policy,
+            )
+            result = parser.parse(
+                request_id=request["request_id"],
+                original_text=request["original_text"],
+                current_date=date(2026, 11, 1),
+                timezone_name="UTC",
+            )
+
+        self.assertEqual(len(result.requests), 1)
+        self.assertEqual(len(calls), 1)
+        self.assertGreater(calls[0]["timeout"], 0)
+        self.assertLessEqual(calls[0]["timeout"], 0.75)
+
     def test_structured_json_path_has_zero_gemini_calls_even_when_run_budget_is_zero(self) -> None:
         request = {
             "request_id": "req-structured-zero",
@@ -139,6 +190,39 @@ class Issue14GeminiPolicyTests(unittest.TestCase):
 
             self.assertEqual(calls, ["primary", "primary"])
             self.assertEqual(operation.diagnostics()["attempted_calls"], 2)
+
+    def test_run_allowance_is_shared_by_multiple_operations_and_concurrent_reservations(self) -> None:
+        calls = []
+        with tempfile.TemporaryDirectory() as tmpdir:
+            policy = GeminiCallPolicy(
+                db_path=Path(tmpdir) / "usage.sqlite3",
+                config=GeminiPolicyConfig(
+                    run_call_limit=2,
+                    daily_call_limits={"primary": 10},
+                ),
+            )
+            operations = [policy.operation(f"op-{index}") for index in range(4)]
+
+            def provider(model: str) -> str:
+                calls.append(model)
+                time.sleep(0.03)
+                return "ok"
+
+            def invoke(operation):
+                try:
+                    return operation.invoke(
+                        model="primary", purpose="browser_agent", provider_call=provider
+                    )
+                except GeminiBudgetError as exc:
+                    return exc
+
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                results = list(executor.map(invoke, operations))
+
+        self.assertEqual(sum(result == "ok" for result in results), 2)
+        self.assertEqual(sum(isinstance(result, GeminiBudgetError) for result in results), 2)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(sum(operation.attempted_calls for operation in operations), 2)
 
     def test_daily_counter_survives_restart_and_rolls_at_configured_timezone_boundary(self) -> None:
         current = [datetime(2026, 1, 2, 4, 59, tzinfo=timezone.utc)]
@@ -209,7 +293,6 @@ class Issue14GeminiPolicyTests(unittest.TestCase):
             self.assertEqual(operation.diagnostics()["retried_calls"], 2)
 
     def test_retry_backoff_cannot_outlive_operation_deadline(self) -> None:
-        monotonic_values = iter((0.0, 0.0, 0.0))
         calls = []
 
         class TransientError(RuntimeError):
@@ -224,7 +307,7 @@ class Issue14GeminiPolicyTests(unittest.TestCase):
                     max_attempts=3,
                     retry_backoff_seconds=(1.0,),
                 ),
-                monotonic=lambda: next(monotonic_values),
+                monotonic=lambda: 0.0,
                 sleep=lambda _: self.fail("deadline-bounded retry must not sleep"),
             )
             operation = policy.operation("deadline", deadline_seconds=0.5)
@@ -241,6 +324,130 @@ class Issue14GeminiPolicyTests(unittest.TestCase):
             GeminiErrorClassification.TRANSIENT_PROVIDER_ERROR,
         )
         self.assertEqual(operation.records[0].retry_decision, "deadline_exhausted")
+
+    def test_sync_provider_call_is_bounded_by_the_original_operation_deadline(self) -> None:
+        calls = []
+        with tempfile.TemporaryDirectory() as tmpdir:
+            policy = GeminiCallPolicy(
+                db_path=Path(tmpdir) / "usage.sqlite3",
+                config=GeminiPolicyConfig(run_call_limit=1, daily_call_limits={"primary": 1}),
+            )
+            operation = policy.operation("sync-timeout", deadline_seconds=0.05)
+
+            def provider(model: str) -> str:
+                calls.append(model)
+                time.sleep(0.25)
+                return "late success"
+
+            started = time.monotonic()
+            with self.assertRaises(GeminiCallFailure) as failure:
+                operation.invoke(model="primary", purpose="request_parse", provider_call=provider)
+            elapsed = time.monotonic() - started
+
+        self.assertLess(elapsed, 0.18)
+        self.assertEqual(calls, ["primary"])
+        self.assertEqual(
+            failure.exception.classification,
+            GeminiErrorClassification.TIMEOUT_CANCELLATION,
+        )
+        self.assertEqual(operation.records[0].classification, "timeout_cancellation")
+
+    def test_async_provider_call_is_cancellable_at_the_original_operation_deadline(self) -> None:
+        async def exercise():
+            with tempfile.TemporaryDirectory() as tmpdir:
+                policy = GeminiCallPolicy(
+                    db_path=Path(tmpdir) / "usage.sqlite3",
+                    config=GeminiPolicyConfig(run_call_limit=1, daily_call_limits={"primary": 1}),
+                )
+                operation = policy.operation("async-timeout", deadline_seconds=0.05)
+
+                async def provider(model: str) -> str:
+                    await asyncio.sleep(0.25)
+                    return "late success"
+
+                started = time.monotonic()
+                with self.assertRaises(GeminiCallFailure) as failure:
+                    await operation.invoke_async(
+                        model="primary", purpose="browser_agent", provider_call=provider
+                    )
+                return time.monotonic() - started, failure.exception, operation
+
+        elapsed, failure, operation = asyncio.run(exercise())
+        self.assertLess(elapsed, 0.18)
+        self.assertEqual(failure.classification, GeminiErrorClassification.TIMEOUT_CANCELLATION)
+        self.assertEqual(operation.records[0].classification, "timeout_cancellation")
+
+    def test_async_caller_cancellation_is_reraised_unchanged(self) -> None:
+        async def exercise():
+            with tempfile.TemporaryDirectory() as tmpdir:
+                policy = GeminiCallPolicy(
+                    db_path=Path(tmpdir) / "usage.sqlite3",
+                    config=GeminiPolicyConfig(run_call_limit=1, daily_call_limits={"primary": 1}),
+                )
+                operation = policy.operation("caller-cancel", deadline_seconds=1)
+                started = asyncio.Event()
+
+                async def provider(model: str) -> str:
+                    started.set()
+                    await asyncio.Event().wait()
+                    return "never"
+
+                task = asyncio.create_task(
+                    operation.invoke_async(
+                        model="primary", purpose="browser_agent", provider_call=provider
+                    )
+                )
+                await started.wait()
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                return operation
+
+        operation = asyncio.run(exercise())
+        self.assertEqual(operation.records[0].classification, "timeout_cancellation")
+
+    def test_async_reservation_and_diagnostic_reads_do_not_wait_for_sqlite_busy_timeout(self) -> None:
+        async def exercise():
+            with tempfile.TemporaryDirectory() as tmpdir:
+                db_path = Path(tmpdir) / "usage.sqlite3"
+                policy = GeminiCallPolicy(
+                    db_path=db_path,
+                    config=GeminiPolicyConfig(run_call_limit=1, daily_call_limits={"primary": 1}),
+                )
+                lock = sqlite3.connect(db_path)
+                lock.execute("BEGIN IMMEDIATE")
+                operation = policy.operation("sqlite-timeout", deadline_seconds=0.05)
+                ticks = 0
+
+                async def ticker():
+                    nonlocal ticks
+                    while True:
+                        ticks += 1
+                        await asyncio.sleep(0.005)
+
+                tick_task = asyncio.create_task(ticker())
+                try:
+                    with self.assertRaises(GeminiCallFailure) as failure:
+                        await operation.invoke_async(
+                            model="primary",
+                            purpose="browser_agent",
+                            provider_call=lambda _: asyncio.sleep(0),
+                        )
+                    diagnostic_started = time.monotonic()
+                    await operation.diagnostics_async(deadline_seconds=0.05)
+                    diagnostic_elapsed = time.monotonic() - diagnostic_started
+                finally:
+                    lock.rollback()
+                    lock.close()
+                    tick_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await tick_task
+                return ticks, failure.exception, diagnostic_elapsed
+
+        ticks, failure, diagnostic_elapsed = asyncio.run(exercise())
+        self.assertGreater(ticks, 2)
+        self.assertEqual(failure.classification, GeminiErrorClassification.TIMEOUT_CANCELLATION)
+        self.assertLess(diagnostic_elapsed, 0.15)
 
     def test_rate_limit_fallback_uses_remaining_run_budget_and_different_model(self) -> None:
         calls = []
@@ -277,6 +484,41 @@ class Issue14GeminiPolicyTests(unittest.TestCase):
             self.assertEqual(calls, ["primary", "fallback"])
             self.assertEqual(operation.diagnostics()["fallback_calls"], 1)
             self.assertEqual(operation.diagnostics()["remaining_run_calls"], 0)
+
+    def test_transient_retry_reserves_a_fallback_attempt(self) -> None:
+        calls = []
+
+        class TransientError(RuntimeError):
+            status_code = 503
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            policy = GeminiCallPolicy(
+                db_path=Path(tmpdir) / "usage.sqlite3",
+                config=GeminiPolicyConfig(
+                    run_call_limit=3,
+                    daily_call_limits={"primary": 2, "fallback": 1},
+                    max_attempts=3,
+                    retry_backoff_seconds=(),
+                ),
+            )
+            operation = policy.operation("retry-then-fallback")
+
+            def provider(model: str) -> str:
+                calls.append(model)
+                if model == "primary":
+                    raise TransientError("service unavailable")
+                return "fallback-ok"
+
+            result = operation.invoke(
+                model="primary",
+                purpose="browser_agent",
+                provider_call=provider,
+                fallback_model="fallback",
+            )
+            self.assertEqual(operation.diagnostics()["attempted_calls"], 3)
+
+        self.assertEqual(result, "fallback-ok")
+        self.assertEqual(calls, ["primary", "primary", "fallback"])
 
     def test_fallback_daily_exhaustion_stops_without_calling_fallback(self) -> None:
         calls = []
@@ -332,6 +574,45 @@ class Issue14GeminiPolicyTests(unittest.TestCase):
         self.assertNotIn("Bearer abc123", safe)
         self.assertNotIn("cookie=secret", safe)
 
+    def test_diagnostic_jsonl_redacts_original_text_and_sensitive_mapping_keys(self) -> None:
+        class FailingParser:
+            def parse(self, **kwargs):
+                raise ParserFailure(
+                    "provider rejected password=opaque-secret",
+                    diagnostics={
+                        "ordinary": "keep-this-diagnostic",
+                        "password": "opaque-secret",
+                        "nested": {
+                            "api_key": "ordinary-api-value",
+                            "session": {"token": "session-value"},
+                        },
+                        "sensitive_url": "https://sensitive.test/session?token=url-secret",
+                    },
+                )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            directory = Path(tmpdir)
+            run_request(
+                request={
+                    "request_id": "req-redaction",
+                    "original_text": "search https://sensitive.test/session?token=original-secret",
+                },
+                confirmation={"confirmed": False},
+                event_log_path=directory / "events.jsonl",
+                parser=FailingParser(),
+            )
+            diagnostic_text = (directory / "events.diagnostics.jsonl").read_text(encoding="utf-8")
+
+        for secret in (
+            "original-secret",
+            "opaque-secret",
+            "ordinary-api-value",
+            "session-value",
+            "url-secret",
+        ):
+            self.assertNotIn(secret, diagnostic_text)
+        self.assertIn("keep-this-diagnostic", diagnostic_text)
+
     def test_daily_exhaustion_is_an_explicit_application_outcome_without_a_provider_call(self) -> None:
         request = {
             "request_id": "req-quota",
@@ -367,6 +648,61 @@ class Issue14GeminiPolicyTests(unittest.TestCase):
             events[0]["gemini_usage"]["terminal_classification"],
             "daily_quota_exhaustion",
         )
+
+    def test_browser_run_budget_exhaustion_is_a_structured_application_outcome(self) -> None:
+        from flight_search_demo.live_run import run_spike
+
+        calls = []
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = SimpleNamespace(
+                steel_base_url="http://127.0.0.1:3000",
+                controlled_page_public_origin="http://127.0.0.1:8765",
+                controlled_page_port=8765,
+                start_local_controlled_page_server=False,
+                storage_state_path=str(Path(tmpdir) / "state.json"),
+                handoff_file=str(Path(tmpdir) / "handoff.json"),
+                marker="marker",
+                gemini_model="primary",
+                fallback_gemini_model="fallback",
+                max_steps=2,
+                handoff_timeout=1,
+                gemini_run_call_limit=0,
+                gemini_usage_db_path=str(Path(tmpdir) / "usage.sqlite3"),
+            )
+            policy = GeminiCallPolicy(
+                db_path=Path(tmpdir) / "usage.sqlite3",
+                config=GeminiPolicyConfig(
+                    run_call_limit=0,
+                    daily_call_limits={"primary": 1},
+                ),
+            )
+
+            def no_provider_call(*args, **kwargs):
+                calls.append((args, kwargs))
+                raise AssertionError("budget exhaustion must stop before a Gemini provider call")
+
+            with patch("flight_search_demo.live_run.run_in_fresh_session", new=AsyncMock(
+                side_effect=GeminiBudgetError(
+                    "per-run Gemini call allowance exhausted",
+                    classification=GeminiErrorClassification.RUN_BUDGET_EXHAUSTION,
+                    diagnostics=policy.operation("browser").diagnostics(
+                        terminal_classification=GeminiErrorClassification.RUN_BUDGET_EXHAUSTION,
+                        terminal_error="per-run Gemini call allowance exhausted",
+                        include_daily_reads=False,
+                    ),
+                )
+            )), patch("flight_search_demo.live_run.run_agent_task", new=AsyncMock(
+                side_effect=no_provider_call
+            )) as agent_task:
+                summary = asyncio.run(run_spike(args))
+
+        self.assertEqual(summary.status, "GEMINI_BUDGET_EXHAUSTED")
+        self.assertIsNone(summary.initial_result)
+        self.assertEqual(summary.gemini_outcome["status"], "GEMINI_BUDGET_EXHAUSTED")
+        self.assertTrue(summary.gemini_outcome["diagnostic_id"])
+        self.assertEqual(summary.gemini_outcome["remaining_run_calls"], 0)
+        self.assertEqual(calls, [])
+        agent_task.assert_not_awaited()
 
     def test_browser_agent_model_boundary_uses_same_budget_and_fallback(self) -> None:
         class RateLimitError(RuntimeError):

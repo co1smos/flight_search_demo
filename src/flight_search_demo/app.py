@@ -295,13 +295,22 @@ class GoogleGenAIRequestParser:
             f"timezone: {timezone_name}\n"
             f"request: {original_text}\n"
         )
+        active_operation = None
+
         def parse_response(model: str) -> RequestParseResult:
             try:
+                create_kwargs = {
+                    "model": model,
+                    "input": prompt,
+                    "response_mime_type": "application/json",
+                    "response_format": natural_language_parse_schema(),
+                }
+                if active_operation is not None:
+                    # google-genai 1.75 exposes a per-request timeout on
+                    # interactions.create; the policy remains the source of truth.
+                    create_kwargs["timeout"] = max(active_operation.remaining_seconds(), 0.001)
                 interaction = self._client.interactions.create(
-                    model=model,
-                    input=prompt,
-                    response_mime_type="application/json",
-                    response_format=natural_language_parse_schema(),
+                    **create_kwargs,
                 )
                 payload = json.loads("".join(
                     output.text for output in interaction.outputs or []
@@ -369,6 +378,7 @@ class GoogleGenAIRequestParser:
         operation = self._policy.operation(
             f"request-parse:{request_id}", request_id=request_id
         )
+        active_operation = operation
         try:
             result = operation.invoke(
                 model=self._model,
@@ -881,7 +891,8 @@ def run_request(
             metadata = {"diagnostic_metadata_error": type(metadata).__name__}
         append_event(event_log_path.with_suffix(".diagnostics.jsonl"), {
             "diagnostic_id": diagnostic_id, "request_id": request_id,
-            "original_text": original_text, "metadata": metadata, "error": error,
+            "original_text": redact_sensitive_text(original_text),
+            "metadata": metadata, "error": error,
         })
 
     def report(status: str, detail: str, criteria=None, **fields) -> List[Dict[str, Any]]:

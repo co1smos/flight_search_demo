@@ -9,6 +9,7 @@ from pathlib import Path
 import time
 from typing import Any, Callable
 from urllib.parse import urlparse
+from uuid import uuid4
 
 from browser_use import Agent, BrowserSession
 from browser_use.llm import ChatGoogle
@@ -56,6 +57,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-steps", type=int, default=8)
     parser.add_argument("--handoff-timeout", type=int, default=300)
+    parser.add_argument("--gemini-run-call-limit", type=int, default=3)
+    parser.add_argument("--gemini-usage-db-path", default=".artifacts/gemini-usage.sqlite3")
     return parser.parse_args()
 
 
@@ -117,7 +120,7 @@ class PolicyBoundChatGoogle:
             raise
         finally:
             if self._diagnostic_sink is not None:
-                self._diagnostic_sink(self._operation.diagnostics())
+                self._diagnostic_sink(await self._operation.diagnostics_async())
 
 
 def classify_allowlist_rejection(exc: Exception) -> str:
@@ -203,9 +206,7 @@ async def run_agent_task(
             raise GeminiPolicyError(
                 "browser agent operation deadline exhausted",
                 classification=GeminiErrorClassification.TIMEOUT_CANCELLATION,
-                diagnostics=operation.diagnostics(
-                    terminal_error="browser agent operation deadline exhausted",
-                ),
+                diagnostics=await operation.diagnostics_async(deadline_seconds=0.01),
             ) from exc
         if policy_llm.last_policy_error is not None:
             raise policy_llm.last_policy_error
@@ -311,6 +312,10 @@ async def run_spike(args: argparse.Namespace) -> RunSummary:
             gemini_model=args.gemini_model,
             fallback_gemini_model=args.fallback_gemini_model,
             max_steps=args.max_steps,
+            gemini_run_call_limit=getattr(args, "gemini_run_call_limit", 3),
+            gemini_usage_db_path=Path(
+                getattr(args, "gemini_usage_db_path", ".artifacts/gemini-usage.sqlite3")
+            ),
         )
         ensure_storage_state_parent(config.storage_state_path)
         gemini_policy = GeminiCallPolicy(
@@ -324,28 +329,61 @@ async def run_spike(args: argparse.Namespace) -> RunSummary:
         )
         gemini_operations: list[dict[str, Any]] = []
 
-        initial_result = await run_in_fresh_session(
-            client=client,
-            config=config,
-            policy=gemini_policy,
-            diagnostic_sink=gemini_operations.append,
-            task=(
-                f"Open {config.controlled_page_url}. Enter the marker value '{args.marker}' "
-                "into the Marker input, click 'Save marker to this browser profile', and return "
-                "the page title, the visible persisted marker, whether it is persisted, and the current URL."
-            ),
-        )
+        try:
+            initial_result = await run_in_fresh_session(
+                client=client,
+                config=config,
+                policy=gemini_policy,
+                diagnostic_sink=gemini_operations.append,
+                task=(
+                    f"Open {config.controlled_page_url}. Enter the marker value '{args.marker}' "
+                    "into the Marker input, click 'Save marker to this browser profile', and return "
+                    "the page title, the visible persisted marker, whether it is persisted, and the current URL."
+                ),
+            )
 
-        persisted_result = await run_in_fresh_session(
-            client=client,
-            config=config,
-            policy=gemini_policy,
-            diagnostic_sink=gemini_operations.append,
-            task=(
-                f"Open {config.controlled_page_url}. Do not change the page. Read the visible page title, "
-                "the persisted marker value, whether a marker is persisted, and the current URL."
-            ),
-        )
+            persisted_result = await run_in_fresh_session(
+                client=client,
+                config=config,
+                policy=gemini_policy,
+                diagnostic_sink=gemini_operations.append,
+                task=(
+                    f"Open {config.controlled_page_url}. Do not change the page. Read the visible page title, "
+                    "the persisted marker value, whether a marker is persisted, and the current URL."
+                ),
+            )
+        except GeminiPolicyError as exc:
+            diagnostics = dict(exc.diagnostics)
+            classification = exc.classification.value
+            if exc.classification == GeminiErrorClassification.RUN_BUDGET_EXHAUSTION:
+                status = "GEMINI_BUDGET_EXHAUSTED"
+            elif exc.classification == GeminiErrorClassification.DAILY_QUOTA_EXHAUSTION:
+                status = "GEMINI_QUOTA_EXHAUSTED"
+            else:
+                status = "GEMINI_FAILED"
+            diagnostic_id = uuid4().hex
+            outcome = {
+                "status": status,
+                "diagnostic_id": diagnostic_id,
+                "classification": classification,
+                "model": diagnostics.get("model"),
+                "purpose": diagnostics.get("purpose"),
+                "remaining_run_calls": diagnostics.get("remaining_run_calls"),
+                "remaining_daily_calls": diagnostics.get("remaining_daily_calls", {}),
+                "provenance": diagnostics,
+            }
+            return RunSummary(
+                initial_result=None,
+                persisted_result=None,
+                offsite_rejection=None,
+                handoff=None,
+                gemini_policy={
+                    "limits": gemini_policy.limits_summary(),
+                    "operations": gemini_operations,
+                },
+                status=status,
+                gemini_outcome=outcome,
+            )
         assert_expected_results(
             initial_result,
             persisted_result,
@@ -401,14 +439,28 @@ def main() -> None:
     print(
         json.dumps(
             {
-                "initial_result": summary.initial_result.model_dump(),
-                "persisted_result": summary.persisted_result.model_dump(),
+                "status": summary.status,
+                "initial_result": (
+                    summary.initial_result.model_dump()
+                    if summary.initial_result is not None
+                    else None
+                ),
+                "persisted_result": (
+                    summary.persisted_result.model_dump()
+                    if summary.persisted_result is not None
+                    else None
+                ),
                 "offsite_rejection": summary.offsite_rejection,
-                "handoff": {
-                    "session_id": summary.handoff.session_id,
-                    "status": summary.handoff.status.value,
-                    "details_written": True,
-                },
+                "handoff": (
+                    {
+                        "session_id": summary.handoff.session_id,
+                        "status": summary.handoff.status.value,
+                        "details_written": True,
+                    }
+                    if summary.handoff is not None
+                    else None
+                ),
+                "gemini_outcome": summary.gemini_outcome,
                 "gemini_policy": summary.gemini_policy,
             },
             indent=2,

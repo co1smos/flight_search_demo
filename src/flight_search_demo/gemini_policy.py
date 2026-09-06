@@ -8,9 +8,11 @@ or models.
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 import inspect
 import re
 import sqlite3
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -154,7 +156,19 @@ def redact_sensitive(value: Any) -> Any:
     if isinstance(value, str):
         return redact_sensitive_text(value)
     if isinstance(value, Mapping):
-        return {str(key): redact_sensitive(item) for key, item in value.items()}
+        redacted = {}
+        for key, item in value.items():
+            key_text = str(key)
+            normalized_key = re.sub(r"[^a-z0-9]", "", key_text.lower())
+            sensitive_key = any(
+                marker in normalized_key
+                for marker in (
+                    "apikey", "authorization", "credential", "cookie", "password",
+                    "secret", "session", "token",
+                )
+            )
+            redacted[key_text] = "[REDACTED]" if sensitive_key else redact_sensitive(item)
+        return redacted
     if isinstance(value, (list, tuple)):
         return [redact_sensitive(item) for item in value]
     return value
@@ -264,6 +278,30 @@ class _Reservation:
     daily_remaining: int
 
 
+class _RunBudget:
+    """A process-local, concurrency-safe allowance for one policy/run scope."""
+
+    def __init__(self, limit: int) -> None:
+        self._remaining = limit
+        self._lock = threading.Lock()
+
+    def reserve(self) -> int | None:
+        with self._lock:
+            if self._remaining <= 0:
+                return None
+            self._remaining -= 1
+            return self._remaining
+
+    def release(self) -> None:
+        with self._lock:
+            self._remaining += 1
+
+    @property
+    def remaining(self) -> int:
+        with self._lock:
+            return self._remaining
+
+
 class GeminiCallPolicy:
     """Reserve and account for every outbound application Gemini attempt."""
 
@@ -283,6 +321,7 @@ class GeminiCallPolicy:
         self._monotonic = monotonic or time.monotonic
         self._sleep = sleep or time.sleep
         self._async_sleep = async_sleep or asyncio.sleep
+        self._run_budget = _RunBudget(self.config.run_call_limit)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as connection:
             connection.execute(
@@ -321,16 +360,12 @@ class GeminiCallPolicy:
             "operation_deadline_seconds": self.config.operation_deadline_seconds,
         }
 
-    def _reserve(self, operation: "GeminiOperation", model: str) -> _Reservation:
-        if operation.attempted_calls >= self.config.run_call_limit:
-            raise GeminiBudgetError(
-                "per-run Gemini call allowance exhausted",
-                classification=GeminiErrorClassification.RUN_BUDGET_EXHAUSTION,
-                diagnostics=operation.diagnostics(
-                    terminal_classification=GeminiErrorClassification.RUN_BUDGET_EXHAUSTION,
-                    terminal_error="per-run Gemini call allowance exhausted",
-                ),
-            )
+    def _reserve(
+        self,
+        operation: "GeminiOperation",
+        model: str,
+        deadline_at: float | None = None,
+    ) -> _Reservation:
         daily_limit = self.config.daily_call_limits.get(model)
         if daily_limit is None:
             raise GeminiBudgetError(
@@ -345,6 +380,16 @@ class GeminiCallPolicy:
         usage_day = self.usage_day()
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            if deadline_at is not None and self._monotonic() >= deadline_at:
+                connection.rollback()
+                raise GeminiCallFailure(
+                    "Gemini operation deadline exhausted before reservation",
+                    classification=GeminiErrorClassification.TIMEOUT_CANCELLATION,
+                    diagnostics=operation.diagnostics(
+                        terminal_classification=GeminiErrorClassification.TIMEOUT_CANCELLATION,
+                        terminal_error="operation deadline exhausted before reservation",
+                    ),
+                )
             row = connection.execute(
                 "SELECT attempted_calls FROM gemini_daily_usage WHERE usage_day=? AND timezone_name=? AND model=?",
                 (usage_day, self.config.timezone_name, model),
@@ -360,6 +405,17 @@ class GeminiCallPolicy:
                         terminal_error=f"daily allowance exhausted for model {model}",
                     ),
                 )
+            run_remaining = self._run_budget.reserve()
+            if run_remaining is None:
+                connection.rollback()
+                raise GeminiBudgetError(
+                    "per-run Gemini call allowance exhausted",
+                    classification=GeminiErrorClassification.RUN_BUDGET_EXHAUSTION,
+                    diagnostics=operation.diagnostics(
+                        terminal_classification=GeminiErrorClassification.RUN_BUDGET_EXHAUSTION,
+                        terminal_error="per-run Gemini call allowance exhausted",
+                    ),
+                )
             if row:
                 connection.execute(
                     "UPDATE gemini_daily_usage SET attempted_calls=attempted_calls+1 WHERE usage_day=? AND timezone_name=? AND model=?",
@@ -370,10 +426,29 @@ class GeminiCallPolicy:
                     "INSERT INTO gemini_daily_usage(usage_day, timezone_name, model, attempted_calls) VALUES (?, ?, ?, 1)",
                     (usage_day, self.config.timezone_name, model),
                 )
-            connection.commit()
+            try:
+                if deadline_at is not None and self._monotonic() >= deadline_at:
+                    connection.rollback()
+                    self._run_budget.release()
+                    raise GeminiCallFailure(
+                        "Gemini operation deadline exhausted before reservation",
+                        classification=GeminiErrorClassification.TIMEOUT_CANCELLATION,
+                        diagnostics=operation.diagnostics(
+                            terminal_classification=GeminiErrorClassification.TIMEOUT_CANCELLATION,
+                            terminal_error="operation deadline exhausted before reservation",
+                        ),
+                    )
+                connection.commit()
+            except BaseException:
+                if connection.in_transaction:
+                    connection.rollback()
+                if run_remaining is not None:
+                    self._run_budget.release()
+                raise
         operation.attempted_calls += 1
+        operation._daily_remaining[model] = daily_limit - daily_used - 1
         return _Reservation(
-            run_remaining=self.config.run_call_limit - operation.attempted_calls,
+            run_remaining=run_remaining,
             daily_remaining=daily_limit - daily_used - 1,
         )
 
@@ -384,6 +459,25 @@ class GeminiCallPolicy:
                 (self.usage_day(), self.config.timezone_name, model),
             ).fetchone()
         return int(row[0]) if row else 0
+
+    async def reserve_async(self, operation: "GeminiOperation", model: str) -> _Reservation:
+        operation._ensure_time()
+        remaining = operation.remaining_seconds()
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(self._reserve, operation, model, operation.deadline_at),
+                timeout=remaining,
+            )
+        except asyncio.TimeoutError as exc:
+            raise GeminiCallFailure(
+                "Gemini operation deadline exhausted while reserving call budget",
+                classification=GeminiErrorClassification.TIMEOUT_CANCELLATION,
+                diagnostics=operation.diagnostics(
+                    terminal_classification=GeminiErrorClassification.TIMEOUT_CANCELLATION,
+                    terminal_error="operation deadline exhausted while reserving call budget",
+                    include_daily_reads=False,
+                ),
+            ) from exc
 
     def operation(
         self,
@@ -426,6 +520,7 @@ class GeminiOperation:
         self.deadline_at = deadline_at
         self.attempted_calls = 0
         self.records: list[_CallRecord] = []
+        self._daily_remaining: dict[str, int] = {}
         self.current_model: str | None = None
         self.current_purpose: str | None = None
 
@@ -439,6 +534,9 @@ class GeminiOperation:
                     terminal_error="operation deadline exhausted before the next call",
                 ),
             )
+
+    def remaining_seconds(self) -> float:
+        return max(0.0, self.deadline_at - self.policy._monotonic())
 
     def _finish_record(self, record: _CallRecord, exc: BaseException | None) -> GeminiErrorClassification | None:
         if exc is None:
@@ -458,30 +556,66 @@ class GeminiOperation:
 
     def _prepare_retry(self, record: _CallRecord, retry_number: int) -> bool:
         delay = self._retry_delay(retry_number)
-        if self.policy._monotonic() + delay >= self.deadline_at:
+        if self.remaining_seconds() <= delay:
             record.retry_decision = "deadline_exhausted"
             return False
         record.retry_decision = f"retry_after_{delay:g}s"
-        self.policy._sleep(delay)
+        try:
+            self._bounded_sync_call(lambda: self.policy._sleep(delay))
+        except TimeoutError:
+            record.retry_decision = "deadline_exhausted"
+            return False
         return True
 
     async def _prepare_async_retry(self, record: _CallRecord, retry_number: int) -> bool:
         delay = self._retry_delay(retry_number)
-        if self.policy._monotonic() + delay >= self.deadline_at:
+        if self.remaining_seconds() <= delay:
             record.retry_decision = "deadline_exhausted"
             return False
         record.retry_decision = f"retry_after_{delay:g}s"
-        await self.policy._async_sleep(delay)
+        try:
+            await asyncio.wait_for(self.policy._async_sleep(delay), timeout=self.remaining_seconds())
+        except asyncio.TimeoutError:
+            record.retry_decision = "deadline_exhausted"
+            return False
         return True
+
+    def _bounded_sync_call(self, callback: Callable[[], T]) -> T:
+        """Run a sync provider boundary within the remaining deadline.
+
+        A non-cooperative provider thread may finish after a timeout; it is
+        detached and its result can never authorize or return a successful
+        application call.
+        """
+        remaining = self.remaining_seconds()
+        if remaining <= 0:
+            raise TimeoutError("Gemini operation deadline exhausted")
+        executor = ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(callback)
+        try:
+            return future.result(timeout=remaining)
+        except FutureTimeoutError as exc:
+            future.cancel()
+            executor.shutdown(wait=False, cancel_futures=True)
+            raise TimeoutError("Gemini operation deadline exhausted") from exc
+        finally:
+            if not future.done():
+                executor.shutdown(wait=False, cancel_futures=True)
+            else:
+                executor.shutdown(wait=True)
 
     def diagnostics(
         self,
         *,
         terminal_classification: GeminiErrorClassification | None = None,
         terminal_error: str | None = None,
+        include_daily_reads: bool = True,
     ) -> dict[str, Any]:
         daily_remaining = {
             model: max(0, limit - self.policy.daily_usage(model))
+            for model, limit in self.policy.config.daily_call_limits.items()
+        } if include_daily_reads else {
+            model: self._daily_remaining.get(model, limit)
             for model, limit in self.policy.config.daily_call_limits.items()
         }
         usage_by_model: dict[str, dict[str, int]] = {}
@@ -511,7 +645,7 @@ class GeminiOperation:
             "failed_calls": sum(record.status == "failed" for record in self.records),
             "retried_calls": sum(record.retry_decision.startswith("retry_after_") for record in self.records),
             "fallback_calls": sum(record.fallback_decision == "attempt" for record in self.records),
-            "remaining_run_calls": max(0, self.policy.config.run_call_limit - self.attempted_calls),
+            "remaining_run_calls": self.policy._run_budget.remaining,
             "remaining_daily_calls": daily_remaining,
             "usage_by_model": usage_by_model,
             "counter_deltas": {
@@ -530,6 +664,19 @@ class GeminiOperation:
             payload["terminal_error"] = redact_sensitive_text(terminal_error)
         return redact_sensitive(payload)
 
+    async def diagnostics_async(self, *, deadline_seconds: float | None = None) -> dict[str, Any]:
+        remaining = self.remaining_seconds() if deadline_seconds is None else min(
+            self.remaining_seconds(), deadline_seconds
+        )
+        if remaining <= 0:
+            return self.diagnostics(include_daily_reads=False)
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(self.diagnostics), timeout=remaining
+            )
+        except asyncio.TimeoutError:
+            return self.diagnostics(include_daily_reads=False)
+
     def invoke(
         self,
         *,
@@ -544,10 +691,17 @@ class GeminiOperation:
         fallback_used = False
         attempts = 0
         retry_number = 0
+        has_fallback = bool(fallback_model and fallback_model != model)
+        primary_attempt_limit = max(
+            1, self.policy.config.max_attempts - int(has_fallback)
+        ) if has_fallback else self.policy.config.max_attempts
+        primary_attempts = 0
         while attempts < self.policy.config.max_attempts:
             self._ensure_time()
             reservation = self.policy._reserve(self, current_model)
             attempts += 1
+            if current_model == model:
+                primary_attempts += 1
             record = _CallRecord(
                 model=current_model,
                 purpose=purpose,
@@ -560,7 +714,7 @@ class GeminiOperation:
                 record.fallback_decision = "attempt"
             self.records.append(record)
             try:
-                result = provider_call(current_model)
+                result = self._bounded_sync_call(lambda: provider_call(current_model))
                 if inspect.isawaitable(result):
                     raise TypeError("sync Gemini provider callback returned an awaitable")
                 record.status = "successful"
@@ -568,7 +722,12 @@ class GeminiOperation:
                 if isinstance(exc, (KeyboardInterrupt, SystemExit)):
                     raise
                 classification = self._finish_record(record, exc)
-                if classification in self.policy.config.retry_classifications and attempts < self.policy.config.max_attempts:
+                if (
+                    current_model == model
+                    and classification in self.policy.config.retry_classifications
+                    and primary_attempts < primary_attempt_limit
+                    and attempts < self.policy.config.max_attempts
+                ):
                     retry_number += 1
                     if self._prepare_retry(record, retry_number):
                         continue
@@ -616,10 +775,17 @@ class GeminiOperation:
         fallback_used = False
         attempts = 0
         retry_number = 0
+        has_fallback = bool(fallback_model and fallback_model != model)
+        primary_attempt_limit = max(
+            1, self.policy.config.max_attempts - int(has_fallback)
+        ) if has_fallback else self.policy.config.max_attempts
+        primary_attempts = 0
         while attempts < self.policy.config.max_attempts:
             self._ensure_time()
-            reservation = self.policy._reserve(self, current_model)
+            reservation = await self.policy.reserve_async(self, current_model)
             attempts += 1
+            if current_model == model:
+                primary_attempts += 1
             record = _CallRecord(
                 model=current_model,
                 purpose=purpose,
@@ -632,13 +798,23 @@ class GeminiOperation:
                 record.fallback_decision = "attempt"
             self.records.append(record)
             try:
-                result = await provider_call(current_model)
+                result = await asyncio.wait_for(
+                    provider_call(current_model), timeout=self.remaining_seconds()
+                )
                 record.status = "successful"
+            except asyncio.CancelledError as exc:
+                self._finish_record(record, exc)
+                raise
             except BaseException as exc:
                 if isinstance(exc, (KeyboardInterrupt, SystemExit)):
                     raise
                 classification = self._finish_record(record, exc)
-                if classification in self.policy.config.retry_classifications and attempts < self.policy.config.max_attempts:
+                if (
+                    current_model == model
+                    and classification in self.policy.config.retry_classifications
+                    and primary_attempts < primary_attempt_limit
+                    and attempts < self.policy.config.max_attempts
+                ):
                     retry_number += 1
                     if await self._prepare_async_retry(record, retry_number):
                         continue

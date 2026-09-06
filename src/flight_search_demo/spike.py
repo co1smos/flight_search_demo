@@ -72,11 +72,13 @@ def redact_runtime_text(text: str, steel_api_key: Optional[str], google_api_key:
 
 @dataclass
 class RunSummary:
-    initial_result: ControlledPageResult
-    persisted_result: ControlledPageResult
-    offsite_rejection: str
-    handoff: HumanTakeoverGate
+    initial_result: ControlledPageResult | None
+    persisted_result: ControlledPageResult | None
+    offsite_rejection: str | None
+    handoff: HumanTakeoverGate | None
     gemini_policy: dict[str, Any] = field(default_factory=dict)
+    status: str = "SUCCEEDED"
+    gemini_outcome: dict[str, Any] | None = None
 
 
 def ensure_storage_state_parent(path: Path) -> None:

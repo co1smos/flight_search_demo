@@ -13,6 +13,7 @@ from flight_search_demo.live_run import (
     assert_expected_results,
     build_agent_llms,
     classify_allowlist_rejection,
+    run_offsite_attempt,
     run_spike,
 )
 from flight_search_demo.models import ControlledPageResult
@@ -136,6 +137,50 @@ class SpikeContractTests(unittest.TestCase):
         wrong_origin = good.model_copy(update={"current_url": "https://example.com/"})
         with self.assertRaisesRegex(RuntimeError, "controlled origin"):
             assert_expected_results(good, wrong_origin, marker="expected-marker", controlled_page_url=expected_url)
+
+    def test_deterministic_security_and_result_proofs_make_zero_model_calls(self) -> None:
+        calls = []
+
+        class ZeroBudgetRecordingBrowser:
+            async def start(self) -> None:
+                return None
+
+            async def navigate_to(self, url: str) -> None:
+                if "example.com" in url:
+                    raise ValueError("Navigation to https://example.com/ blocked by security policy")
+
+            async def stop(self) -> None:
+                return None
+
+        config = BrowserStackConfig(
+            steel_base_url="http://127.0.0.1:3000",
+            controlled_page_url="http://127.0.0.1:8765/",
+            storage_state_path=Path(".artifacts/zero-budget/state.json"),
+            gemini_run_call_limit=0,
+        )
+        good = ControlledPageResult(
+            page_title="Controlled Browser Stack Test",
+            marker_value="expected-marker",
+            marker_persisted=True,
+            current_url=config.controlled_page_url,
+        )
+        with patch(
+            "flight_search_demo.live_run.BrowserSession",
+            return_value=ZeroBudgetRecordingBrowser(),
+        ):
+            rejection = asyncio.run(
+                run_offsite_attempt(config=config, cdp_url="ws://127.0.0.1:9223/devtools/browser/test")
+            )
+
+        self.assertEqual(rejection, "ValueError")
+        self.assertEqual(calls, [])
+        self.assertEqual(debugger_metadata_url(config.steel_base_url), "http://127.0.0.1:9223/json/version")
+        assert_expected_results(
+            good,
+            good,
+            marker="expected-marker",
+            controlled_page_url=config.controlled_page_url,
+        )
 
     def test_steel_control_and_debugger_surfaces_must_be_private(self) -> None:
         from flight_search_demo.spike import debugger_metadata_url
