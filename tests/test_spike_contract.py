@@ -13,15 +13,27 @@ from flight_search_demo.live_run import (
     assert_expected_results,
     build_agent_llms,
     classify_allowlist_rejection,
+    parse_args,
+    run_agent_task,
+    run_in_fresh_session,
+    run_offsite_attempt,
     run_spike,
 )
 from flight_search_demo.models import ControlledPageResult
+from flight_search_demo.gemini_policy import (
+    GeminiCallPolicy,
+    GeminiErrorClassification,
+    GeminiPolicyError,
+    GeminiPolicyConfig,
+)
 from flight_search_demo.spike import (
+    BrowserTaskOutcome,
     build_cdp_url,
     build_debugger_cdp_url,
     build_session_endpoints,
     build_takeover_gate,
     debugger_metadata_url,
+    discover_debugger_cdp_url,
     redact_runtime_text,
     complete_handoff_file,
     secure_artifact_file,
@@ -31,6 +43,26 @@ from flight_search_demo.live_run import navigate_handoff_session
 
 
 class SpikeContractTests(unittest.TestCase):
+    def test_live_cli_exposes_all_gemini_budget_and_deadline_settings(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "GEMINI_DAILY_CALL_LIMITS": "primary=7,fallback=4",
+                "GEMINI_TIMEZONE": "America/New_York",
+                "GEMINI_MAX_ATTEMPTS": "4",
+                "GEMINI_RETRY_BACKOFF_SECONDS": "0.2,0.5",
+                "GEMINI_OPERATION_DEADLINE_SECONDS": "12.5",
+            },
+            clear=False,
+        ), patch("sys.argv", ["live_run"]):
+            args = parse_args()
+
+        self.assertEqual(args.gemini_daily_call_limits, {"primary": 7, "fallback": 4})
+        self.assertEqual(args.gemini_timezone, "America/New_York")
+        self.assertEqual(args.gemini_max_attempts, 4)
+        self.assertEqual(args.gemini_retry_backoff_seconds, (0.2, 0.5))
+        self.assertEqual(args.gemini_operation_deadline_seconds, 12.5)
+
     def test_run_spike_rejects_public_steel_url_before_constructing_client(self) -> None:
         args = self.make_run_args(steel_base_url="https://steel.example.com")
 
@@ -137,6 +169,395 @@ class SpikeContractTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "controlled origin"):
             assert_expected_results(good, wrong_origin, marker="expected-marker", controlled_page_url=expected_url)
 
+    def test_browser_runner_requires_caller_owned_policy_before_client_construction(self) -> None:
+        config = BrowserStackConfig(
+            steel_base_url="http://127.0.0.1:3000",
+            controlled_page_url="http://controlled.test/",
+            storage_state_path=Path(".artifacts/owned-policy/state.json"),
+            google_api_key="offline-test",
+        )
+        with patch("flight_search_demo.live_run.BrowserSession") as browser, patch(
+            "flight_search_demo.live_run.build_agent_llms"
+        ) as build_llms:
+            with self.assertRaisesRegex(ValueError, "caller-owned Gemini policy"):
+                asyncio.run(
+                    run_agent_task(
+                        task="deterministic check",
+                        config=config,
+                        cdp_url="ws://127.0.0.1:9223/devtools/browser/test",
+                        policy=None,
+                    )
+                )
+        browser.assert_not_called()
+        build_llms.assert_not_called()
+
+    def test_equal_primary_and_fallback_models_are_rejected_at_configuration_boundary(self) -> None:
+        with self.assertRaisesRegex(ValueError, "different"):
+            BrowserStackConfig(
+                steel_base_url="http://127.0.0.1:3000",
+                controlled_page_url="http://controlled.test/",
+                storage_state_path=Path(".artifacts/model-config/state.json"),
+                gemini_model="same-model",
+                fallback_gemini_model="same-model",
+            )
+
+        args = self.make_run_args(
+            gemini_model="same-model",
+            fallback_gemini_model="same-model",
+        )
+        with patch("flight_search_demo.live_run.Steel") as steel:
+            with self.assertRaisesRegex(ValueError, "different"):
+                asyncio.run(run_spike(args))
+        steel.assert_not_called()
+
+    def test_deterministic_browser_paths_return_structured_zero_call_outcomes(self) -> None:
+        calls = []
+
+        class RecordingLLM:
+            model = "offline-primary"
+
+            async def ainvoke(self, *args, **kwargs):
+                calls.append((args, kwargs))
+                raise AssertionError("deterministic browser paths must not call the model")
+
+        class RecordingBrowser:
+            async def navigate_to(self, url: str) -> None:
+                if "example.com" in url:
+                    raise ValueError("Navigation to https://example.com/ blocked by security policy")
+
+        class RecordingAgent:
+            def __init__(self, *, task, llm, browser_session, **kwargs):
+                self.task = task
+                self.llm = llm
+                self.browser_session = browser_session
+
+            async def run(self, max_steps):
+                if self.task == "domain":
+                    await self.browser_session.navigate_to("https://example.com/")
+                if self.task == "security":
+                    raise RuntimeError("CAPTCHA challenge requires human intervention")
+                return SimpleNamespace(
+                    structured_output=ControlledPageResult(
+                        page_title="Controlled Browser Stack Test",
+                        marker_value="wrong-marker" if self.task == "result" else "expected-marker",
+                        marker_persisted=True,
+                        current_url="http://controlled.test/",
+                    )
+                )
+
+        config = BrowserStackConfig(
+            steel_base_url="http://127.0.0.1:3000",
+            controlled_page_url="http://controlled.test/",
+            storage_state_path=Path(".artifacts/zero-budget/state.json"),
+            google_api_key="offline-test",
+        )
+
+        def build_recording_llms(**kwargs):
+            return RecordingLLM(), RecordingLLM()
+
+        def run(task: str, cdp_url: str):
+            with tempfile.TemporaryDirectory() as tmpdir:
+                policy = GeminiCallPolicy(
+                    db_path=Path(tmpdir) / "usage.sqlite3",
+                    config=GeminiPolicyConfig(
+                        run_call_limit=0,
+                        daily_call_limits={"offline-primary": 1, "offline-fallback": 1},
+                    )
+                )
+                with patch("flight_search_demo.live_run.BrowserSession", return_value=RecordingBrowser()), patch(
+                    "flight_search_demo.live_run.build_agent_llms", side_effect=build_recording_llms
+                ), patch("flight_search_demo.live_run.Agent", RecordingAgent):
+                    return asyncio.run(
+                        run_agent_task(
+                            task=task,
+                            config=config,
+                            cdp_url=cdp_url,
+                            policy=policy,
+                            expected_marker="expected-marker",
+                            expected_controlled_page_url=config.controlled_page_url,
+                        )
+                    )
+
+        outcomes = [
+            run("domain", "ws://127.0.0.1:9223/devtools/browser/test"),
+            run("security", "ws://127.0.0.1:9223/devtools/browser/test"),
+            run("result", "ws://127.0.0.1:9223/devtools/browser/test"),
+            run("result", "ws://8.8.8.8:9223/devtools/browser/test"),
+        ]
+
+        self.assertTrue(all(isinstance(outcome, BrowserTaskOutcome) for outcome in outcomes))
+        self.assertEqual(
+            [outcome.classification for outcome in outcomes],
+            [
+                "domain_allowlist_rejection",
+                "security_condition",
+                "final_result_validation",
+                "private_cdp_endpoint_rejection",
+            ],
+        )
+        self.assertEqual(calls, [])
+        for outcome in outcomes:
+            self.assertEqual(outcome.provenance["attempted_calls"], 0)
+            self.assertEqual(outcome.provenance["remaining_run_calls"], 0)
+            self.assertTrue(outcome.status)
+
+    def test_browser_setup_consumes_the_original_operation_deadline(self) -> None:
+        ticks = [0.0]
+
+        class DelayedBrowser:
+            def __init__(self, **kwargs):
+                ticks[0] = 0.06
+
+        class FakeLLM:
+            model = "primary"
+
+        class RecordingAgent:
+            def __init__(self, **kwargs):
+                self.ran = False
+
+            async def run(self, max_steps):
+                self.ran = True
+                return SimpleNamespace(
+                    structured_output=ControlledPageResult(
+                        page_title="Controlled Browser Stack Test",
+                        marker_value="expected-marker",
+                        marker_persisted=True,
+                        current_url="http://controlled.test/",
+                    )
+                )
+
+        config = BrowserStackConfig(
+            steel_base_url="http://127.0.0.1:3000",
+            controlled_page_url="http://controlled.test/",
+            storage_state_path=Path(".artifacts/deadline/state.json"),
+            google_api_key="offline-test",
+            operation_deadline_seconds=0.05,
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            policy = GeminiCallPolicy(
+                db_path=Path(tmpdir) / "usage.sqlite3",
+                config=GeminiPolicyConfig(
+                    run_call_limit=1,
+                    daily_call_limits={"primary": 1, "fallback": 1},
+                    operation_deadline_seconds=0.05,
+                ),
+                monotonic=lambda: ticks[0],
+            )
+            with patch("flight_search_demo.live_run.BrowserSession", DelayedBrowser), patch(
+                "flight_search_demo.live_run.build_agent_llms",
+                return_value=(FakeLLM(), FakeLLM()),
+            ), patch("flight_search_demo.live_run.Agent", RecordingAgent):
+                with self.assertRaises(GeminiPolicyError) as failure:
+                    asyncio.run(
+                        run_agent_task(
+                            task="deadline setup",
+                            config=config,
+                            cdp_url="ws://127.0.0.1:9223/devtools/browser/test",
+                            policy=policy,
+                        )
+                    )
+
+        self.assertEqual(failure.exception.classification, GeminiErrorClassification.TIMEOUT_CANCELLATION)
+        self.assertEqual(failure.exception.diagnostics["attempted_calls"], 0)
+
+    def test_fresh_session_client_setup_consumes_the_original_operation_deadline(self) -> None:
+        ticks = [0.0]
+
+        class Sessions:
+            def create(self, **kwargs):
+                ticks[0] = 0.06
+                return SimpleNamespace(
+                    id="session",
+                    websocket_url="ws://127.0.0.1:3000/",
+                    session_viewer_url="http://127.0.0.1:3000/ui",
+                    debug_url="http://127.0.0.1:3000/debug",
+                )
+
+            def release(self, session_id):
+                pass
+
+        config = BrowserStackConfig(
+            steel_base_url="http://127.0.0.1:3000",
+            controlled_page_url="http://controlled.test/",
+            storage_state_path=Path(".artifacts/fresh-deadline/state.json"),
+            google_api_key="offline-test",
+            operation_deadline_seconds=0.05,
+        )
+        client = SimpleNamespace(sessions=Sessions())
+        with tempfile.TemporaryDirectory() as tmpdir:
+            policy = GeminiCallPolicy(
+                db_path=Path(tmpdir) / "usage.sqlite3",
+                config=GeminiPolicyConfig(
+                    run_call_limit=1,
+                    daily_call_limits={"primary": 1, "fallback": 1},
+                    operation_deadline_seconds=0.05,
+                ),
+                monotonic=lambda: ticks[0],
+            )
+            with patch(
+                "flight_search_demo.live_run.discover_debugger_cdp_url",
+                return_value="ws://127.0.0.1:9223/devtools/browser/test",
+            ), patch(
+                "flight_search_demo.live_run.run_agent_task", new=AsyncMock()
+            ) as agent_task:
+                with self.assertRaises(GeminiPolicyError) as failure:
+                    asyncio.run(
+                        run_in_fresh_session(
+                            client=client,
+                            config=config,
+                            task="fresh session deadline",
+                            policy=policy,
+                        )
+                    )
+
+        self.assertEqual(failure.exception.classification, GeminiErrorClassification.TIMEOUT_CANCELLATION)
+        agent_task.assert_not_awaited()
+
+    def test_fresh_session_setup_passes_native_timeout_and_releases_after_late_completion(self) -> None:
+        released = []
+        create_kwargs = []
+
+        class Sessions:
+            def create(self, **kwargs):
+                create_kwargs.append(kwargs)
+                import time
+                time.sleep(0.03)
+                return SimpleNamespace(
+                    id="late-session",
+                    websocket_url="ws://127.0.0.1:3000/",
+                    session_viewer_url="http://127.0.0.1:3000/ui",
+                    debug_url="http://127.0.0.1:3000/debug",
+                )
+
+            def release(self, session_id):
+                released.append(session_id)
+
+        config = BrowserStackConfig(
+            steel_base_url="http://127.0.0.1:3000",
+            controlled_page_url="http://controlled.test/",
+            storage_state_path=Path(".artifacts/fresh-late/state.json"),
+            google_api_key="offline-test",
+            operation_deadline_seconds=0.01,
+        )
+        client = SimpleNamespace(sessions=Sessions())
+        with tempfile.TemporaryDirectory() as tmpdir:
+            policy = GeminiCallPolicy(
+                db_path=Path(tmpdir) / "usage.sqlite3",
+                config=GeminiPolicyConfig(
+                    run_call_limit=1,
+                    daily_call_limits={"primary": 1, "fallback": 1},
+                    operation_deadline_seconds=0.01,
+                ),
+            )
+            with patch(
+                "flight_search_demo.live_run.discover_debugger_cdp_url",
+                return_value="ws://127.0.0.1:9223/devtools/browser/test",
+            ):
+                with self.assertRaises(GeminiPolicyError) as failure:
+                    asyncio.run(
+                        run_in_fresh_session(
+                            client=client,
+                            config=config,
+                            task="fresh session late",
+                            policy=policy,
+                        )
+                    )
+
+        self.assertEqual(failure.exception.classification, GeminiErrorClassification.TIMEOUT_CANCELLATION)
+        self.assertEqual(released, ["late-session"])
+        self.assertEqual(create_kwargs[0]["max_retries"], 0)
+        self.assertGreater(create_kwargs[0]["timeout"], 0)
+
+    def test_fresh_session_setup_releases_session_when_endpoint_setup_fails(self) -> None:
+        released = []
+
+        class Sessions:
+            def create(self, **kwargs):
+                self.create_kwargs = kwargs
+                return SimpleNamespace(
+                    id="failed-setup-session",
+                    websocket_url="ws://127.0.0.1:3000/",
+                    session_viewer_url="http://127.0.0.1:3000/ui",
+                    debug_url="http://127.0.0.1:3000/debug",
+                )
+
+            def release(self, session_id):
+                released.append(session_id)
+
+        config = BrowserStackConfig(
+            steel_base_url="http://127.0.0.1:3000",
+            controlled_page_url="http://controlled.test/",
+            storage_state_path=Path(".artifacts/fresh-failure/state.json"),
+            google_api_key="offline-test",
+        )
+        client = SimpleNamespace(sessions=Sessions())
+        with tempfile.TemporaryDirectory() as tmpdir:
+            policy = GeminiCallPolicy(
+                db_path=Path(tmpdir) / "usage.sqlite3",
+                config=GeminiPolicyConfig(
+                    run_call_limit=1,
+                    daily_call_limits={"primary": 1, "fallback": 1},
+                ),
+            )
+            with patch(
+                "flight_search_demo.live_run.discover_debugger_cdp_url",
+                side_effect=RuntimeError("debugger setup failed"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "debugger setup failed"):
+                    asyncio.run(
+                        run_in_fresh_session(
+                            client=client,
+                            config=config,
+                            task="fresh session failure",
+                            policy=policy,
+                        )
+                    )
+
+        self.assertEqual(released, ["failed-setup-session"])
+
+    def test_missing_browser_structured_output_is_a_malformed_non_success_outcome(self) -> None:
+        class FakeLLM:
+            model = "primary"
+
+        class RecordingAgent:
+            def __init__(self, **kwargs):
+                pass
+
+            async def run(self, max_steps):
+                return SimpleNamespace(structured_output=None)
+
+        config = BrowserStackConfig(
+            steel_base_url="http://127.0.0.1:3000",
+            controlled_page_url="http://controlled.test/",
+            storage_state_path=Path(".artifacts/malformed/state.json"),
+            google_api_key="offline-test",
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            policy = GeminiCallPolicy(
+                db_path=Path(tmpdir) / "usage.sqlite3",
+                config=GeminiPolicyConfig(
+                    run_call_limit=1,
+                    daily_call_limits={"primary": 1, "fallback": 1},
+                ),
+            )
+            with patch("flight_search_demo.live_run.BrowserSession"), patch(
+                "flight_search_demo.live_run.build_agent_llms",
+                return_value=(FakeLLM(), FakeLLM()),
+            ), patch("flight_search_demo.live_run.Agent", RecordingAgent):
+                outcome = asyncio.run(
+                    run_agent_task(
+                        task="missing output",
+                        config=config,
+                        cdp_url="ws://127.0.0.1:9223/devtools/browser/test",
+                        policy=policy,
+                    )
+                )
+
+        self.assertIsInstance(outcome, BrowserTaskOutcome)
+        self.assertEqual(outcome.classification, GeminiErrorClassification.MALFORMED_OUTPUT.value)
+        self.assertNotEqual(outcome.status, "SUCCEEDED")
+        self.assertIn("structured output", outcome.detail)
+
     def test_steel_control_and_debugger_surfaces_must_be_private(self) -> None:
         from flight_search_demo.spike import debugger_metadata_url
 
@@ -146,6 +567,18 @@ class SpikeContractTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "private address or loopback"):
             debugger_metadata_url("https://steel.example.com")
+
+    def test_debugger_metadata_lookup_receives_a_cooperative_timeout(self) -> None:
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.__exit__.return_value = False
+        response.read.return_value = b'{"webSocketDebuggerUrl":"ws://127.0.0.1:9223/devtools/browser/test"}'
+        with patch("flight_search_demo.spike.urllib.request.urlopen", return_value=response) as urlopen:
+            discover_debugger_cdp_url("http://127.0.0.1:3000", None, timeout=0.25)
+
+        urlopen.assert_called_once_with(
+            "http://127.0.0.1:9223/json/version", timeout=0.25
+        )
 
     def test_agent_llms_use_an_independent_fallback_model(self) -> None:
         primary, fallback = build_agent_llms(

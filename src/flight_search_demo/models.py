@@ -9,6 +9,8 @@ from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
+from .gemini_policy import DEFAULT_DAILY_CALL_LIMITS
+
 
 class ControlledPageResult(BaseModel):
     page_title: str = Field(description="The visible page title.")
@@ -33,6 +35,19 @@ class BrowserStackConfig:
     gemini_model: str = "gemini-2.5-flash"
     fallback_gemini_model: str = "gemini-3.6-flash"
     max_steps: int = 8
+    gemini_usage_db_path: Path = Path(".artifacts/gemini-usage.sqlite3")
+    gemini_timezone_name: str = "UTC"
+    gemini_run_call_limit: int = 3
+    gemini_daily_call_limits: dict[str, int] = field(
+        default_factory=lambda: dict(DEFAULT_DAILY_CALL_LIMITS)
+    )
+    operation_deadline_seconds: float = 60.0
+    gemini_max_attempts: int = 2
+    gemini_retry_backoff_seconds: tuple[float, ...] = (0.25,)
+
+    def __post_init__(self) -> None:
+        if self.gemini_model == self.fallback_gemini_model:
+            raise ValueError("primary and fallback Gemini models must be different")
 
     def resolved_allowed_domains(self) -> List[str]:
         if self.allowed_domains:

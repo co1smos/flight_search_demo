@@ -1,15 +1,31 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 import json
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 from urllib.parse import urlparse
 import urllib.request
 
 from .models import BrowserStackConfig, ControlledPageResult, HandoffStatus, HumanTakeoverGate, SessionEndpoints
 from .security import assert_private_url, normalize_loopback_url, redact_secrets
+
+
+@dataclass(frozen=True)
+class BrowserTaskOutcome:
+    status: str
+    classification: str
+    detail: str
+    provenance: dict[str, Any]
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "classification": self.classification,
+            "detail": self.detail,
+            "provenance": self.provenance,
+        }
 
 
 def build_cdp_url(websocket_url: str, steel_api_key: Optional[str]) -> str:
@@ -43,8 +59,15 @@ def build_debugger_cdp_url(debugger_websocket_url: str, steel_api_key: Optional[
     return cdp_url
 
 
-def discover_debugger_cdp_url(steel_base_url: str, steel_api_key: Optional[str]) -> str:
-    with urllib.request.urlopen(debugger_metadata_url(steel_base_url)) as response:
+def discover_debugger_cdp_url(
+    steel_base_url: str,
+    steel_api_key: Optional[str],
+    *,
+    timeout: float = 10.0,
+) -> str:
+    with urllib.request.urlopen(
+        debugger_metadata_url(steel_base_url), timeout=max(timeout, 0.001)
+    ) as response:
         payload = json.loads(response.read().decode("utf-8"))
     debugger_url = payload["webSocketDebuggerUrl"]
     return build_debugger_cdp_url(debugger_url, steel_api_key)
@@ -72,10 +95,14 @@ def redact_runtime_text(text: str, steel_api_key: Optional[str], google_api_key:
 
 @dataclass
 class RunSummary:
-    initial_result: ControlledPageResult
-    persisted_result: ControlledPageResult
-    offsite_rejection: str
-    handoff: HumanTakeoverGate
+    initial_result: ControlledPageResult | None
+    persisted_result: ControlledPageResult | None
+    offsite_rejection: str | None
+    handoff: HumanTakeoverGate | None
+    gemini_policy: dict[str, Any] = field(default_factory=dict)
+    status: str = "SUCCEEDED"
+    gemini_outcome: dict[str, Any] | None = None
+    browser_outcome: dict[str, Any] | None = None
 
 
 def ensure_storage_state_parent(path: Path) -> None:

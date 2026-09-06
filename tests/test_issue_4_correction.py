@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import Mock
 
 from flight_search_demo.app import ParsedNaturalLanguageRequest, RequestParseResult, run_request
+from flight_search_demo.gemini_policy import GeminiCallPolicy, GeminiPolicyConfig
 
 
 class Issue4CorrectionTests(unittest.TestCase):
@@ -21,6 +22,13 @@ class Issue4CorrectionTests(unittest.TestCase):
         )
         self.adapter = Mock()
         self.adapter.execute.return_value = {"status": "MATCH_FOUND", "detail": "fixture"}
+        self.policy = GeminiCallPolicy(
+            db_path=Path(self.directory.name) / "gemini-usage.sqlite3",
+            config=GeminiPolicyConfig(
+                run_call_limit=20,
+                daily_call_limits={"gemini-2.5-flash": 20, "offline": 20},
+            ),
+        )
         self.request = {'request_id': 'correction', 'original_text':
                         'Aeroplan JFK to CDG on 2026-11-05 business for one adult under 70000 points'}
 
@@ -71,7 +79,9 @@ class Issue4CorrectionTests(unittest.TestCase):
         with httpx.Client(transport=httpx.MockTransport(respond)) as transport:
             with genai.Client(api_key='offline-test-only', vertexai=False,
                               http_options={'httpx_client': transport}) as client:
-                parser = GoogleGenAIRequestParser(client=client, model='gemini-2.5-flash')
+                parser = GoogleGenAIRequestParser(
+                    client=client, model='gemini-2.5-flash', policy=self.policy
+                )
                 with redirect_stdout(io.StringIO()):
                     events = run_request(request=self.request, confirmation={},
                                          event_log_path=self.log, parser=parser,
@@ -668,7 +678,9 @@ class Issue4CorrectionTests(unittest.TestCase):
                             'stated_program': 'Aeroplan',
                             'requests': [item],
                         }))])
-                    parser = GoogleGenAIRequestParser(client=client, model='offline')
+                    parser = GoogleGenAIRequestParser(
+                        client=client, model='offline', policy=self.policy
+                    )
                     with redirect_stdout(io.StringIO()):
                         event = run_request(request=self.request, confirmation={},
                                             event_log_path=self.log, parser=parser,
