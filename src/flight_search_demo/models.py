@@ -42,6 +42,8 @@ class BrowserStackConfig:
         default_factory=lambda: dict(DEFAULT_DAILY_CALL_LIMITS)
     )
     operation_deadline_seconds: float = 60.0
+    gemini_max_attempts: int = 2
+    gemini_retry_backoff_seconds: tuple[float, ...] = (0.25,)
 
     def __post_init__(self) -> None:
         if self.gemini_model == self.fallback_gemini_model:

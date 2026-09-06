@@ -59,8 +59,15 @@ def build_debugger_cdp_url(debugger_websocket_url: str, steel_api_key: Optional[
     return cdp_url
 
 
-def discover_debugger_cdp_url(steel_base_url: str, steel_api_key: Optional[str]) -> str:
-    with urllib.request.urlopen(debugger_metadata_url(steel_base_url)) as response:
+def discover_debugger_cdp_url(
+    steel_base_url: str,
+    steel_api_key: Optional[str],
+    *,
+    timeout: float = 10.0,
+) -> str:
+    with urllib.request.urlopen(
+        debugger_metadata_url(steel_base_url), timeout=max(timeout, 0.001)
+    ) as response:
         payload = json.loads(response.read().decode("utf-8"))
     debugger_url = payload["webSocketDebuggerUrl"]
     return build_debugger_cdp_url(debugger_url, steel_api_key)

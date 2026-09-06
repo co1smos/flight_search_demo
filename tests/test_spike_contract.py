@@ -13,6 +13,7 @@ from flight_search_demo.live_run import (
     assert_expected_results,
     build_agent_llms,
     classify_allowlist_rejection,
+    parse_args,
     run_agent_task,
     run_in_fresh_session,
     run_offsite_attempt,
@@ -32,6 +33,7 @@ from flight_search_demo.spike import (
     build_session_endpoints,
     build_takeover_gate,
     debugger_metadata_url,
+    discover_debugger_cdp_url,
     redact_runtime_text,
     complete_handoff_file,
     secure_artifact_file,
@@ -41,6 +43,26 @@ from flight_search_demo.live_run import navigate_handoff_session
 
 
 class SpikeContractTests(unittest.TestCase):
+    def test_live_cli_exposes_all_gemini_budget_and_deadline_settings(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "GEMINI_DAILY_CALL_LIMITS": "primary=7,fallback=4",
+                "GEMINI_TIMEZONE": "America/New_York",
+                "GEMINI_MAX_ATTEMPTS": "4",
+                "GEMINI_RETRY_BACKOFF_SECONDS": "0.2,0.5",
+                "GEMINI_OPERATION_DEADLINE_SECONDS": "12.5",
+            },
+            clear=False,
+        ), patch("sys.argv", ["live_run"]):
+            args = parse_args()
+
+        self.assertEqual(args.gemini_daily_call_limits, {"primary": 7, "fallback": 4})
+        self.assertEqual(args.gemini_timezone, "America/New_York")
+        self.assertEqual(args.gemini_max_attempts, 4)
+        self.assertEqual(args.gemini_retry_backoff_seconds, (0.2, 0.5))
+        self.assertEqual(args.gemini_operation_deadline_seconds, 12.5)
+
     def test_run_spike_rejects_public_steel_url_before_constructing_client(self) -> None:
         args = self.make_run_args(steel_base_url="https://steel.example.com")
 
@@ -391,6 +413,108 @@ class SpikeContractTests(unittest.TestCase):
         self.assertEqual(failure.exception.classification, GeminiErrorClassification.TIMEOUT_CANCELLATION)
         agent_task.assert_not_awaited()
 
+    def test_fresh_session_setup_passes_native_timeout_and_releases_after_late_completion(self) -> None:
+        released = []
+        create_kwargs = []
+
+        class Sessions:
+            def create(self, **kwargs):
+                create_kwargs.append(kwargs)
+                import time
+                time.sleep(0.03)
+                return SimpleNamespace(
+                    id="late-session",
+                    websocket_url="ws://127.0.0.1:3000/",
+                    session_viewer_url="http://127.0.0.1:3000/ui",
+                    debug_url="http://127.0.0.1:3000/debug",
+                )
+
+            def release(self, session_id):
+                released.append(session_id)
+
+        config = BrowserStackConfig(
+            steel_base_url="http://127.0.0.1:3000",
+            controlled_page_url="http://controlled.test/",
+            storage_state_path=Path(".artifacts/fresh-late/state.json"),
+            google_api_key="offline-test",
+            operation_deadline_seconds=0.01,
+        )
+        client = SimpleNamespace(sessions=Sessions())
+        with tempfile.TemporaryDirectory() as tmpdir:
+            policy = GeminiCallPolicy(
+                db_path=Path(tmpdir) / "usage.sqlite3",
+                config=GeminiPolicyConfig(
+                    run_call_limit=1,
+                    daily_call_limits={"primary": 1, "fallback": 1},
+                    operation_deadline_seconds=0.01,
+                ),
+            )
+            with patch(
+                "flight_search_demo.live_run.discover_debugger_cdp_url",
+                return_value="ws://127.0.0.1:9223/devtools/browser/test",
+            ):
+                with self.assertRaises(GeminiPolicyError) as failure:
+                    asyncio.run(
+                        run_in_fresh_session(
+                            client=client,
+                            config=config,
+                            task="fresh session late",
+                            policy=policy,
+                        )
+                    )
+
+        self.assertEqual(failure.exception.classification, GeminiErrorClassification.TIMEOUT_CANCELLATION)
+        self.assertEqual(released, ["late-session"])
+        self.assertEqual(create_kwargs[0]["max_retries"], 0)
+        self.assertGreater(create_kwargs[0]["timeout"], 0)
+
+    def test_fresh_session_setup_releases_session_when_endpoint_setup_fails(self) -> None:
+        released = []
+
+        class Sessions:
+            def create(self, **kwargs):
+                self.create_kwargs = kwargs
+                return SimpleNamespace(
+                    id="failed-setup-session",
+                    websocket_url="ws://127.0.0.1:3000/",
+                    session_viewer_url="http://127.0.0.1:3000/ui",
+                    debug_url="http://127.0.0.1:3000/debug",
+                )
+
+            def release(self, session_id):
+                released.append(session_id)
+
+        config = BrowserStackConfig(
+            steel_base_url="http://127.0.0.1:3000",
+            controlled_page_url="http://controlled.test/",
+            storage_state_path=Path(".artifacts/fresh-failure/state.json"),
+            google_api_key="offline-test",
+        )
+        client = SimpleNamespace(sessions=Sessions())
+        with tempfile.TemporaryDirectory() as tmpdir:
+            policy = GeminiCallPolicy(
+                db_path=Path(tmpdir) / "usage.sqlite3",
+                config=GeminiPolicyConfig(
+                    run_call_limit=1,
+                    daily_call_limits={"primary": 1, "fallback": 1},
+                ),
+            )
+            with patch(
+                "flight_search_demo.live_run.discover_debugger_cdp_url",
+                side_effect=RuntimeError("debugger setup failed"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "debugger setup failed"):
+                    asyncio.run(
+                        run_in_fresh_session(
+                            client=client,
+                            config=config,
+                            task="fresh session failure",
+                            policy=policy,
+                        )
+                    )
+
+        self.assertEqual(released, ["failed-setup-session"])
+
     def test_missing_browser_structured_output_is_a_malformed_non_success_outcome(self) -> None:
         class FakeLLM:
             model = "primary"
@@ -443,6 +567,18 @@ class SpikeContractTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "private address or loopback"):
             debugger_metadata_url("https://steel.example.com")
+
+    def test_debugger_metadata_lookup_receives_a_cooperative_timeout(self) -> None:
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.__exit__.return_value = False
+        response.read.return_value = b'{"webSocketDebuggerUrl":"ws://127.0.0.1:9223/devtools/browser/test"}'
+        with patch("flight_search_demo.spike.urllib.request.urlopen", return_value=response) as urlopen:
+            discover_debugger_cdp_url("http://127.0.0.1:3000", None, timeout=0.25)
+
+        urlopen.assert_called_once_with(
+            "http://127.0.0.1:9223/json/version", timeout=0.25
+        )
 
     def test_agent_llms_use_an_independent_fallback_model(self) -> None:
         primary, fallback = build_agent_llms(

@@ -264,16 +264,15 @@ class GoogleGenAIRequestParser:
         *,
         client: Any,
         model: str,
-        policy: GeminiCallPolicy | None = None,
+        policy: GeminiCallPolicy,
         fallback_model: str | None = None,
     ) -> None:
+        if policy is None:
+            raise ValueError("Google Gemini request parsing requires a caller-owned Gemini policy")
         self._client = client
         self._model = model
         self._policy = policy
         self._fallback_model = fallback_model
-
-    def with_policy(self, policy: GeminiCallPolicy) -> None:
-        self._policy = policy
 
     def parse(
         self,
@@ -361,20 +360,6 @@ class GoogleGenAIRequestParser:
                 unsupported_reason=payload.get("unsupported_reason"),
                 diagnostics={"provider": "google_genai", "model": model},
             )
-
-        if self._policy is None:
-            try:
-                return parse_response(self._model)
-            except MalformedModelOutputError as exc:
-                raise ParserFailure(
-                    str(exc),
-                    diagnostics={"provider": "google_genai", "model": self._model},
-                ) from exc
-            except Exception as exc:
-                raise ParserFailure(
-                    str(exc),
-                    diagnostics={"provider": "google_genai", "model": self._model},
-                ) from exc
 
         operation = self._policy.operation(
             f"request-parse:{request_id}", request_id=request_id
@@ -926,8 +911,6 @@ def run_request(
                     config=GeminiPolicyConfig(timezone_name=timezone_name),
                 )
             parser = build_default_request_parser(policy=gemini_policy)
-        elif gemini_policy is not None and isinstance(parser, GoogleGenAIRequestParser):
-            parser.with_policy(gemini_policy)
         parse_result = parser.parse(
             request_id=request_id, original_text=original_text,
             current_date=current_date, timezone_name=timezone_name,
@@ -1510,9 +1493,11 @@ def render_terminal_report(event: Dict[str, Any]) -> str:
 def build_default_request_parser(
     model: str | None = None,
     *,
-    policy: GeminiCallPolicy | None = None,
+    policy: GeminiCallPolicy,
     fallback_model: str | None = None,
 ) -> GoogleGenAIRequestParser:
+    if policy is None:
+        raise ValueError("Google Gemini request parsing requires a caller-owned Gemini policy")
     primary_model = model or os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
     fallback = fallback_model or os.environ.get("FALLBACK_GEMINI_MODEL", "gemini-3.6-flash")
     validate_model_configuration(primary_model, fallback)

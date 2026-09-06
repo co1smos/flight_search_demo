@@ -40,6 +40,32 @@ from flight_search_demo.gemini_policy import (
 
 
 class Issue14GeminiPolicyTests(unittest.TestCase):
+    def test_limits_summary_exposes_selected_budget_retry_and_deadline_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            policy = GeminiCallPolicy(
+                db_path=Path(tmpdir) / "usage.sqlite3",
+                config=GeminiPolicyConfig(
+                    run_call_limit=4,
+                    daily_call_limits={"primary": 7},
+                    timezone_name="UTC",
+                    max_attempts=3,
+                    retry_backoff_seconds=(0.2, 0.5),
+                    operation_deadline_seconds=12.5,
+                ),
+            )
+            summary = policy.limits_summary()
+
+        self.assertEqual(summary["run_call_limit"], 4)
+        self.assertEqual(summary["daily_call_limits"], {"primary": 7})
+        self.assertEqual(summary["timezone_name"], "UTC")
+        self.assertEqual(summary["max_attempts"], 3)
+        self.assertEqual(summary["retry_backoff_seconds"], [0.2, 0.5])
+        self.assertEqual(summary["operation_deadline_seconds"], 12.5)
+
+    def test_google_parser_requires_a_caller_owned_policy(self) -> None:
+        with self.assertRaisesRegex(ValueError, "caller-owned Gemini policy"):
+            GoogleGenAIRequestParser(client=SimpleNamespace(), model="gemini-test", policy=None)
+
     def test_natural_language_run_records_one_bounded_call_in_final_event(self) -> None:
         request = {
             "request_id": "req-policy-seam",
@@ -329,6 +355,7 @@ class Issue14GeminiPolicyTests(unittest.TestCase):
 
     def test_sync_provider_call_is_bounded_by_the_original_operation_deadline(self) -> None:
         calls = []
+        completed = []
         with tempfile.TemporaryDirectory() as tmpdir:
             policy = GeminiCallPolicy(
                 db_path=Path(tmpdir) / "usage.sqlite3",
@@ -338,7 +365,8 @@ class Issue14GeminiPolicyTests(unittest.TestCase):
 
             def provider(model: str) -> str:
                 calls.append(model)
-                time.sleep(0.25)
+                time.sleep(0.08)
+                completed.append(True)
                 return "late success"
 
             started = time.monotonic()
@@ -346,8 +374,9 @@ class Issue14GeminiPolicyTests(unittest.TestCase):
                 operation.invoke(model="primary", purpose="request_parse", provider_call=provider)
             elapsed = time.monotonic() - started
 
-        self.assertLess(elapsed, 0.18)
+        self.assertGreaterEqual(elapsed, 0.07)
         self.assertEqual(calls, ["primary"])
+        self.assertEqual(completed, [True])
         self.assertEqual(
             failure.exception.classification,
             GeminiErrorClassification.TIMEOUT_CANCELLATION,

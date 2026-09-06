@@ -8,7 +8,6 @@ or models.
 from __future__ import annotations
 
 import asyncio
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 import inspect
 import re
 import sqlite3
@@ -390,6 +389,7 @@ class GeminiCallPolicy:
             "timezone_name": self.config.timezone_name,
             "usage_day": self.usage_day(),
             "max_attempts": self.config.max_attempts,
+            "retry_backoff_seconds": list(self.config.retry_backoff_seconds),
             "operation_deadline_seconds": self.config.operation_deadline_seconds,
         }
 
@@ -398,6 +398,7 @@ class GeminiCallPolicy:
         operation: "GeminiOperation",
         model: str,
         deadline_at: float | None = None,
+        sqlite_timeout_seconds: float | None = None,
     ) -> _Reservation:
         daily_limit = self.config.daily_call_limits.get(model)
         if daily_limit is None:
@@ -425,7 +426,11 @@ class GeminiCallPolicy:
         usage_day = self.usage_day()
         try:
             with self._connect(
-                timeout_seconds=30.0 if remaining is None else remaining
+                timeout_seconds=(
+                    sqlite_timeout_seconds
+                    if sqlite_timeout_seconds is not None
+                    else (30.0 if remaining is None else remaining)
+                )
             ) as connection:
                 connection.execute("BEGIN IMMEDIATE")
                 if deadline_at is not None and self._monotonic() >= deadline_at:
@@ -514,8 +519,8 @@ class GeminiCallPolicy:
             daily_remaining=daily_limit - daily_used - 1,
         )
 
-    def daily_usage(self, model: str) -> int:
-        with self._connect() as connection:
+    def daily_usage(self, model: str, *, timeout_seconds: float = 30.0) -> int:
+        with self._connect(timeout_seconds=timeout_seconds) as connection:
             row = connection.execute(
                 "SELECT attempted_calls FROM gemini_daily_usage WHERE usage_day=? AND timezone_name=? AND model=?",
                 (self.usage_day(), self.config.timezone_name, model),
@@ -524,22 +529,34 @@ class GeminiCallPolicy:
 
     async def reserve_async(self, operation: "GeminiOperation", model: str) -> _Reservation:
         operation._ensure_time()
-        remaining = operation.remaining_seconds()
-        try:
-            return await asyncio.wait_for(
-                asyncio.to_thread(self._reserve, operation, model, operation.deadline_at),
-                timeout=remaining,
-            )
-        except asyncio.TimeoutError as exc:
-            raise GeminiCallFailure(
-                "Gemini operation deadline exhausted while reserving call budget",
-                classification=GeminiErrorClassification.TIMEOUT_CANCELLATION,
-                diagnostics=operation.diagnostics(
-                    terminal_classification=GeminiErrorClassification.TIMEOUT_CANCELLATION,
-                    terminal_error="operation deadline exhausted while reserving call budget",
-                    include_daily_reads=False,
-                ),
-            ) from exc
+        # Poll SQLite with a short cooperative busy timeout so the event loop
+        # remains cancellable without leaving an uncancellable worker behind.
+        while True:
+            remaining = operation.remaining_seconds()
+            if remaining <= 0:
+                raise GeminiCallFailure(
+                    "Gemini operation deadline exhausted while reserving call budget",
+                    classification=GeminiErrorClassification.TIMEOUT_CANCELLATION,
+                    diagnostics=operation.diagnostics(
+                        terminal_classification=GeminiErrorClassification.TIMEOUT_CANCELLATION,
+                        terminal_error="operation deadline exhausted while reserving call budget",
+                        include_daily_reads=False,
+                    ),
+                )
+            try:
+                return self._reserve(
+                    operation,
+                    model,
+                    operation.deadline_at,
+                    sqlite_timeout_seconds=min(0.01, remaining),
+                )
+            except GeminiCallFailure as exc:
+                if (
+                    exc.classification != GeminiErrorClassification.TIMEOUT_CANCELLATION
+                    or operation.remaining_seconds() <= 0
+                ):
+                    raise
+                await asyncio.sleep(min(0.005, operation.remaining_seconds()))
 
     def operation(
         self,
@@ -623,7 +640,7 @@ class GeminiOperation:
             return False
         record.retry_decision = f"retry_after_{delay:g}s"
         try:
-            self._bounded_sync_call(lambda: self.policy._sleep(delay))
+            self._run_sync_cooperatively(lambda: self.policy._sleep(delay))
         except TimeoutError:
             record.retry_decision = "deadline_exhausted"
             return False
@@ -642,37 +659,28 @@ class GeminiOperation:
             return False
         return True
 
-    def _bounded_sync_call(self, callback: Callable[[], T]) -> T:
-        """Run a sync provider boundary within the remaining deadline.
+    def _run_sync_cooperatively(self, callback: Callable[[], T]) -> T:
+        """Run a sync callback without creating an uncancellable worker.
 
-        A non-cooperative provider thread may finish after a timeout; it is
-        detached and its result can never authorize or return a successful
-        application call.
+        External synchronous providers must receive their own native timeout
+        from the caller. This seam executes callbacks directly and checks the
+        shared deadline after they return; it never claims to cancel a callback
+        that the provider cannot cancel.
         """
-        remaining = self.remaining_seconds()
-        if remaining <= 0:
+        if self.remaining_seconds() <= 0:
             raise TimeoutError("Gemini operation deadline exhausted")
-        executor = ThreadPoolExecutor(max_workers=1)
-        future = executor.submit(callback)
-        try:
-            return future.result(timeout=remaining)
-        except FutureTimeoutError as exc:
-            future.cancel()
-            executor.shutdown(wait=False, cancel_futures=True)
-            raise TimeoutError("Gemini operation deadline exhausted") from exc
-        finally:
-            if not future.done():
-                executor.shutdown(wait=False, cancel_futures=True)
-            else:
-                executor.shutdown(wait=True)
+        result = callback()
+        if self.remaining_seconds() <= 0:
+            raise TimeoutError("Gemini operation deadline exhausted")
+        return result
 
     def ensure_time(self) -> None:
         """Require that the operation's original deadline has not elapsed."""
         self._ensure_time()
 
     def run_sync(self, callback: Callable[[], T]) -> T:
-        """Run synchronous setup or provider work within this operation deadline."""
-        return self._bounded_sync_call(callback)
+        """Run local setup directly under this operation's shared deadline."""
+        return self._run_sync_cooperatively(callback)
 
     def diagnostics(
         self,
@@ -680,9 +688,21 @@ class GeminiOperation:
         terminal_classification: GeminiErrorClassification | None = None,
         terminal_error: str | None = None,
         include_daily_reads: bool = True,
+        read_timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
         daily_remaining = {
-            model: max(0, limit - self.policy.daily_usage(model))
+            model: max(
+                0,
+                limit
+                - self.policy.daily_usage(
+                    model,
+                    timeout_seconds=(
+                        max(0.001, min(read_timeout_seconds, self.remaining_seconds()))
+                        if read_timeout_seconds is not None
+                        else 30.0
+                    ),
+                ),
+            )
             for model, limit in self.policy.config.daily_call_limits.items()
         } if include_daily_reads else {
             model: self._daily_remaining.get(model, limit)
@@ -735,17 +755,12 @@ class GeminiOperation:
         return redact_sensitive(payload)
 
     async def diagnostics_async(self, *, deadline_seconds: float | None = None) -> dict[str, Any]:
-        remaining = self.remaining_seconds() if deadline_seconds is None else min(
-            self.remaining_seconds(), deadline_seconds
-        )
+        remaining = self.remaining_seconds()
+        if deadline_seconds is not None:
+            remaining = min(remaining, deadline_seconds)
         if remaining <= 0:
             return self.diagnostics(include_daily_reads=False)
-        try:
-            return await asyncio.wait_for(
-                asyncio.to_thread(self.diagnostics), timeout=remaining
-            )
-        except asyncio.TimeoutError:
-            return self.diagnostics(include_daily_reads=False)
+        return self.diagnostics(read_timeout_seconds=remaining)
 
     def invoke(
         self,
@@ -788,7 +803,7 @@ class GeminiOperation:
                 record.fallback_decision = "attempt"
             self.records.append(record)
             try:
-                result = self._bounded_sync_call(lambda: provider_call(current_model))
+                result = self._run_sync_cooperatively(lambda: provider_call(current_model))
                 if inspect.isawaitable(result):
                     raise TypeError("sync Gemini provider callback returned an awaitable")
                 record.status = "successful"

@@ -18,6 +18,7 @@ from steel import Steel
 
 from .controlled_page import ControlledPageServer
 from .gemini_policy import (
+    DEFAULT_DAILY_CALL_LIMITS,
     GeminiCallPolicy,
     GeminiErrorClassification,
     GeminiPolicyConfig,
@@ -40,7 +41,26 @@ from .spike import (
 from .security import assert_private_url
 
 
+def _parse_retry_backoff(value: str) -> tuple[float, ...]:
+    if not value.strip():
+        return ()
+    return tuple(float(item.strip()) for item in value.split(","))
+
+
+def _parse_daily_call_limits(value: str | None) -> dict[str, int]:
+    if not value:
+        return {}
+    limits: dict[str, int] = {}
+    for item in value.split(","):
+        model, separator, raw_limit = item.partition("=")
+        if not separator or not model.strip():
+            raise ValueError("daily Gemini limits must use MODEL=LIMIT entries")
+        limits[model.strip()] = int(raw_limit.strip())
+    return limits
+
+
 def parse_args() -> argparse.Namespace:
+    load_dotenv()
     parser = argparse.ArgumentParser(description="Run the controlled-page browser stack spike.")
     parser.add_argument("--steel-base-url", default=os.environ.get("STEEL_BASE_URL", "http://127.0.0.1:3000"))
     parser.add_argument("--controlled-page-public-origin", default=os.environ.get("CONTROLLED_PAGE_PUBLIC_ORIGIN"))
@@ -60,9 +80,52 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-steps", type=int, default=8)
     parser.add_argument("--handoff-timeout", type=int, default=300)
-    parser.add_argument("--gemini-run-call-limit", type=int, default=3)
-    parser.add_argument("--gemini-usage-db-path", default=".artifacts/gemini-usage.sqlite3")
-    return parser.parse_args()
+    parser.add_argument(
+        "--gemini-run-call-limit",
+        type=int,
+        default=int(os.environ.get("GEMINI_RUN_CALL_LIMIT", "3")),
+    )
+    parser.add_argument(
+        "--gemini-usage-db-path",
+        default=os.environ.get("GEMINI_USAGE_DB_PATH", ".artifacts/gemini-usage.sqlite3"),
+    )
+    parser.add_argument(
+        "--gemini-daily-call-limit",
+        dest="gemini_daily_call_limits",
+        action="append",
+        default=None,
+        metavar="MODEL=LIMIT",
+        help="Override one model's persistent daily Gemini allowance; repeat as needed.",
+    )
+    parser.add_argument(
+        "--gemini-timezone",
+        default=os.environ.get("GEMINI_TIMEZONE", "UTC"),
+        help="IANA timezone used for persistent Gemini daily counters.",
+    )
+    parser.add_argument(
+        "--gemini-max-attempts",
+        type=int,
+        default=int(os.environ.get("GEMINI_MAX_ATTEMPTS", "2")),
+    )
+    parser.add_argument(
+        "--gemini-retry-backoff-seconds",
+        type=_parse_retry_backoff,
+        default=_parse_retry_backoff(os.environ.get("GEMINI_RETRY_BACKOFF_SECONDS", "0.25")),
+    )
+    parser.add_argument(
+        "--gemini-operation-deadline-seconds",
+        type=float,
+        default=float(os.environ.get("GEMINI_OPERATION_DEADLINE_SECONDS", "60")),
+    )
+    args = parser.parse_args()
+    raw_limits = args.gemini_daily_call_limits
+    if isinstance(raw_limits, list):
+        args.gemini_daily_call_limits = _parse_daily_call_limits(",".join(raw_limits))
+    else:
+        args.gemini_daily_call_limits = _parse_daily_call_limits(
+            os.environ.get("GEMINI_DAILY_CALL_LIMITS")
+        )
+    return args
 
 
 def build_agent_llms(*, primary_model: str, fallback_model: str, api_key: str):
@@ -73,9 +136,9 @@ def build_agent_llms(*, primary_model: str, fallback_model: str, api_key: str):
         retry_options=types.HttpRetryOptions(attempts=1),
     )
     return (
-        # Application policy owns retries; browser-use's SDK retry loop is one attempt.
-        ChatGoogle(model=primary_model, api_key=api_key, max_retries=1, http_options=http_options),
-        ChatGoogle(model=fallback_model, api_key=api_key, max_retries=1, http_options=http_options),
+        # Application policy owns retries; the Google SDK request retry budget is one attempt.
+        ChatGoogle(model=primary_model, api_key=api_key, http_options=http_options),
+        ChatGoogle(model=fallback_model, api_key=api_key, http_options=http_options),
     )
 
 
@@ -389,12 +452,20 @@ async def run_in_fresh_session(
     session_id: str | None = None
     try:
         def setup() -> tuple[str, str]:
-            session = client.sessions.create(headless=True)
+            nonlocal session_id
+            session = client.sessions.create(
+                headless=True,
+                timeout=max(operation.remaining_seconds(), 0.001),
+                max_retries=0,
+            )
+            session_id = str(session.id)
             endpoints = build_session_endpoints(session)
             cdp_url = discover_debugger_cdp_url(
-                config.steel_base_url, os.environ.get("STEEL_API_KEY")
+                config.steel_base_url,
+                os.environ.get("STEEL_API_KEY"),
+                timeout=max(operation.remaining_seconds(), 0.001),
             )
-            return endpoints.session_id, cdp_url
+            return session_id, cdp_url
 
         try:
             session_id, cdp_url = operation.run_sync(setup)
@@ -425,13 +496,24 @@ async def run_offsite_in_fresh_session(
     client: Steel,
     config: BrowserStackConfig,
 ) -> str:
-    session = client.sessions.create(headless=True)
-    endpoints = build_session_endpoints(session)
+    session_id: str | None = None
     try:
-        cdp_url = discover_debugger_cdp_url(config.steel_base_url, os.environ.get("STEEL_API_KEY"))
+        session = client.sessions.create(
+            headless=True,
+            timeout=max(config.operation_deadline_seconds, 0.001),
+            max_retries=0,
+        )
+        session_id = str(session.id)
+        endpoints = build_session_endpoints(session)
+        cdp_url = discover_debugger_cdp_url(
+            config.steel_base_url,
+            os.environ.get("STEEL_API_KEY"),
+            timeout=max(config.operation_deadline_seconds, 0.001),
+        )
         return await run_offsite_attempt(config=config, cdp_url=cdp_url)
     finally:
-        client.sessions.release(endpoints.session_id)
+        if session_id is not None:
+            client.sessions.release(session_id)
 
 
 async def run_spike(args: argparse.Namespace) -> RunSummary:
@@ -462,6 +544,14 @@ async def run_spike(args: argparse.Namespace) -> RunSummary:
             fallback_gemini_model=args.fallback_gemini_model,
             max_steps=args.max_steps,
             gemini_run_call_limit=getattr(args, "gemini_run_call_limit", 3),
+            gemini_timezone_name=getattr(args, "gemini_timezone", "UTC"),
+            gemini_daily_call_limits={
+                **DEFAULT_DAILY_CALL_LIMITS,
+                **getattr(args, "gemini_daily_call_limits", {}),
+            },
+            operation_deadline_seconds=getattr(args, "gemini_operation_deadline_seconds", 60.0),
+            gemini_max_attempts=getattr(args, "gemini_max_attempts", 2),
+            gemini_retry_backoff_seconds=getattr(args, "gemini_retry_backoff_seconds", (0.25,)),
             gemini_usage_db_path=Path(
                 getattr(args, "gemini_usage_db_path", ".artifacts/gemini-usage.sqlite3")
             ),
@@ -473,6 +563,8 @@ async def run_spike(args: argparse.Namespace) -> RunSummary:
                 run_call_limit=config.gemini_run_call_limit,
                 daily_call_limits=config.gemini_daily_call_limits,
                 timezone_name=config.gemini_timezone_name,
+                max_attempts=config.gemini_max_attempts,
+                retry_backoff_seconds=config.gemini_retry_backoff_seconds,
                 operation_deadline_seconds=config.operation_deadline_seconds,
             ),
         )
@@ -604,20 +696,30 @@ async def run_spike(args: argparse.Namespace) -> RunSummary:
                 browser_outcome=outcome.as_dict(),
             )
 
-        handoff_session = client.sessions.create(headless=True)
-        handoff_endpoints = build_session_endpoints(handoff_session)
-        handoff_browser = BrowserSession(
-            cdp_url=discover_debugger_cdp_url(config.steel_base_url, os.environ.get("STEEL_API_KEY")),
-            is_local=False,
-            keep_alive=True,
-            allowed_domains=config.resolved_allowed_domains(),
-            storage_state=str(config.storage_state_path),
+        handoff_session = client.sessions.create(
+            headless=True,
+            timeout=max(float(args.handoff_timeout), 0.001),
+            max_retries=0,
         )
-        await navigate_handoff_session(handoff_browser, config.controlled_page_url)
-        handoff = build_takeover_gate(handoff_endpoints)
-        handoff_path = Path(args.handoff_file)
-        write_private_handoff_file(handoff, handoff_path)
+        handoff_session_id = str(handoff_session.id)
+        handoff_browser = None
         try:
+            handoff_endpoints = build_session_endpoints(handoff_session)
+            handoff_browser = BrowserSession(
+                cdp_url=discover_debugger_cdp_url(
+                    config.steel_base_url,
+                    os.environ.get("STEEL_API_KEY"),
+                    timeout=max(config.operation_deadline_seconds, 0.001),
+                ),
+                is_local=False,
+                keep_alive=True,
+                allowed_domains=config.resolved_allowed_domains(),
+                storage_state=str(config.storage_state_path),
+            )
+            await navigate_handoff_session(handoff_browser, config.controlled_page_url)
+            handoff = build_takeover_gate(handoff_endpoints)
+            handoff_path = Path(args.handoff_file)
+            write_private_handoff_file(handoff, handoff_path)
             deadline = time.monotonic() + args.handoff_timeout
             while not handoff_is_complete(handoff_path):
                 if time.monotonic() >= deadline:
@@ -626,8 +728,9 @@ async def run_spike(args: argparse.Namespace) -> RunSummary:
             handoff.complete(handoff.resume_token)
             handoff.assert_resumable()
         finally:
-            await handoff_browser.stop()
-            client.sessions.release(handoff_endpoints.session_id)
+            if handoff_browser is not None:
+                await handoff_browser.stop()
+            client.sessions.release(handoff_session_id)
 
         offsite_rejection = await run_offsite_in_fresh_session(client=client, config=config)
 
