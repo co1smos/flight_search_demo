@@ -272,6 +272,8 @@ class GoogleGenAIRequestParser:
     ) -> None:
         if policy is None:
             raise ValueError("Google Gemini request parsing requires a caller-owned Gemini policy")
+        if fallback_model is not None:
+            validate_model_configuration(model, fallback_model)
         self._client = client
         self._model = model
         self._policy = policy
@@ -988,6 +990,7 @@ def run_request(
             classification = None
         if classification is None and isinstance(exc, GeminiPolicyError):
             classification = exc.classification.value
+            gemini_usage = exc.diagnostics
         diagnostic(redact_sensitive(metadata), redact_sensitive_text(str(exc)))
         if classification in {
             GeminiErrorClassification.RUN_BUDGET_EXHAUSTION.value,

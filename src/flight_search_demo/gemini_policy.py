@@ -516,7 +516,13 @@ class GeminiCallPolicy:
                         timeout_seconds=max(0.001, operation.remaining_seconds())
                     )
                 )
-            except TimeoutError as exc:
+            except (TimeoutError, sqlite3.OperationalError) as exc:
+                if (
+                    isinstance(exc, sqlite3.OperationalError)
+                    and "locked" not in str(exc).lower()
+                    and operation.remaining_seconds() > 0
+                ):
+                    raise
                 raise GeminiCallFailure(
                     "Gemini operation deadline exhausted during policy setup",
                     classification=GeminiErrorClassification.TIMEOUT_CANCELLATION,
