@@ -731,6 +731,114 @@ class Issue14GeminiPolicyTests(unittest.TestCase):
         self.assertEqual(structured["headers"][1]["value"], "keep-this-id")
         self.assertNotIn("session-secret", structured["websocket"])
 
+    def test_redaction_covers_quoted_serialized_header_mappings(self) -> None:
+        samples = (
+            "headers={'Cookie': 'sid=COOKIE_SECRET; csrf=CSRF_SECRET'}",
+            '{"Authorization": "Custom AUTH_SECRET", "Cookie": "sid=COOKIE_SECRET"}',
+            "{'Set-Cookie': 'sid=COOKIE_SECRET; Path=/'}",
+        )
+        for sample in samples:
+            with self.subTest(sample=sample.split(":", 1)[0]):
+                safe = redact_sensitive_text(sample)
+                for secret in (
+                    "COOKIE_SECRET",
+                    "CSRF_SECRET",
+                    "AUTH_SECRET",
+                    "sid=",
+                    "csrf=",
+                    "Path=/",
+                ):
+                    self.assertFalse(secret in safe)
+        self.assertIn("headers=", redact_sensitive_text(samples[0]))
+        self.assertIn("Authorization", redact_sensitive_text(samples[1]))
+        self.assertIn("Set-Cookie", redact_sensitive_text(samples[2]))
+
+    def test_quoted_header_redaction_reaches_persisted_diagnostics(self) -> None:
+        samples = (
+            "headers={'Cookie': 'sid=COOKIE_SECRET; csrf=CSRF_SECRET'}",
+            '{"Authorization": "Custom AUTH_SECRET", "Cookie": "sid=COOKIE_SECRET"}',
+            "{'Set-Cookie': 'sid=COOKIE_SECRET; Path=/'}",
+        )
+
+        class FailingParser:
+            def parse(self, **kwargs):
+                raise ParserFailure(
+                    "diagnostic failure",
+                    diagnostics={
+                        "single_quoted": samples[0],
+                        "double_quoted": samples[1],
+                        "set_cookie": samples[2],
+                    },
+                )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            directory = Path(tmpdir)
+            with redirect_stdout(io.StringIO()):
+                run_request(
+                    request={"request_id": "req-quoted-header", "original_text": "find an award"},
+                    confirmation={"confirmed": False},
+                    event_log_path=directory / "events.jsonl",
+                    parser=FailingParser(),
+                )
+            diagnostic_text = (directory / "events.diagnostics.jsonl").read_text(encoding="utf-8")
+
+        for secret in ("COOKIE_SECRET", "CSRF_SECRET", "AUTH_SECRET"):
+            self.assertFalse(secret in diagnostic_text)
+
+    def test_natural_language_credentials_are_redacted_at_prompt_event_and_report_seams(self) -> None:
+        request = {
+            "request_id": "req-original-text-secret",
+            "original_text": "find an award; password hunter2",
+        }
+        parsed = ParsedNaturalLanguageRequest(
+            "aeroplan", "JFK", "CDG", "2026-11-05", "Business", 1, "one_way", 70000
+        )
+        response = SimpleNamespace(
+            outputs=[SimpleNamespace(type="text", text=json.dumps({
+                "program_selection": "omitted",
+                "requests": [asdict(parsed)],
+            }))]
+        )
+        prompts = []
+
+        def create(**kwargs):
+            prompts.append(kwargs["input"])
+            return response
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            directory = Path(tmpdir)
+            policy = GeminiCallPolicy(
+                db_path=directory / "usage.sqlite3",
+                config=GeminiPolicyConfig(
+                    run_call_limit=1,
+                    daily_call_limits={"gemini-test": 1},
+                ),
+            )
+            parser = GoogleGenAIRequestParser(
+                client=SimpleNamespace(interactions=SimpleNamespace(create=create)),
+                model="gemini-test",
+                policy=policy,
+            )
+            with redirect_stdout(io.StringIO()) as terminal:
+                events = run_request(
+                    request=request,
+                    confirmation={"confirmed": False},
+                    event_log_path=directory / "events.jsonl",
+                    parser=parser,
+                    current_date=date(2026, 11, 1),
+                    gemini_policy=policy,
+                )
+            event_text = (directory / "events.jsonl").read_text(encoding="utf-8")
+            event = json.loads(event_text)
+
+        self.assertEqual(len(prompts), 1)
+        self.assertFalse("hunter2" in prompts[0])
+        self.assertFalse("hunter2" in event_text)
+        self.assertFalse("hunter2" in terminal.getvalue())
+        self.assertIn("find an award", prompts[0])
+        self.assertIn("find an award", event["original_text"])
+        self.assertEqual(events[0]["status"], "CLARIFICATION_REQUIRED")
+
     def test_diagnostic_jsonl_redacts_original_text_and_sensitive_mapping_keys(self) -> None:
         class FailingParser:
             def parse(self, **kwargs):

@@ -130,6 +130,18 @@ def redact_sensitive_text(value: str) -> str:
     """Remove credentials, session material, query values, and cookie values."""
 
     value = re.sub(
+        r"(?im)(?P<key_quote>['\"]?)"
+        r"(?P<label>\b(?:proxy[-_ ]?authorization|authorization|set[-_ ]?cookie|cookies?)\b)"
+        r"(?P=key_quote)(?P<separator>\s*(?::|=)\s*)"
+        r"(?P<value_quote>['\"])[^\r\n]*?(?P=value_quote)",
+        lambda match: (
+            f"{match.group('key_quote')}{match.group('label')}"
+            f"{match.group('key_quote')}{match.group('separator')}"
+            f"{match.group('value_quote')}[REDACTED]{match.group('value_quote')}"
+        ),
+        value,
+    )
+    value = re.sub(
         r"(?im)(?P<label>\b(?:proxy[-_ ]?authorization|authorization)\b)"
         r"(?P<separator>\s*(?::|=)\s*|\s+)[^\r\n]*",
         lambda match: match.group("label") + match.group("separator") + "[REDACTED]",

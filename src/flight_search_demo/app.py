@@ -293,7 +293,7 @@ class GoogleGenAIRequestParser:
             f"request_id: {request_id}\n"
             f"current_date: {current_date.isoformat()}\n"
             f"timezone: {timezone_name}\n"
-            f"request: {original_text}\n"
+            f"request: {redact_sensitive_text(original_text)}\n"
         )
         active_operation = None
 
@@ -1432,7 +1432,7 @@ def emit_event(
     event = {
         "timestamp": timestamp,
         "request_id": request_id,
-        "original_text": original_text,
+        "original_text": redact_sensitive_text(original_text),
         "atomic_task_id": atomic_task_id,
         "normalized_criteria": normalized_criteria,
         "status": status,
@@ -1485,7 +1485,7 @@ def render_terminal_report(event: Dict[str, Any]) -> str:
     task = event["atomic_task_id"] or "none"
     return (
         f"{event['status']} request={event['request_id']}"
-        f" original_text={event['original_text']} task={task}"
+        f" original_text={redact_sensitive_text(str(event['original_text']))} task={task}"
         f"{criteria_report} detail={event['detail']} at {event['timestamp']}"
     )
 
