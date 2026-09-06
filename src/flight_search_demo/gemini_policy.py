@@ -129,6 +129,8 @@ def _utc_timestamp(value: datetime) -> str:
 def redact_sensitive_text(value: str) -> str:
     """Remove credentials, session material, query values, and cookie values."""
 
+    value = _redact_serialized_sensitive_mappings(value)
+
     value = re.sub(
         r"(?im)(?P<key_quote>['\"]?)"
         r"(?P<label>\b(?:proxy[-_ ]?authorization|authorization|set[-_ ]?cookie|cookies?)\b)"
@@ -191,6 +193,106 @@ def redact_sensitive_text(value: str) -> str:
     return re.sub(r"(?:https?|wss?)://[^\s'\"<>]+", redact_url, value)
 
 
+_SENSITIVE_MAPPING_KEY_MARKERS = (
+    "apikey", "authorization", "credential", "credentials", "cookie", "password",
+    "secret", "session", "token",
+)
+
+
+def _is_sensitive_mapping_key(value: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9]", "", value.lower())
+    return any(marker in normalized for marker in _SENSITIVE_MAPPING_KEY_MARKERS)
+
+
+def _quoted_end(value: str, start: int) -> int:
+    quote = value[start]
+    index = start + 1
+    while index < len(value):
+        if value[index] == "\\":
+            index += 2
+            continue
+        if value[index] == quote:
+            return index
+        index += 1
+    return len(value) - 1
+
+
+def _container_end(value: str, start: int) -> int:
+    pairs = {"[": "]", "(": ")", "{": "}"}
+    stack: list[str] = [pairs[value[start]]]
+    index = start + 1
+    while index < len(value) and stack:
+        character = value[index]
+        if character in {"'", '"'}:
+            index = _quoted_end(value, index) + 1
+            continue
+        if character in pairs:
+            stack.append(pairs[character])
+        elif character == stack[-1]:
+            stack.pop()
+        index += 1
+    return min(index, len(value))
+
+
+def _serialized_value_end(value: str, start: int) -> int:
+    if start >= len(value):
+        return start
+    if value[start] in {"'", '"'}:
+        return min(_quoted_end(value, start) + 1, len(value))
+    if value[start] in "[{(":
+        return _container_end(value, start)
+    index = start
+    while index < len(value) and value[index] not in ",]}):":
+        index += 1
+    return index
+
+
+def _redact_serialized_sensitive_mappings(value: str) -> str:
+    """Redact complete values for sensitive quoted mapping keys.
+
+    Provider diagnostics often contain ``repr`` or JSON-like mappings. A
+    regular expression can stop at the first nested quote, so scan only the
+    mapping boundary and replace a scalar or balanced container as one value.
+    """
+
+    pieces: list[str] = []
+    index = 0
+    while index < len(value):
+        if value[index] not in {"'", '"'}:
+            pieces.append(value[index])
+            index += 1
+            continue
+        key_start = index
+        key_end = _quoted_end(value, index)
+        key = value[index + 1:key_end]
+        separator = key_end + 1
+        while separator < len(value) and value[separator].isspace():
+            separator += 1
+        if (
+            separator < len(value)
+            and value[separator] in ":="
+            and _is_sensitive_mapping_key(key)
+        ):
+            pieces.append(value[key_start:key_end + 1])
+            pieces.append(value[key_end + 1:separator + 1])
+            value_start = separator + 1
+            while value_start < len(value) and value[value_start].isspace():
+                value_start += 1
+            pieces.append(value[separator + 1:value_start])
+            value_end = _serialized_value_end(value, value_start)
+            if value_start < value_end:
+                if value[value_start] in {"'", '"'}:
+                    quote = value[value_start]
+                    pieces.append(quote + "[REDACTED]" + quote)
+                else:
+                    pieces.append("[REDACTED]")
+            index = value_end
+            continue
+        pieces.append(value[key_start:key_end + 1])
+        index = key_end + 1
+    return "".join(pieces)
+
+
 def redact_sensitive(value: Any) -> Any:
     if isinstance(value, str):
         return redact_sensitive_text(value)
@@ -217,13 +319,7 @@ def redact_sensitive(value: Any) -> Any:
         for key, item in value.items():
             key_text = str(key)
             normalized_key = re.sub(r"[^a-z0-9]", "", key_text.lower())
-            sensitive_key = any(
-                marker in normalized_key
-                for marker in (
-                    "apikey", "authorization", "credential", "credentials", "cookie", "password",
-                    "secret", "session", "token",
-                )
-            )
+            sensitive_key = any(marker in normalized_key for marker in _SENSITIVE_MAPPING_KEY_MARKERS)
             header_value = sensitive_header and normalized_key in {"value", "val", "content"}
             redacted[key_text] = "[REDACTED]" if sensitive_key or header_value else redact_sensitive(item)
         return redacted
@@ -372,6 +468,7 @@ class GeminiCallPolicy:
         monotonic: Callable[[], float] | None = None,
         sleep: Callable[[float], None] | None = None,
         async_sleep: Callable[[float], Awaitable[None]] | None = None,
+        defer_initialization: bool = False,
     ) -> None:
         self.db_path = Path(db_path)
         self.config = config or GeminiPolicyConfig()
@@ -380,19 +477,55 @@ class GeminiCallPolicy:
         self._sleep = sleep or time.sleep
         self._async_sleep = async_sleep or asyncio.sleep
         self._run_budget = _RunBudget(self.config.run_call_limit)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as connection:
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS gemini_daily_usage (
-                    usage_day TEXT NOT NULL,
-                    timezone_name TEXT NOT NULL,
-                    model TEXT NOT NULL,
-                    attempted_calls INTEGER NOT NULL DEFAULT 0,
-                    PRIMARY KEY (usage_day, timezone_name, model)
+        self._storage_lock = threading.Lock()
+        self._initialized = False
+        if not defer_initialization:
+            self._initialize_storage()
+
+    def _initialize_storage(self, *, timeout_seconds: float = 30.0) -> None:
+        if self._initialized:
+            return
+        with self._storage_lock:
+            if self._initialized:
+                return
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            with self._connect(timeout_seconds=timeout_seconds) as connection:
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS gemini_daily_usage (
+                        usage_day TEXT NOT NULL,
+                        timezone_name TEXT NOT NULL,
+                        model TEXT NOT NULL,
+                        attempted_calls INTEGER NOT NULL DEFAULT 0,
+                        PRIMARY KEY (usage_day, timezone_name, model)
+                    )
+                    """
                 )
-                """
-            )
+            self._initialized = True
+
+    def initialize(self, operation: "GeminiOperation | None" = None) -> None:
+        """Initialize persistent counters, optionally under an operation deadline."""
+        if self._initialized:
+            return
+        if operation is None:
+            self._initialize_storage()
+        else:
+            try:
+                operation.run_sync(
+                    lambda: self._initialize_storage(
+                        timeout_seconds=max(0.001, operation.remaining_seconds())
+                    )
+                )
+            except TimeoutError as exc:
+                raise GeminiCallFailure(
+                    "Gemini operation deadline exhausted during policy setup",
+                    classification=GeminiErrorClassification.TIMEOUT_CANCELLATION,
+                    diagnostics=operation.diagnostics(
+                        terminal_classification=GeminiErrorClassification.TIMEOUT_CANCELLATION,
+                        terminal_error="operation deadline exhausted during policy setup",
+                        include_daily_reads=False,
+                    ),
+                ) from exc
 
     def _connect(self, *, timeout_seconds: float = 30.0) -> sqlite3.Connection:
         bounded_timeout = max(0.001, timeout_seconds)
@@ -415,6 +548,7 @@ class GeminiCallPolicy:
             "run_call_limit": self.config.run_call_limit,
             "daily_call_limits": dict(self.config.daily_call_limits),
             "timezone_name": self.config.timezone_name,
+            "day_boundary": "midnight",
             "usage_day": self.usage_day(),
             "max_attempts": self.config.max_attempts,
             "retry_backoff_seconds": list(self.config.retry_backoff_seconds),
@@ -458,6 +592,9 @@ class GeminiCallPolicy:
                     include_daily_reads=False,
                 ),
             )
+
+        if not self._initialized:
+            self.initialize(operation)
 
         usage_day = self.usage_day()
         try:
@@ -572,6 +709,7 @@ class GeminiCallPolicy:
         )
 
     def daily_usage(self, model: str, *, timeout_seconds: float = 30.0) -> int:
+        self._initialize_storage(timeout_seconds=timeout_seconds)
         with self._connect(timeout_seconds=timeout_seconds) as connection:
             row = connection.execute(
                 "SELECT attempted_calls FROM gemini_daily_usage WHERE usage_day=? AND timezone_name=? AND model=?",
@@ -655,6 +793,9 @@ class GeminiOperation:
         self._daily_remaining: dict[str, int] = {}
         self.current_model: str | None = None
         self.current_purpose: str | None = None
+        self._fallback_used = False
+        self._fallback_model: str | None = None
+        self._retry_number = 0
 
     def _record_reservation_denial(
         self,
@@ -875,13 +1016,16 @@ class GeminiOperation:
         provider_call: Callable[[str], T],
         fallback_model: str | None = None,
     ) -> T:
-        current_model = model
+        has_fallback = bool(fallback_model and fallback_model != model)
+        fallback_used = (
+            self._fallback_used
+            and has_fallback
+            and self._fallback_model == fallback_model
+        )
+        current_model = fallback_model if fallback_used else model
         self.current_model = model
         self.current_purpose = purpose
-        fallback_used = False
         attempts = 0
-        retry_number = 0
-        has_fallback = bool(fallback_model and fallback_model != model)
         primary_attempt_limit = max(
             1, self.policy.config.max_attempts - int(has_fallback)
         ) if has_fallback else self.policy.config.max_attempts
@@ -899,7 +1043,7 @@ class GeminiOperation:
             record = _CallRecord(
                 model=current_model,
                 purpose=purpose,
-                attempt_number=attempts,
+                attempt_number=len(self.records) + 1,
                 started_at=_utc_timestamp(self.policy._now()),
                 run_remaining=reservation.run_remaining,
                 daily_remaining=reservation.daily_remaining,
@@ -922,8 +1066,8 @@ class GeminiOperation:
                     and primary_attempts < primary_attempt_limit
                     and attempts < self.policy.config.max_attempts
                 ):
-                    retry_number += 1
-                    if self._prepare_retry(record, retry_number):
+                    self._retry_number += 1
+                    if self._prepare_retry(record, self._retry_number):
                         continue
                 if (
                     not fallback_used
@@ -936,6 +1080,8 @@ class GeminiOperation:
                     current_model = fallback_model
                     self.current_model = current_model
                     fallback_used = True
+                    self._fallback_used = True
+                    self._fallback_model = fallback_model
                     continue
                 raise GeminiCallFailure(
                     "Gemini provider call failed",
@@ -963,13 +1109,16 @@ class GeminiOperation:
         provider_call: Callable[[str], Awaitable[T]],
         fallback_model: str | None = None,
     ) -> T:
-        current_model = model
+        has_fallback = bool(fallback_model and fallback_model != model)
+        fallback_used = (
+            self._fallback_used
+            and has_fallback
+            and self._fallback_model == fallback_model
+        )
+        current_model = fallback_model if fallback_used else model
         self.current_model = model
         self.current_purpose = purpose
-        fallback_used = False
         attempts = 0
-        retry_number = 0
-        has_fallback = bool(fallback_model and fallback_model != model)
         primary_attempt_limit = max(
             1, self.policy.config.max_attempts - int(has_fallback)
         ) if has_fallback else self.policy.config.max_attempts
@@ -983,7 +1132,7 @@ class GeminiOperation:
             record = _CallRecord(
                 model=current_model,
                 purpose=purpose,
-                attempt_number=attempts,
+                attempt_number=len(self.records) + 1,
                 started_at=_utc_timestamp(self.policy._now()),
                 run_remaining=reservation.run_remaining,
                 daily_remaining=reservation.daily_remaining,
@@ -1009,8 +1158,8 @@ class GeminiOperation:
                     and primary_attempts < primary_attempt_limit
                     and attempts < self.policy.config.max_attempts
                 ):
-                    retry_number += 1
-                    if await self._prepare_async_retry(record, retry_number):
+                    self._retry_number += 1
+                    if await self._prepare_async_retry(record, self._retry_number):
                         continue
                 if (
                     not fallback_used
@@ -1023,6 +1172,8 @@ class GeminiOperation:
                     current_model = fallback_model
                     self.current_model = current_model
                     fallback_used = True
+                    self._fallback_used = True
+                    self._fallback_model = fallback_model
                     continue
                 raise GeminiCallFailure(
                     "Gemini provider call failed",
