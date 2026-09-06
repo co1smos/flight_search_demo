@@ -34,6 +34,7 @@ from flight_search_demo.gemini_policy import (
     GeminiPolicyConfig,
     MalformedModelOutputError,
     classify_gemini_error,
+    redact_sensitive,
     redact_sensitive_text,
 )
 
@@ -649,6 +650,50 @@ class Issue14GeminiPolicyTests(unittest.TestCase):
         )
         for secret in ("sid=one", "csrf=two", "session=three", "Path=/", "HttpOnly", "SameSite=Strict"):
             self.assertNotIn(secret, headers)
+
+    def test_diagnostic_redaction_covers_authorization_schemes_proxy_headers_and_urls(self) -> None:
+        sensitive = (
+            "Authorization: Basic dXNlcjpzZWNyZXQ=\n"
+            "Authorization: Digest username=alice, nonce=nonce-secret, response=response-secret\n"
+            "Authorization: Custom opaque-authorization-secret\n"
+            "Proxy-Authorization: Digest username=proxy, response=proxy-response-secret\n"
+            "Cookie: sid=session-secret; csrf=csrf-secret\n"
+            "credentials=user:password-secret api_key=api-secret\n"
+            "https://user:url-password-secret@sensitive.test/account/session-secret?session=session-url-secret&token=url-token-secret"
+        )
+
+        safe = redact_sensitive_text(sensitive)
+
+        for secret in (
+            "dXNlcjpzZWNyZXQ=",
+            "nonce-secret",
+            "response-secret",
+            "opaque-authorization-secret",
+            "proxy-response-secret",
+            "session-secret",
+            "csrf-secret",
+            "password-secret",
+            "api-secret",
+            "url-password-secret",
+            "session-url-secret",
+            "url-token-secret",
+        ):
+            self.assertNotIn(secret, safe)
+        self.assertIn("Authorization", safe)
+        self.assertIn("Proxy-Authorization", safe)
+        self.assertIn("sensitive.test", safe)
+
+        structured = redact_sensitive({
+            "headers": [
+                {"name": "Authorization", "value": "Basic header-secret"},
+                {"name": "X-Request-ID", "value": "keep-this-id"},
+            ],
+            "websocket": "wss://127.0.0.1/devtools/browser/session-secret",
+        })
+        self.assertEqual(structured["headers"][0]["name"], "Authorization")
+        self.assertEqual(structured["headers"][0]["value"], "[REDACTED]")
+        self.assertEqual(structured["headers"][1]["value"], "keep-this-id")
+        self.assertNotIn("session-secret", structured["websocket"])
 
     def test_diagnostic_jsonl_redacts_original_text_and_sensitive_mapping_keys(self) -> None:
         class FailingParser:

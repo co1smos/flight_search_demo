@@ -131,19 +131,18 @@ def redact_sensitive_text(value: str) -> str:
     """Remove credentials, session material, query values, and cookie values."""
 
     value = re.sub(
-        r"(?im)(^\s*(?:set-)?cookie\s*:\s*)[^\r\n]*",
-        r"\1[REDACTED]",
-        value,
-    )
-
-    value = re.sub(
-        r"(?i)\bauthorization\s*:\s*(?:bearer\s+)?[^\s,;]+",
-        "authorization=[REDACTED]",
+        r"(?im)(\b(?:proxy[-_ ]?authorization|authorization)\s*[:=]\s*)[^\r\n]*",
+        lambda match: match.group(1) + "[REDACTED]",
         value,
     )
     value = re.sub(
-        r"(?i)\b(?:api[_-]?key|authorization|cookie|password|secret|credential|token|session[_-]?id)\s*[:=]\s*[^\s,;]+",
-        lambda match: match.group(0).split("=", 1)[0].split(":", 1)[0] + "=[REDACTED]",
+        r"(?im)(\b(?:set[-_ ]?cookie|cookies?)\s*[:=]\s*)[^\r\n]*",
+        lambda match: match.group(1) + "[REDACTED]",
+        value,
+    )
+    value = re.sub(
+        r"(?i)\b(?:api[ _-]?key|credentials?|password|secret|token|session[_-]?id)\s*[:=]\s*[^\s,;]+",
+        lambda match: re.split(r"\s*[:=]\s*", match.group(0), maxsplit=1)[0] + "=[REDACTED]",
         value,
     )
     value = re.sub(r"\bAIza[0-9A-Za-z_-]{20,}\b", "[REDACTED]", value)
@@ -162,13 +161,31 @@ def redact_sensitive_text(value: str) -> str:
             pass
         return "[REDACTED_URL]"
 
-    return re.sub(r"https?://[^\s'\"<>]+", redact_url, value)
+    return re.sub(r"(?:https?|wss?)://[^\s'\"<>]+", redact_url, value)
 
 
 def redact_sensitive(value: Any) -> Any:
     if isinstance(value, str):
         return redact_sensitive_text(value)
     if isinstance(value, Mapping):
+        header_name = next(
+            (
+                str(item)
+                for key, item in value.items()
+                if str(key).lower().replace("-", "_") in {"name", "header", "key"}
+                and isinstance(item, str)
+            ),
+            None,
+        )
+        normalized_header_name = (
+            re.sub(r"[^a-z0-9]", "", header_name.lower())
+            if header_name is not None
+            else ""
+        )
+        sensitive_header = any(
+            marker in normalized_header_name
+            for marker in ("authorization", "cookie", "apikey", "credential")
+        )
         redacted = {}
         for key, item in value.items():
             key_text = str(key)
@@ -176,11 +193,12 @@ def redact_sensitive(value: Any) -> Any:
             sensitive_key = any(
                 marker in normalized_key
                 for marker in (
-                    "apikey", "authorization", "credential", "cookie", "password",
+                    "apikey", "authorization", "credential", "credentials", "cookie", "password",
                     "secret", "session", "token",
                 )
             )
-            redacted[key_text] = "[REDACTED]" if sensitive_key else redact_sensitive(item)
+            header_value = sensitive_header and normalized_key in {"value", "val", "content"}
+            redacted[key_text] = "[REDACTED]" if sensitive_key or header_value else redact_sensitive(item)
         return redacted
     if isinstance(value, (list, tuple)):
         return [redact_sensitive(item) for item in value]
@@ -647,6 +665,14 @@ class GeminiOperation:
                 executor.shutdown(wait=False, cancel_futures=True)
             else:
                 executor.shutdown(wait=True)
+
+    def ensure_time(self) -> None:
+        """Require that the operation's original deadline has not elapsed."""
+        self._ensure_time()
+
+    def run_sync(self, callback: Callable[[], T]) -> T:
+        """Run synchronous setup or provider work within this operation deadline."""
+        return self._bounded_sync_call(callback)
 
     def diagnostics(
         self,

@@ -213,15 +213,19 @@ async def run_agent_task(
     diagnostic_sink: Callable[[dict[str, Any]], None] | None = None,
     expected_marker: str | None = None,
     expected_controlled_page_url: str | None = None,
+    operation: Any | None = None,
 ) -> ControlledPageResult | BrowserTaskOutcome:
     if policy is None:
         raise ValueError("browser execution requires a caller-owned Gemini policy")
     validate_model_configuration(config.gemini_model, config.fallback_gemini_model)
-    operation = policy.operation(
-        f"browser-agent:{hashlib.sha256(task.encode('utf-8')).hexdigest()[:12]}",
-        task_id=hashlib.sha256(task.encode("utf-8")).hexdigest()[:12],
-        deadline_seconds=config.operation_deadline_seconds,
-    )
+    if operation is None:
+        operation = policy.operation(
+            f"browser-agent:{hashlib.sha256(task.encode('utf-8')).hexdigest()[:12]}",
+            task_id=hashlib.sha256(task.encode("utf-8")).hexdigest()[:12],
+            deadline_seconds=config.operation_deadline_seconds,
+        )
+    operation.current_model = config.gemini_model
+    operation.current_purpose = "browser_agent"
     try:
         assert_private_url(cdp_url)
     except ValueError as exc:
@@ -232,39 +236,51 @@ async def run_agent_task(
             detail=str(exc),
             diagnostic_sink=diagnostic_sink,
         )
-    browser = BrowserSession(
-        cdp_url=cdp_url,
-        is_local=False,
-        keep_alive=False,
-        allowed_domains=config.resolved_allowed_domains(),
-        storage_state=str(config.storage_state_path),
-    )
-    primary_llm, fallback_llm = build_agent_llms(
-        primary_model=config.gemini_model,
-        fallback_model=config.fallback_gemini_model,
-        api_key=config.google_api_key or "",
-    )
-    policy_llm = PolicyBoundChatGoogle(
-        primary=primary_llm,
-        fallback=fallback_llm,
-        operation=operation,
-        diagnostic_sink=diagnostic_sink,
-    )
-    agent = Agent(
-        task=task,
-        llm=policy_llm,
-        browser_session=browser,
-        output_model_schema=ControlledPageResult,
-        use_vision=False,
-        max_actions_per_step=2,
-        max_failures=2,
-        llm_timeout=max(1, int(config.operation_deadline_seconds)),
-    )
     try:
+        def setup() -> tuple[BrowserSession, PolicyBoundChatGoogle, Agent]:
+            browser = BrowserSession(
+                cdp_url=cdp_url,
+                is_local=False,
+                keep_alive=False,
+                allowed_domains=config.resolved_allowed_domains(),
+                storage_state=str(config.storage_state_path),
+            )
+            primary_llm, fallback_llm = build_agent_llms(
+                primary_model=config.gemini_model,
+                fallback_model=config.fallback_gemini_model,
+                api_key=config.google_api_key or "",
+            )
+            policy_llm = PolicyBoundChatGoogle(
+                primary=primary_llm,
+                fallback=fallback_llm,
+                operation=operation,
+                diagnostic_sink=diagnostic_sink,
+            )
+            agent = Agent(
+                task=task,
+                llm=policy_llm,
+                browser_session=browser,
+                output_model_schema=ControlledPageResult,
+                use_vision=False,
+                max_actions_per_step=2,
+                max_failures=2,
+                llm_timeout=max(1, int(config.operation_deadline_seconds)),
+            )
+            return browser, policy_llm, agent
+
+        try:
+            _, policy_llm, agent = operation.run_sync(setup)
+            operation.ensure_time()
+        except TimeoutError as exc:
+            raise GeminiPolicyError(
+                "browser agent operation deadline exhausted during setup",
+                classification=GeminiErrorClassification.TIMEOUT_CANCELLATION,
+                diagnostics=operation.diagnostics(include_daily_reads=False),
+            ) from exc
         try:
             history = await asyncio.wait_for(
                 agent.run(max_steps=config.max_steps),
-                timeout=config.operation_deadline_seconds,
+                timeout=operation.remaining_seconds(),
             )
         except asyncio.TimeoutError as exc:
             raise GeminiPolicyError(
@@ -286,9 +302,15 @@ async def run_agent_task(
             )
         if policy_llm.last_policy_error is not None:
             raise policy_llm.last_policy_error
-        if history.structured_output is None:
-            raise RuntimeError("browser-use returned no structured output")
-        result = history.structured_output
+        result = getattr(history, "structured_output", None)
+        if not isinstance(result, ControlledPageResult):
+            return _browser_outcome(
+                operation=operation,
+                status="BROWSER_RESULT_INVALID",
+                classification=GeminiErrorClassification.MALFORMED_OUTPUT.value,
+                detail="browser-use returned missing or unusable structured output",
+                diagnostic_sink=diagnostic_sink,
+            )
         if expected_marker is not None or expected_controlled_page_url is not None:
             if expected_marker is None or expected_controlled_page_url is None:
                 raise ValueError("expected marker and controlled URL must be provided together")
@@ -356,10 +378,33 @@ async def run_in_fresh_session(
 ) -> ControlledPageResult | BrowserTaskOutcome:
     if policy is None:
         raise ValueError("browser execution requires a caller-owned Gemini policy")
-    session = client.sessions.create(headless=True)
-    endpoints = build_session_endpoints(session)
+    task_hash = hashlib.sha256(task.encode("utf-8")).hexdigest()[:12]
+    operation = policy.operation(
+        f"browser-agent:{task_hash}",
+        task_id=task_hash,
+        deadline_seconds=config.operation_deadline_seconds,
+    )
+    operation.current_model = config.gemini_model
+    operation.current_purpose = "browser_agent"
+    session_id: str | None = None
     try:
-        cdp_url = discover_debugger_cdp_url(config.steel_base_url, os.environ.get("STEEL_API_KEY"))
+        def setup() -> tuple[str, str]:
+            session = client.sessions.create(headless=True)
+            endpoints = build_session_endpoints(session)
+            cdp_url = discover_debugger_cdp_url(
+                config.steel_base_url, os.environ.get("STEEL_API_KEY")
+            )
+            return endpoints.session_id, cdp_url
+
+        try:
+            session_id, cdp_url = operation.run_sync(setup)
+            operation.ensure_time()
+        except TimeoutError as exc:
+            raise GeminiPolicyError(
+                "browser agent operation deadline exhausted during session setup",
+                classification=GeminiErrorClassification.TIMEOUT_CANCELLATION,
+                diagnostics=operation.diagnostics(include_daily_reads=False),
+            ) from exc
         return await run_agent_task(
             task=task,
             config=config,
@@ -368,9 +413,11 @@ async def run_in_fresh_session(
             diagnostic_sink=diagnostic_sink,
             expected_marker=expected_marker,
             expected_controlled_page_url=expected_controlled_page_url,
+            operation=operation,
         )
     finally:
-        client.sessions.release(endpoints.session_id)
+        if session_id is not None:
+            client.sessions.release(session_id)
 
 
 async def run_offsite_in_fresh_session(
