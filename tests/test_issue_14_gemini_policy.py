@@ -644,6 +644,13 @@ class Issue14GeminiPolicyTests(unittest.TestCase):
                 )
             self.assertEqual(blocked.exception.classification, GeminiErrorClassification.DAILY_QUOTA_EXHAUSTION)
             self.assertEqual(calls, ["primary"])
+            diagnostics = blocked.exception.diagnostics
+            self.assertEqual(diagnostics["model"], "fallback")
+            self.assertEqual(diagnostics["fallback_decision"], "blocked_daily_budget")
+            self.assertEqual(diagnostics["attempted_calls"], 1)
+            self.assertEqual(diagnostics["reservation_denial"]["allowance"], "daily_call_limit")
+            self.assertEqual(diagnostics["reservation_denial"]["remaining_allowance"], 0)
+            self.assertFalse(diagnostics["reservation_denial"]["provider_call_started"])
 
     def test_required_provider_classifications_and_redaction_are_stable(self) -> None:
         class ErrorWithCode(RuntimeError):
@@ -762,6 +769,111 @@ class Issue14GeminiPolicyTests(unittest.TestCase):
         ):
             self.assertNotIn(secret, diagnostic_text)
         self.assertIn("keep-this-diagnostic", diagnostic_text)
+
+    def test_persisted_diagnostic_redacts_whitespace_credentials_and_standalone_auth_schemes(self) -> None:
+        class FailingParser:
+            def parse(self, **kwargs):
+                raise ParserFailure(
+                    "provider error: password hunter2; credentials are user@example.com / p@ssw0rd; "
+                    "cookie sid=abc; csrf=def; Bearer opaque-secret-token; "
+                    "Basic dXNlcjpzZWNyZXQ=; Digest username=alice, nonce=nonce-secret, response=response-secret; "
+                    "authorization custom-auth-secret; api key api-whitespace-secret; "
+                    "session material session-material-secret",
+                    diagnostics={"provenance": "provider-call", "detail": "keep-this-provenance"},
+                )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            directory = Path(tmpdir)
+            run_request(
+                request={
+                    "request_id": "req-broad-redaction",
+                    "original_text": "find an award",
+                },
+                confirmation={"confirmed": False},
+                event_log_path=directory / "events.jsonl",
+                parser=FailingParser(),
+            )
+            diagnostic_text = (directory / "events.diagnostics.jsonl").read_text(encoding="utf-8")
+
+        for secret in (
+            "hunter2",
+            "user@example.com",
+            "p@ssw0rd",
+            "sid=abc",
+            "csrf=def",
+            "opaque-secret-token",
+            "dXNlcjpzZWNyZXQ=",
+            "nonce-secret",
+            "response-secret",
+            "custom-auth-secret",
+            "api-whitespace-secret",
+            "session-material-secret",
+        ):
+            self.assertNotIn(secret, diagnostic_text)
+        self.assertIn("keep-this-provenance", diagnostic_text)
+
+    def test_final_outcome_identifies_fallback_reservation_denial(self) -> None:
+        class RateLimitError(RuntimeError):
+            status_code = 429
+
+        calls = []
+
+        def create(**kwargs):
+            calls.append(kwargs["model"])
+            raise RateLimitError("RPM rate limit")
+
+        client = SimpleNamespace(interactions=SimpleNamespace(create=create))
+        request = {
+            "request_id": "req-fallback-denial-seam",
+            "original_text": (
+                "Find one Aeroplan business seat from JFK to CDG on 2026-11-05 "
+                "under 70000 points"
+            ),
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            directory = Path(tmpdir)
+            policy = GeminiCallPolicy(
+                db_path=directory / "usage.sqlite3",
+                config=GeminiPolicyConfig(
+                    run_call_limit=2,
+                    daily_call_limits={"primary": 1, "fallback": 0},
+                    max_attempts=2,
+                ),
+            )
+            parser = GoogleGenAIRequestParser(
+                client=client,
+                model="primary",
+                policy=policy,
+                fallback_model="fallback",
+            )
+            with redirect_stdout(io.StringIO()):
+                events = run_request(
+                    request=request,
+                    confirmation={"confirmed": True},
+                    event_log_path=directory / "events.jsonl",
+                    parser=parser,
+                    current_date=date(2026, 11, 1),
+                    gemini_policy=policy,
+                )
+
+        self.assertEqual(calls, ["primary"])
+        self.assertEqual(events[0]["status"], "GEMINI_QUOTA_EXHAUSTED")
+        usage = events[0]["gemini_usage"]
+        self.assertEqual(usage["attempted_calls"], 1)
+        self.assertEqual(usage["model"], "fallback")
+        self.assertEqual(usage["purpose"], "request_parse")
+        self.assertEqual(usage["fallback_decision"], "blocked_daily_budget")
+        self.assertEqual(usage["terminal_classification"], "daily_quota_exhaustion")
+        denial = usage["reservation_denial"]
+        self.assertEqual(denial["model"], "fallback")
+        self.assertEqual(denial["purpose"], "request_parse")
+        self.assertEqual(denial["decision"], "blocked_daily_budget")
+        self.assertEqual(denial["allowance"], "daily_call_limit")
+        self.assertEqual(denial["allowance_limit"], 0)
+        self.assertEqual(denial["remaining_allowance"], 0)
+        self.assertEqual(denial["classification"], "daily_quota_exhaustion")
+        self.assertTrue(denial["timestamp"])
 
     def test_daily_exhaustion_is_an_explicit_application_outcome_without_a_provider_call(self) -> None:
         request = {

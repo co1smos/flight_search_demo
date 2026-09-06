@@ -130,18 +130,34 @@ def redact_sensitive_text(value: str) -> str:
     """Remove credentials, session material, query values, and cookie values."""
 
     value = re.sub(
-        r"(?im)(\b(?:proxy[-_ ]?authorization|authorization)\s*[:=]\s*)[^\r\n]*",
-        lambda match: match.group(1) + "[REDACTED]",
+        r"(?im)(?P<label>\b(?:proxy[-_ ]?authorization|authorization)\b)"
+        r"(?P<separator>\s*(?::|=)\s*|\s+)[^\r\n]*",
+        lambda match: match.group("label") + match.group("separator") + "[REDACTED]",
         value,
     )
     value = re.sub(
-        r"(?im)(\b(?:set[-_ ]?cookie|cookies?)\s*[:=]\s*)[^\r\n]*",
-        lambda match: match.group(1) + "[REDACTED]",
+        r"(?im)(?P<label>\b(?:set[-_ ]?cookie|cookies?)\b)"
+        r"(?P<separator>\s*(?::|=)\s*|\s+)[^\r\n]*",
+        lambda match: match.group("label") + match.group("separator") + "[REDACTED]",
         value,
     )
     value = re.sub(
-        r"(?i)\b(?:api[ _-]?key|credentials?|password|secret|token|session[_-]?id)\s*[:=]\s*[^\s,;]+",
-        lambda match: re.split(r"\s*[:=]\s*", match.group(0), maxsplit=1)[0] + "=[REDACTED]",
+        r"(?im)(?P<label>\bcredentials?\b(?:\s+(?:are|is))?)"
+        r"(?P<separator>\s*(?::|=)\s*|\s+)[^\r\n]*",
+        lambda match: match.group("label") + match.group("separator") + "[REDACTED]",
+        value,
+    )
+    value = re.sub(
+        r"(?im)(?P<scheme>\b(?:basic|bearer|digest)\b)(?P<separator>\s+)[^\r\n]*",
+        lambda match: match.group("scheme") + match.group("separator") + "[REDACTED]",
+        value,
+    )
+    value = re.sub(
+        r"(?i)(?P<label>\b(?:api[ _-]?key|access[ _-]?key|client[ _-]?secret|"
+        r"secret[ _-]?key|password|secret|refresh[ _-]?token|auth[ _-]?token|token|"
+        r"session(?:[ _-]?(?:id|token|key|material|cookie))?)\b)"
+        r"(?P<separator>\s+(?:is|are)\s+|\s*[:=]\s*|\s+)[^\s,;]+",
+        lambda match: match.group("label") + match.group("separator") + "[REDACTED]",
         value,
     )
     value = re.sub(r"\bAIza[0-9A-Za-z_-]{20,}\b", "[REDACTED]", value)
@@ -402,6 +418,14 @@ class GeminiCallPolicy:
     ) -> _Reservation:
         daily_limit = self.config.daily_call_limits.get(model)
         if daily_limit is None:
+            operation._record_reservation_denial(
+                model=model,
+                decision="blocked_daily_budget",
+                allowance="daily_call_limit",
+                allowance_limit=None,
+                remaining_allowance=0,
+                classification=GeminiErrorClassification.DAILY_QUOTA_EXHAUSTION,
+            )
             raise GeminiBudgetError(
                 f"no daily Gemini allowance is configured for model {model}",
                 classification=GeminiErrorClassification.DAILY_QUOTA_EXHAUSTION,
@@ -451,6 +475,14 @@ class GeminiCallPolicy:
                 daily_used = int(row[0]) if row else 0
                 if daily_used >= daily_limit:
                     connection.rollback()
+                    operation._record_reservation_denial(
+                        model=model,
+                        decision="blocked_daily_budget",
+                        allowance="daily_call_limit",
+                        allowance_limit=daily_limit,
+                        remaining_allowance=daily_limit - daily_used,
+                        classification=GeminiErrorClassification.DAILY_QUOTA_EXHAUSTION,
+                    )
                     raise GeminiBudgetError(
                         f"daily Gemini allowance exhausted for model {model}",
                         classification=GeminiErrorClassification.DAILY_QUOTA_EXHAUSTION,
@@ -462,6 +494,14 @@ class GeminiCallPolicy:
                 run_remaining = self._run_budget.reserve()
                 if run_remaining is None:
                     connection.rollback()
+                    operation._record_reservation_denial(
+                        model=model,
+                        decision="blocked_run_budget",
+                        allowance="run_call_limit",
+                        allowance_limit=self.config.run_call_limit,
+                        remaining_allowance=self._run_budget.remaining,
+                        classification=GeminiErrorClassification.RUN_BUDGET_EXHAUSTION,
+                    )
                     raise GeminiBudgetError(
                         "per-run Gemini call allowance exhausted",
                         classification=GeminiErrorClassification.RUN_BUDGET_EXHAUSTION,
@@ -599,9 +639,35 @@ class GeminiOperation:
         self.deadline_at = deadline_at
         self.attempted_calls = 0
         self.records: list[_CallRecord] = []
+        self.reservation_denials: list[dict[str, Any]] = []
         self._daily_remaining: dict[str, int] = {}
         self.current_model: str | None = None
         self.current_purpose: str | None = None
+
+    def _record_reservation_denial(
+        self,
+        *,
+        model: str,
+        decision: str,
+        allowance: str,
+        allowance_limit: int | None,
+        remaining_allowance: int,
+        classification: GeminiErrorClassification,
+    ) -> None:
+        self.current_model = model
+        denial = {
+            "model": model,
+            "purpose": self.current_purpose,
+            "attempt_number": len(self.records) + 1,
+            "decision": decision,
+            "allowance": allowance,
+            "allowance_limit": allowance_limit,
+            "remaining_allowance": max(0, remaining_allowance),
+            "classification": classification.value,
+            "timestamp": _utc_timestamp(self.policy._now()),
+            "provider_call_started": False,
+        }
+        self.reservation_denials.append(denial)
 
     def _ensure_time(self) -> None:
         if self.policy._monotonic() >= self.deadline_at:
@@ -720,15 +786,38 @@ class GeminiOperation:
             model_usage["retried"] += int(record.retry_decision.startswith("retry_after_"))
             model_usage["fallback"] += int(record.fallback_decision == "attempt")
 
+        reservation_denial = self.reservation_denials[-1] if self.reservation_denials else None
+        latest_record = self.records[-1] if self.records else None
+        diagnostic_model = (
+            reservation_denial["model"]
+            if reservation_denial is not None
+            else (latest_record.model if latest_record is not None else self.current_model)
+        )
+        diagnostic_purpose = (
+            reservation_denial["purpose"]
+            if reservation_denial is not None
+            else (latest_record.purpose if latest_record is not None else self.current_purpose)
+        )
+        diagnostic_attempt_number = (
+            reservation_denial["attempt_number"]
+            if reservation_denial is not None
+            else (latest_record.attempt_number if latest_record is not None else None)
+        )
+        diagnostic_fallback_decision = (
+            reservation_denial["decision"]
+            if reservation_denial is not None
+            else (latest_record.fallback_decision if latest_record is not None else "none")
+        )
+
         payload: dict[str, Any] = {
             "operation_id": self.operation_id,
             "request_id": self.request_id,
             "task_id": self.task_id,
-            "purpose": self.records[-1].purpose if self.records else self.current_purpose,
-            "model": self.records[-1].model if self.records else self.current_model,
-            "attempt_number": self.records[-1].attempt_number if self.records else None,
-            "retry_decision": self.records[-1].retry_decision if self.records else "none",
-            "fallback_decision": self.records[-1].fallback_decision if self.records else "none",
+            "purpose": diagnostic_purpose,
+            "model": diagnostic_model,
+            "attempt_number": diagnostic_attempt_number,
+            "retry_decision": latest_record.retry_decision if latest_record else "none",
+            "fallback_decision": diagnostic_fallback_decision,
             "timestamp": _utc_timestamp(self.policy._now()),
             "attempted_calls": self.attempted_calls,
             "successful_calls": sum(record.status == "successful" for record in self.records),
@@ -742,12 +831,16 @@ class GeminiOperation:
                 "attempted": self.attempted_calls,
                 "successful": sum(record.status == "successful" for record in self.records),
                 "failed": sum(record.status == "failed" for record in self.records),
+                "reservation_denied": len(self.reservation_denials),
             },
             "timezone_name": self.policy.config.timezone_name,
             "usage_day": self.policy.usage_day(),
             "call_records": [record.as_dict() for record in self.records],
+            "reservation_denials": list(self.reservation_denials),
             "limits": self.policy.limits_summary(),
         }
+        if reservation_denial is not None:
+            payload["reservation_denial"] = reservation_denial
         if terminal_classification is not None:
             payload["terminal_classification"] = terminal_classification.value
         if terminal_error is not None:
