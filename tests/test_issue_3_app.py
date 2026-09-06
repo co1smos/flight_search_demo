@@ -20,16 +20,451 @@ from flight_search_demo.app import (
     AeroplanFixtureAdapter,
     AwardProviderAdapter,
     DEFAULT_ADAPTER_REGISTRY,
+    GoogleGenAIRequestParser,
     NormalizedCriteria,
+    ParsedNaturalLanguageRequest,
+    ParserFailure,
+    RequestParseResult,
+    RequestParser,
+    build_confirmation_request,
     build_request_hash,
     normalize_airport,
     normalize_departure_date,
     normalize_request,
+    main,
+    run_request,
     run_structured_request,
 )
 
 
 class Issue3ApplicationTests(unittest.TestCase):
+    def test_natural_language_request_requires_confirmation_with_normalized_criteria(self) -> None:
+        class FakeParser(RequestParser):
+            def parse(
+                self,
+                *,
+                request_id: str,
+                original_text: str,
+                current_date: calendar_date,
+                timezone_name: str,
+            ) -> RequestParseResult:
+                self.call = (request_id, original_text, current_date, timezone_name)
+                return RequestParseResult(
+                    requests=[
+                        ParsedNaturalLanguageRequest(
+                            program="aeroplan",
+                            origin="JFK",
+                            destination="CDG",
+                            departure_date="2026-11-05",
+                            cabin="Business",
+                            adults=1,
+                            trip_type="one_way",
+                            maximum_points=70000,
+                        )
+                    ],
+                    program_selection="supported",
+                    diagnostics={"parser": "fake"},
+                )
+
+        parser = FakeParser()
+        request = {
+            "request_id": "req-nl-confirm",
+            "original_text": "Find one business Aeroplan seat from JFK to CDG next Thursday under 70k",
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = run_request(
+                request=request,
+                confirmation={"confirmed": False},
+                event_log_path=Path(tmpdir) / "events.jsonl",
+                parser=parser,
+                current_date=calendar_date(2026, 11, 1),
+                timezone_name="America/New_York",
+            )
+
+        self.assertEqual(
+            parser.call,
+            (
+                "req-nl-confirm",
+                request["original_text"],
+                calendar_date(2026, 11, 1),
+                "America/New_York",
+            ),
+        )
+        self.assertEqual(len(result), 1)
+        event = result[0]
+        self.assertEqual(event["status"], "CONFIRMATION_REQUIRED")
+        self.assertEqual(event["normalized_criteria"]["program"], "aeroplan")
+        self.assertEqual(event["normalized_criteria"]["departure_date"], "2026-11-05")
+        self.assertEqual(event["detail"], "explicit confirmation is required")
+
+    def test_natural_language_ambiguity_requires_clarification_before_execution(self) -> None:
+        class AmbiguousParser(RequestParser):
+            def parse(
+                self,
+                *,
+                request_id: str,
+                original_text: str,
+                current_date: calendar_date,
+                timezone_name: str,
+            ) -> RequestParseResult:
+                return RequestParseResult(
+                    requests=[],
+                    program_selection="ambiguous",
+                    clarification="'ANA flight' is ambiguous; confirm ANA Mileage Club or a flight operated by ANA.",
+                    diagnostics={"parser": "fake"},
+                )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = run_request(
+                request={
+                    "request_id": "req-nl-ambiguous",
+                    "original_text": "Find an ANA flight from JFK to CDG next Thursday in business",
+                },
+                confirmation={"confirmed": True},
+                event_log_path=Path(tmpdir) / "events.jsonl",
+                parser=AmbiguousParser(),
+                current_date=calendar_date(2026, 11, 1),
+                timezone_name="America/New_York",
+            )
+
+        self.assertEqual(len(result), 1)
+        event = result[0]
+        self.assertEqual(event["status"], "CLARIFICATION_REQUIRED")
+        self.assertIn("ambiguous", event["detail"])
+        self.assertIsNone(event["atomic_task_id"])
+
+    def test_confirmed_multi_program_request_creates_one_atomic_task_per_program(self) -> None:
+        class MultiProgramParser(RequestParser):
+            def parse(
+                self,
+                *,
+                request_id: str,
+                original_text: str,
+                current_date: calendar_date,
+                timezone_name: str,
+            ) -> RequestParseResult:
+                return RequestParseResult(
+                    requests=[
+                        ParsedNaturalLanguageRequest(
+                            program="aeroplan",
+                            origin="JFK",
+                            destination="CDG",
+                            departure_date="2026-11-05",
+                            cabin="Business",
+                            adults=1,
+                            trip_type="one_way",
+                            maximum_points=70000,
+                        ),
+                        ParsedNaturalLanguageRequest(
+                            program="ana",
+                            origin="JFK",
+                            destination="CDG",
+                            departure_date="2026-11-05",
+                            cabin="Business",
+                            adults=1,
+                            trip_type="one_way",
+                            maximum_points=70000,
+                        ),
+                    ],
+                    program_selection="supported",
+                    diagnostics={"parser": "fake"},
+                )
+
+        class RecordingAdapter(AwardProviderAdapter):
+            def __init__(self, status: str) -> None:
+                self.status = status
+                self.calls = []
+
+            def execute(
+                self, criteria: NormalizedCriteria, atomic_task_id: str
+            ) -> Dict[str, str]:
+                self.calls.append((criteria, atomic_task_id))
+                return {"status": self.status, "detail": f"{criteria.program} ran"}
+
+        aeroplan = RecordingAdapter("MATCH_FOUND")
+        ana = RecordingAdapter("NO_AWARD_AVAILABILITY")
+        adapter_registry = {"aeroplan": aeroplan, "ana": ana}
+        request = {
+            "request_id": "req-nl-multi",
+            "original_text": "Monitor Aeroplan and ANA from JFK to CDG on November 5 2026 in business for one adult under 70000 points",
+        }
+        confirmation = build_confirmation_request(
+            request=request,
+            parsed_requests=[
+                ParsedNaturalLanguageRequest(
+                    program="aeroplan",
+                    origin="JFK",
+                    destination="CDG",
+                    departure_date="2026-11-05",
+                    cabin="Business",
+                    adults=1,
+                    trip_type="one_way",
+                    maximum_points=70000,
+                ),
+                ParsedNaturalLanguageRequest(
+                    program="ana",
+                    origin="JFK",
+                    destination="CDG",
+                    departure_date="2026-11-05",
+                    cabin="Business",
+                    adults=1,
+                    trip_type="one_way",
+                    maximum_points=70000,
+                ),
+            ],
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = run_request(
+                request=request,
+                confirmation=confirmation,
+                event_log_path=Path(tmpdir) / "events.jsonl",
+                parser=MultiProgramParser(),
+                adapter_registry=adapter_registry,
+                current_date=calendar_date(2026, 11, 1),
+                timezone_name="America/New_York",
+            )
+
+        self.assertEqual([event["program"] for event in result], ["aeroplan", "ana"])
+        self.assertEqual(len(aeroplan.calls), 1)
+        self.assertEqual(len(ana.calls), 1)
+        self.assertNotEqual(result[0]["atomic_task_id"], result[1]["atomic_task_id"])
+        self.assertEqual(aeroplan.calls[0][0].maximum_points, 70000)
+        self.assertEqual(ana.calls[0][0].maximum_points, 70000)
+
+    def test_parser_failure_is_reported_and_does_not_authorize_execution(self) -> None:
+        class FailingParser(RequestParser):
+            def parse(
+                self,
+                *,
+                request_id: str,
+                original_text: str,
+                current_date: calendar_date,
+                timezone_name: str,
+            ) -> RequestParseResult:
+                raise ParserFailure("sdk parse failed", diagnostics={"parser": "fake"})
+
+        class RecordingAdapter(AwardProviderAdapter):
+            def execute(
+                self, criteria: NormalizedCriteria, atomic_task_id: str
+            ) -> Dict[str, str]:
+                raise AssertionError("execution should not occur after parser failure")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = run_request(
+                request={
+                    "request_id": "req-parse-fail",
+                    "original_text": "Search for something vague",
+                },
+                confirmation={"confirmed": True},
+                event_log_path=Path(tmpdir) / "events.jsonl",
+                parser=FailingParser(),
+                adapter_registry={"aeroplan": RecordingAdapter()},
+                current_date=calendar_date(2026, 11, 1),
+            )
+
+            diagnostic = json.loads((Path(tmpdir) / "events.diagnostics.jsonl").read_text())
+
+        self.assertEqual(result[0]["status"], "PARSER_FAILED")
+        self.assertEqual(result[0]["diagnostic_id"], diagnostic["diagnostic_id"])
+        self.assertEqual(diagnostic["metadata"]["parser"], "fake")
+
+    def test_empty_parse_result_is_reported_as_parser_failure(self) -> None:
+        class EmptyParser(RequestParser):
+            def parse(
+                self,
+                *,
+                request_id: str,
+                original_text: str,
+                current_date: calendar_date,
+                timezone_name: str,
+            ) -> RequestParseResult:
+                return RequestParseResult(
+                    requests=[], program_selection="omitted", diagnostics={"parser": "fake"}
+                )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = run_request(
+                request={
+                    "request_id": "req-empty-parse",
+                    "original_text": "Find me something",
+                },
+                confirmation={"confirmed": True},
+                event_log_path=Path(tmpdir) / "events.jsonl",
+                parser=EmptyParser(),
+                current_date=calendar_date(2026, 11, 1),
+            )
+
+        self.assertEqual(result[0]["status"], "PARSER_FAILED")
+        self.assertIn("no executable request", result[0]["detail"])
+
+    def test_cli_natural_language_request_uses_configured_timezone(self) -> None:
+        class TimezoneParser(RequestParser):
+            def parse(
+                self,
+                *,
+                request_id: str,
+                original_text: str,
+                current_date: calendar_date,
+                timezone_name: str,
+            ) -> RequestParseResult:
+                self.timezone_name = timezone_name
+                return RequestParseResult(
+                    requests=[
+                        ParsedNaturalLanguageRequest(
+                            program="aeroplan",
+                            origin="JFK",
+                            destination="CDG",
+                            departure_date="2026-11-05",
+                            cabin="Business",
+                            adults=1,
+                            trip_type="one_way",
+                            maximum_points=70000,
+                        )
+                    ],
+                    program_selection="supported",
+                )
+
+        parser = TimezoneParser()
+        request = {
+            "request_id": "req-main-nl",
+            "original_text": "Find one Aeroplan business seat from JFK to CDG next Thursday under 70k",
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            directory = Path(tmpdir)
+            request_path = directory / "request.json"
+            confirmation_path = directory / "confirmation.json"
+            event_log_path = directory / "events.jsonl"
+            request_path.write_text(json.dumps(request), encoding="utf-8")
+            confirmation_path.write_text(json.dumps({"confirmed": False}), encoding="utf-8")
+            with patch.object(
+                sys,
+                "argv",
+                [
+                    "flight_search_demo.app",
+                    "--request",
+                    str(request_path),
+                    "--confirmation",
+                    str(confirmation_path),
+                    "--event-log",
+                    str(event_log_path),
+                    "--current-date",
+                    "2026-11-01",
+                    "--timezone",
+                    "America/New_York",
+                ],
+            ), patch(
+                "flight_search_demo.app.build_default_request_parser",
+                return_value=parser,
+            ):
+                exit_code = main()
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(parser.timezone_name, "America/New_York")
+
+    def test_material_edit_invalidates_natural_language_confirmation(self) -> None:
+        class Parser(RequestParser):
+            def parse(
+                self,
+                *,
+                request_id: str,
+                original_text: str,
+                current_date: calendar_date,
+                timezone_name: str,
+            ) -> RequestParseResult:
+                return RequestParseResult(
+                    requests=[
+                        ParsedNaturalLanguageRequest(
+                            program="aeroplan",
+                            origin="JFK",
+                            destination="CDG",
+                            departure_date="2026-11-05",
+                            cabin="First",
+                            adults=1,
+                            trip_type="one_way",
+                            maximum_points=70000,
+                        )
+                    ],
+                    program_selection="supported",
+                )
+
+        request = {
+            "request_id": "req-invalidate",
+            "original_text": "Find one Aeroplan business seat from JFK to CDG next Thursday under 70k",
+        }
+        stale_confirmation = build_confirmation_request(
+            request=request,
+            parsed_requests=[
+                ParsedNaturalLanguageRequest(
+                    program="aeroplan",
+                    origin="JFK",
+                    destination="CDG",
+                    departure_date="2026-11-05",
+                    cabin="Business",
+                    adults=1,
+                    trip_type="one_way",
+                    maximum_points=70000,
+                )
+            ],
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = run_request(
+                request=request,
+                confirmation=stale_confirmation,
+                event_log_path=Path(tmpdir) / "events.jsonl",
+                parser=Parser(),
+                current_date=calendar_date(2026, 11, 1),
+            )
+
+        self.assertEqual(result[0]["status"], "CLARIFICATION_REQUIRED")
+        self.assertNotIn("request_hash", result[0])
+
+    def test_structured_json_path_bypasses_parser_calls(self) -> None:
+        class RaisingParser(RequestParser):
+            def parse(
+                self,
+                *,
+                request_id: str,
+                original_text: str,
+                current_date: calendar_date,
+                timezone_name: str,
+            ) -> RequestParseResult:
+                raise AssertionError("structured JSON path must not call the parser")
+
+        request = {
+            "request_id": "req-structured-no-model",
+            "original_text": "Aeroplan JFK to CDG on 2026-11-05 in business under 70000 points",
+            "program": "aeroplan",
+            "origin": "JFK",
+            "destination": "CDG",
+            "departure_date": "2026-11-05",
+            "cabin": "business",
+            "adults": 1,
+            "trip_type": "one_way",
+            "maximum_points": 70000,
+        }
+        confirmation = {
+            "request_id": request["request_id"],
+            "request_hash": build_request_hash(
+                request["request_id"], request["original_text"], normalize_request(request)
+            ),
+            "confirmed": True,
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = run_request(
+                request=request,
+                confirmation=confirmation,
+                event_log_path=Path(tmpdir) / "events.jsonl",
+                parser=RaisingParser(),
+            )
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["status"], "MATCH_FOUND")
+
     def test_run_uses_injected_current_date_and_utc_clock(self) -> None:
         request = {
             "request_id": "req-clock",
@@ -362,10 +797,10 @@ class Issue3ApplicationTests(unittest.TestCase):
     def test_cli_domain_failure_is_reported_recorded_and_exits_nonzero(self) -> None:
         request = {
             "request_id": "req-cli-failure",
-            "original_text": "Use an unsupported program",
-            "program": "ana",
+            "original_text": "Use an unsupported airport",
+            "program": "aeroplan",
             "origin": "JFK",
-            "destination": "CDG",
+            "destination": "QQQ",
             "departure_date": "2026-11-05",
             "cabin": "business",
             "adults": 1,
@@ -531,7 +966,6 @@ class Issue3ApplicationTests(unittest.TestCase):
 
     def test_unsupported_structured_inputs_produce_explicit_non_success_outcomes(self) -> None:
         invalid_requests = [
-            {"program": "ana"},
             {"origin": "New York"},
             {"destination": "C"},
             {"departure_date": "11/05/2026"},
