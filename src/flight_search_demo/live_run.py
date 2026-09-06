@@ -22,10 +22,13 @@ from .gemini_policy import (
     GeminiErrorClassification,
     GeminiPolicyConfig,
     GeminiPolicyError,
+    redact_sensitive_text,
+    validate_model_configuration,
 )
 from .models import BrowserStackConfig, ControlledPageResult
 from .spike import (
     RunSummary,
+    BrowserTaskOutcome,
     build_session_endpoints,
     build_takeover_gate,
     discover_debugger_cdp_url,
@@ -63,6 +66,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def build_agent_llms(*, primary_model: str, fallback_model: str, api_key: str):
+    validate_model_configuration(primary_model, fallback_model)
     from google.genai import types
 
     http_options = types.HttpOptions(
@@ -129,6 +133,56 @@ def classify_allowlist_rejection(exc: Exception) -> str:
     raise exc
 
 
+def classify_deterministic_browser_failure(exc: Exception) -> str:
+    if isinstance(exc, ValueError) and "blocked by security policy" in str(exc):
+        return "domain_allowlist_rejection"
+    if any(
+        marker in str(exc).lower()
+        for marker in ("captcha", "challenge", "verification", "access denied", "bot block")
+    ):
+        return "security_condition"
+    raise exc
+
+
+def _browser_outcome(
+    *,
+    operation,
+    status: str,
+    classification: str,
+    detail: str,
+    diagnostic_sink: Callable[[dict[str, Any]], None] | None,
+) -> BrowserTaskOutcome:
+    provenance = operation.diagnostics(include_daily_reads=False)
+    provenance["classification"] = classification
+    outcome = BrowserTaskOutcome(
+        status=status,
+        classification=classification,
+        detail=redact_sensitive_text(detail),
+        provenance=provenance,
+    )
+    if diagnostic_sink is not None:
+        diagnostic_sink(outcome.provenance)
+    return outcome
+
+
+def validate_expected_result(
+    result: ControlledPageResult,
+    *,
+    marker: str,
+    controlled_page_url: str,
+) -> None:
+    expected_origin = urlparse(controlled_page_url)._replace(
+        path="", params="", query="", fragment=""
+    ).geturl()
+    if result.marker_value != marker or not result.marker_persisted:
+        raise RuntimeError("result marker did not match the expected persisted marker")
+    result_origin = urlparse(result.current_url)._replace(
+        path="", params="", query="", fragment=""
+    ).geturl()
+    if result_origin != expected_origin:
+        raise RuntimeError("result left the controlled origin")
+
+
 def assert_expected_results(
     initial_result: ControlledPageResult,
     persisted_result: ControlledPageResult,
@@ -136,13 +190,18 @@ def assert_expected_results(
     marker: str,
     controlled_page_url: str,
 ) -> None:
-    expected_origin = urlparse(controlled_page_url)._replace(path="", params="", query="", fragment="").geturl()
     for name, result in (("initial", initial_result), ("persisted", persisted_result)):
-        if result.marker_value != marker or not result.marker_persisted:
-            raise RuntimeError(f"{name} marker did not match the expected persisted marker")
-        result_origin = urlparse(result.current_url)._replace(path="", params="", query="", fragment="").geturl()
-        if result_origin != expected_origin:
-            raise RuntimeError(f"{name} result left the controlled origin")
+        try:
+            validate_expected_result(
+                result,
+                marker=marker,
+                controlled_page_url=controlled_page_url,
+            )
+        except RuntimeError as exc:
+            detail = str(exc)
+            if "marker" in detail:
+                raise RuntimeError(f"{name} marker did not match the expected persisted marker") from exc
+            raise RuntimeError(f"{name} result left the controlled origin") from exc
 
 
 async def run_agent_task(
@@ -150,9 +209,29 @@ async def run_agent_task(
     task: str,
     config: BrowserStackConfig,
     cdp_url: str,
-    policy: GeminiCallPolicy | None = None,
+    policy: GeminiCallPolicy,
     diagnostic_sink: Callable[[dict[str, Any]], None] | None = None,
-) -> ControlledPageResult:
+    expected_marker: str | None = None,
+    expected_controlled_page_url: str | None = None,
+) -> ControlledPageResult | BrowserTaskOutcome:
+    if policy is None:
+        raise ValueError("browser execution requires a caller-owned Gemini policy")
+    validate_model_configuration(config.gemini_model, config.fallback_gemini_model)
+    operation = policy.operation(
+        f"browser-agent:{hashlib.sha256(task.encode('utf-8')).hexdigest()[:12]}",
+        task_id=hashlib.sha256(task.encode("utf-8")).hexdigest()[:12],
+        deadline_seconds=config.operation_deadline_seconds,
+    )
+    try:
+        assert_private_url(cdp_url)
+    except ValueError as exc:
+        return _browser_outcome(
+            operation=operation,
+            status="BROWSER_SECURITY_REJECTED",
+            classification="private_cdp_endpoint_rejection",
+            detail=str(exc),
+            diagnostic_sink=diagnostic_sink,
+        )
     browser = BrowserSession(
         cdp_url=cdp_url,
         is_local=False,
@@ -164,21 +243,6 @@ async def run_agent_task(
         primary_model=config.gemini_model,
         fallback_model=config.fallback_gemini_model,
         api_key=config.google_api_key or "",
-    )
-    if policy is None:
-        policy = GeminiCallPolicy(
-            db_path=config.gemini_usage_db_path,
-            config=GeminiPolicyConfig(
-                run_call_limit=config.gemini_run_call_limit,
-                daily_call_limits=config.gemini_daily_call_limits,
-                timezone_name=config.gemini_timezone_name,
-                operation_deadline_seconds=config.operation_deadline_seconds,
-            ),
-        )
-    operation = policy.operation(
-        f"browser-agent:{hashlib.sha256(task.encode('utf-8')).hexdigest()[:12]}",
-        task_id=hashlib.sha256(task.encode("utf-8")).hexdigest()[:12],
-        deadline_seconds=config.operation_deadline_seconds,
     )
     policy_llm = PolicyBoundChatGoogle(
         primary=primary_llm,
@@ -208,11 +272,41 @@ async def run_agent_task(
                 classification=GeminiErrorClassification.TIMEOUT_CANCELLATION,
                 diagnostics=await operation.diagnostics_async(deadline_seconds=0.01),
             ) from exc
+        except Exception as exc:
+            try:
+                classification = classify_deterministic_browser_failure(exc)
+            except Exception:
+                raise
+            return _browser_outcome(
+                operation=operation,
+                status="BROWSER_SECURITY_REJECTED",
+                classification=classification,
+                detail=str(exc),
+                diagnostic_sink=diagnostic_sink,
+            )
         if policy_llm.last_policy_error is not None:
             raise policy_llm.last_policy_error
         if history.structured_output is None:
             raise RuntimeError("browser-use returned no structured output")
-        return history.structured_output
+        result = history.structured_output
+        if expected_marker is not None or expected_controlled_page_url is not None:
+            if expected_marker is None or expected_controlled_page_url is None:
+                raise ValueError("expected marker and controlled URL must be provided together")
+            try:
+                validate_expected_result(
+                    result,
+                    marker=expected_marker,
+                    controlled_page_url=expected_controlled_page_url,
+                )
+            except RuntimeError as exc:
+                return _browser_outcome(
+                    operation=operation,
+                    status="BROWSER_RESULT_INVALID",
+                    classification="final_result_validation",
+                    detail=str(exc),
+                    diagnostic_sink=diagnostic_sink,
+                )
+        return result
     finally:
         secure_artifact_file(config.storage_state_path)
         secure_artifact_file(config.storage_state_path.with_suffix(config.storage_state_path.suffix + ".bak"))
@@ -223,6 +317,7 @@ async def run_offsite_attempt(
     config: BrowserStackConfig,
     cdp_url: str,
 ) -> str:
+    assert_private_url(cdp_url)
     browser = BrowserSession(
         cdp_url=cdp_url,
         is_local=False,
@@ -254,9 +349,13 @@ async def run_in_fresh_session(
     client: Steel,
     config: BrowserStackConfig,
     task: str,
-    policy: GeminiCallPolicy | None = None,
+    policy: GeminiCallPolicy,
     diagnostic_sink: Callable[[dict[str, Any]], None] | None = None,
-) -> ControlledPageResult:
+    expected_marker: str | None = None,
+    expected_controlled_page_url: str | None = None,
+) -> ControlledPageResult | BrowserTaskOutcome:
+    if policy is None:
+        raise ValueError("browser execution requires a caller-owned Gemini policy")
     session = client.sessions.create(headless=True)
     endpoints = build_session_endpoints(session)
     try:
@@ -267,6 +366,8 @@ async def run_in_fresh_session(
             cdp_url=cdp_url,
             policy=policy,
             diagnostic_sink=diagnostic_sink,
+            expected_marker=expected_marker,
+            expected_controlled_page_url=expected_controlled_page_url,
         )
     finally:
         client.sessions.release(endpoints.session_id)
@@ -287,6 +388,7 @@ async def run_offsite_in_fresh_session(
 
 
 async def run_spike(args: argparse.Namespace) -> RunSummary:
+    validate_model_configuration(args.gemini_model, args.fallback_gemini_model)
     load_dotenv()
     google_api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
     if not google_api_key:
@@ -335,6 +437,8 @@ async def run_spike(args: argparse.Namespace) -> RunSummary:
                 config=config,
                 policy=gemini_policy,
                 diagnostic_sink=gemini_operations.append,
+                expected_marker=args.marker,
+                expected_controlled_page_url=config.controlled_page_url,
                 task=(
                     f"Open {config.controlled_page_url}. Enter the marker value '{args.marker}' "
                     "into the Marker input, click 'Save marker to this browser profile', and return "
@@ -347,6 +451,8 @@ async def run_spike(args: argparse.Namespace) -> RunSummary:
                 config=config,
                 policy=gemini_policy,
                 diagnostic_sink=gemini_operations.append,
+                expected_marker=args.marker,
+                expected_controlled_page_url=config.controlled_page_url,
                 task=(
                     f"Open {config.controlled_page_url}. Do not change the page. Read the visible page title, "
                     "the persisted marker value, whether a marker is persisted, and the current URL."
@@ -384,12 +490,72 @@ async def run_spike(args: argparse.Namespace) -> RunSummary:
                 status=status,
                 gemini_outcome=outcome,
             )
-        assert_expected_results(
-            initial_result,
-            persisted_result,
-            marker=args.marker,
-            controlled_page_url=config.controlled_page_url,
-        )
+        if isinstance(initial_result, BrowserTaskOutcome):
+            return RunSummary(
+                initial_result=None,
+                persisted_result=None,
+                offsite_rejection=None,
+                handoff=None,
+                gemini_policy={
+                    "limits": gemini_policy.limits_summary(),
+                    "operations": gemini_operations,
+                },
+                status=initial_result.status,
+                browser_outcome=initial_result.as_dict(),
+            )
+        if isinstance(persisted_result, BrowserTaskOutcome):
+            return RunSummary(
+                initial_result=initial_result,
+                persisted_result=None,
+                offsite_rejection=None,
+                handoff=None,
+                gemini_policy={
+                    "limits": gemini_policy.limits_summary(),
+                    "operations": gemini_operations,
+                },
+                status=persisted_result.status,
+                browser_outcome=persisted_result.as_dict(),
+            )
+        try:
+            assert_expected_results(
+                initial_result,
+                persisted_result,
+                marker=args.marker,
+                controlled_page_url=config.controlled_page_url,
+            )
+        except RuntimeError as exc:
+            outcome = BrowserTaskOutcome(
+                status="BROWSER_RESULT_INVALID",
+                classification="final_result_validation",
+                detail=redact_sensitive_text(str(exc)),
+                provenance={
+                    "attempted_calls": sum(
+                        operation.get("attempted_calls", 0)
+                        for operation in gemini_operations
+                    ),
+                    "remaining_run_calls": max(
+                        0,
+                        gemini_policy.config.run_call_limit
+                        - sum(
+                            operation.get("attempted_calls", 0)
+                            for operation in gemini_operations
+                        ),
+                    ),
+                    "classification": "final_result_validation",
+                },
+            )
+            return RunSummary(
+                initial_result=initial_result,
+                persisted_result=persisted_result,
+                offsite_rejection=None,
+                handoff=None,
+                gemini_policy={
+                    "limits": gemini_policy.limits_summary(),
+                    "operations": gemini_operations,
+                },
+                status=outcome.status,
+                browser_outcome=outcome.as_dict(),
+            )
 
         handoff_session = client.sessions.create(headless=True)
         handoff_endpoints = build_session_endpoints(handoff_session)
@@ -427,6 +593,18 @@ async def run_spike(args: argparse.Namespace) -> RunSummary:
                 "limits": gemini_policy.limits_summary(),
                 "operations": gemini_operations,
             },
+            browser_outcome={
+                "status": "BROWSER_SECURITY_CHECKED",
+                "classification": "domain_allowlist_rejection",
+                "detail": "offsite navigation was rejected by the browser allowlist",
+                "provenance": {
+                    "offsite_rejection": offsite_rejection,
+                    "provider_calls": sum(
+                        operation.get("attempted_calls", 0)
+                        for operation in gemini_operations
+                    ),
+                },
+            },
         )
     finally:
         if server is not None:
@@ -461,6 +639,7 @@ def main() -> None:
                     else None
                 ),
                 "gemini_outcome": summary.gemini_outcome,
+                "browser_outcome": summary.browser_outcome,
                 "gemini_policy": summary.gemini_policy,
             },
             indent=2,

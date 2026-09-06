@@ -22,6 +22,7 @@ from .gemini_policy import (
     MalformedModelOutputError,
     redact_sensitive,
     redact_sensitive_text,
+    validate_model_configuration,
 )
 
 SUPPORTED_CABINS = {
@@ -1512,6 +1513,9 @@ def build_default_request_parser(
     policy: GeminiCallPolicy | None = None,
     fallback_model: str | None = None,
 ) -> GoogleGenAIRequestParser:
+    primary_model = model or os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+    fallback = fallback_model or os.environ.get("FALLBACK_GEMINI_MODEL", "gemini-3.6-flash")
+    validate_model_configuration(primary_model, fallback)
     try:
         from google import genai
     except ImportError as exc:
@@ -1523,8 +1527,6 @@ def build_default_request_parser(
             retry_options=types.HttpRetryOptions(attempts=1),
         )
     )
-    primary_model = model or os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-    fallback = fallback_model or os.environ.get("FALLBACK_GEMINI_MODEL", "gemini-3.6-flash")
     return GoogleGenAIRequestParser(
         client=client,
         model=primary_model,

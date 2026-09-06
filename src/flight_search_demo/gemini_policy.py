@@ -73,6 +73,13 @@ DEFAULT_DAILY_CALL_LIMITS = {
 }
 
 
+def validate_model_configuration(primary_model: str, fallback_model: str) -> None:
+    if not primary_model or not fallback_model:
+        raise ValueError("primary and fallback Gemini models are required")
+    if primary_model == fallback_model:
+        raise ValueError("primary and fallback Gemini models must be different")
+
+
 @dataclass(frozen=True)
 class GeminiPolicyConfig:
     run_call_limit: int = 3
@@ -122,6 +129,12 @@ def _utc_timestamp(value: datetime) -> str:
 
 def redact_sensitive_text(value: str) -> str:
     """Remove credentials, session material, query values, and cookie values."""
+
+    value = re.sub(
+        r"(?im)(^\s*(?:set-)?cookie\s*:\s*)[^\r\n]*",
+        r"\1[REDACTED]",
+        value,
+    )
 
     value = re.sub(
         r"(?i)\bauthorization\s*:\s*(?:bearer\s+)?[^\s,;]+",
@@ -336,9 +349,11 @@ class GeminiCallPolicy:
                 """
             )
 
-    def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.db_path, timeout=30)
-        connection.execute("PRAGMA busy_timeout = 30000")
+    def _connect(self, *, timeout_seconds: float = 30.0) -> sqlite3.Connection:
+        bounded_timeout = max(0.001, timeout_seconds)
+        connection = sqlite3.connect(self.db_path, timeout=bounded_timeout)
+        busy_timeout_ms = max(1, int(bounded_timeout * 1000))
+        connection.execute(f"PRAGMA busy_timeout = {busy_timeout_ms}")
         return connection
 
     def _now(self) -> datetime:
@@ -377,74 +392,103 @@ class GeminiCallPolicy:
                 ),
             )
 
+        remaining = None if deadline_at is None else deadline_at - self._monotonic()
+        if remaining is not None and remaining <= 0:
+            raise GeminiCallFailure(
+                "Gemini operation deadline exhausted before reservation",
+                classification=GeminiErrorClassification.TIMEOUT_CANCELLATION,
+                diagnostics=operation.diagnostics(
+                    terminal_classification=GeminiErrorClassification.TIMEOUT_CANCELLATION,
+                    terminal_error="operation deadline exhausted before reservation",
+                    include_daily_reads=False,
+                ),
+            )
+
         usage_day = self.usage_day()
-        with self._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            if deadline_at is not None and self._monotonic() >= deadline_at:
-                connection.rollback()
-                raise GeminiCallFailure(
-                    "Gemini operation deadline exhausted before reservation",
-                    classification=GeminiErrorClassification.TIMEOUT_CANCELLATION,
-                    diagnostics=operation.diagnostics(
-                        terminal_classification=GeminiErrorClassification.TIMEOUT_CANCELLATION,
-                        terminal_error="operation deadline exhausted before reservation",
-                    ),
-                )
-            row = connection.execute(
-                "SELECT attempted_calls FROM gemini_daily_usage WHERE usage_day=? AND timezone_name=? AND model=?",
-                (usage_day, self.config.timezone_name, model),
-            ).fetchone()
-            daily_used = int(row[0]) if row else 0
-            if daily_used >= daily_limit:
-                connection.rollback()
-                raise GeminiBudgetError(
-                    f"daily Gemini allowance exhausted for model {model}",
-                    classification=GeminiErrorClassification.DAILY_QUOTA_EXHAUSTION,
-                    diagnostics=operation.diagnostics(
-                        terminal_classification=GeminiErrorClassification.DAILY_QUOTA_EXHAUSTION,
-                        terminal_error=f"daily allowance exhausted for model {model}",
-                    ),
-                )
-            run_remaining = self._run_budget.reserve()
-            if run_remaining is None:
-                connection.rollback()
-                raise GeminiBudgetError(
-                    "per-run Gemini call allowance exhausted",
-                    classification=GeminiErrorClassification.RUN_BUDGET_EXHAUSTION,
-                    diagnostics=operation.diagnostics(
-                        terminal_classification=GeminiErrorClassification.RUN_BUDGET_EXHAUSTION,
-                        terminal_error="per-run Gemini call allowance exhausted",
-                    ),
-                )
-            if row:
-                connection.execute(
-                    "UPDATE gemini_daily_usage SET attempted_calls=attempted_calls+1 WHERE usage_day=? AND timezone_name=? AND model=?",
-                    (usage_day, self.config.timezone_name, model),
-                )
-            else:
-                connection.execute(
-                    "INSERT INTO gemini_daily_usage(usage_day, timezone_name, model, attempted_calls) VALUES (?, ?, ?, 1)",
-                    (usage_day, self.config.timezone_name, model),
-                )
-            try:
+        try:
+            with self._connect(
+                timeout_seconds=30.0 if remaining is None else remaining
+            ) as connection:
+                connection.execute("BEGIN IMMEDIATE")
                 if deadline_at is not None and self._monotonic() >= deadline_at:
                     connection.rollback()
-                    self._run_budget.release()
                     raise GeminiCallFailure(
                         "Gemini operation deadline exhausted before reservation",
                         classification=GeminiErrorClassification.TIMEOUT_CANCELLATION,
                         diagnostics=operation.diagnostics(
                             terminal_classification=GeminiErrorClassification.TIMEOUT_CANCELLATION,
                             terminal_error="operation deadline exhausted before reservation",
+                            include_daily_reads=False,
                         ),
                     )
-                connection.commit()
-            except BaseException:
-                if connection.in_transaction:
+                row = connection.execute(
+                    "SELECT attempted_calls FROM gemini_daily_usage WHERE usage_day=? AND timezone_name=? AND model=?",
+                    (usage_day, self.config.timezone_name, model),
+                ).fetchone()
+                daily_used = int(row[0]) if row else 0
+                if daily_used >= daily_limit:
                     connection.rollback()
-                if run_remaining is not None:
+                    raise GeminiBudgetError(
+                        f"daily Gemini allowance exhausted for model {model}",
+                        classification=GeminiErrorClassification.DAILY_QUOTA_EXHAUSTION,
+                        diagnostics=operation.diagnostics(
+                            terminal_classification=GeminiErrorClassification.DAILY_QUOTA_EXHAUSTION,
+                            terminal_error=f"daily allowance exhausted for model {model}",
+                        ),
+                    )
+                run_remaining = self._run_budget.reserve()
+                if run_remaining is None:
+                    connection.rollback()
+                    raise GeminiBudgetError(
+                        "per-run Gemini call allowance exhausted",
+                        classification=GeminiErrorClassification.RUN_BUDGET_EXHAUSTION,
+                        diagnostics=operation.diagnostics(
+                            terminal_classification=GeminiErrorClassification.RUN_BUDGET_EXHAUSTION,
+                            terminal_error="per-run Gemini call allowance exhausted",
+                        ),
+                    )
+                if row:
+                    connection.execute(
+                        "UPDATE gemini_daily_usage SET attempted_calls=attempted_calls+1 WHERE usage_day=? AND timezone_name=? AND model=?",
+                        (usage_day, self.config.timezone_name, model),
+                    )
+                else:
+                    connection.execute(
+                        "INSERT INTO gemini_daily_usage(usage_day, timezone_name, model, attempted_calls) VALUES (?, ?, ?, 1)",
+                        (usage_day, self.config.timezone_name, model),
+                    )
+                try:
+                    if deadline_at is not None and self._monotonic() >= deadline_at:
+                        connection.rollback()
+                        raise GeminiCallFailure(
+                            "Gemini operation deadline exhausted before reservation",
+                            classification=GeminiErrorClassification.TIMEOUT_CANCELLATION,
+                            diagnostics=operation.diagnostics(
+                                terminal_classification=GeminiErrorClassification.TIMEOUT_CANCELLATION,
+                                terminal_error="operation deadline exhausted before reservation",
+                                include_daily_reads=False,
+                            ),
+                        )
+                    connection.commit()
+                except BaseException:
+                    if connection.in_transaction:
+                        connection.rollback()
                     self._run_budget.release()
-                raise
+                    raise
+        except sqlite3.OperationalError as exc:
+            if "locked" in str(exc).lower() or (
+                deadline_at is not None and self._monotonic() >= deadline_at
+            ):
+                raise GeminiCallFailure(
+                    "Gemini operation deadline exhausted while reserving call budget",
+                    classification=GeminiErrorClassification.TIMEOUT_CANCELLATION,
+                    diagnostics=operation.diagnostics(
+                        terminal_classification=GeminiErrorClassification.TIMEOUT_CANCELLATION,
+                        terminal_error="operation deadline exhausted while reserving call budget",
+                        include_daily_reads=False,
+                    ),
+                ) from exc
+            raise
         operation.attempted_calls += 1
         operation._daily_remaining[model] = daily_limit - daily_used - 1
         return _Reservation(
@@ -698,7 +742,11 @@ class GeminiOperation:
         primary_attempts = 0
         while attempts < self.policy.config.max_attempts:
             self._ensure_time()
-            reservation = self.policy._reserve(self, current_model)
+            reservation = self.policy._reserve(
+                self,
+                current_model,
+                deadline_at=self.deadline_at,
+            )
             attempts += 1
             if current_model == model:
                 primary_attempts += 1

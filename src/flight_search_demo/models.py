@@ -43,6 +43,10 @@ class BrowserStackConfig:
     )
     operation_deadline_seconds: float = 60.0
 
+    def __post_init__(self) -> None:
+        if self.gemini_model == self.fallback_gemini_model:
+            raise ValueError("primary and fallback Gemini models must be different")
+
     def resolved_allowed_domains(self) -> List[str]:
         if self.allowed_domains:
             return list(self.allowed_domains)

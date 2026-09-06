@@ -13,11 +13,14 @@ from flight_search_demo.live_run import (
     assert_expected_results,
     build_agent_llms,
     classify_allowlist_rejection,
+    run_agent_task,
     run_offsite_attempt,
     run_spike,
 )
 from flight_search_demo.models import ControlledPageResult
+from flight_search_demo.gemini_policy import GeminiCallPolicy, GeminiPolicyConfig
 from flight_search_demo.spike import (
+    BrowserTaskOutcome,
     build_cdp_url,
     build_debugger_cdp_url,
     build_session_endpoints,
@@ -138,49 +141,137 @@ class SpikeContractTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "controlled origin"):
             assert_expected_results(good, wrong_origin, marker="expected-marker", controlled_page_url=expected_url)
 
-    def test_deterministic_security_and_result_proofs_make_zero_model_calls(self) -> None:
+    def test_browser_runner_requires_caller_owned_policy_before_client_construction(self) -> None:
+        config = BrowserStackConfig(
+            steel_base_url="http://127.0.0.1:3000",
+            controlled_page_url="http://controlled.test/",
+            storage_state_path=Path(".artifacts/owned-policy/state.json"),
+            google_api_key="offline-test",
+        )
+        with patch("flight_search_demo.live_run.BrowserSession") as browser, patch(
+            "flight_search_demo.live_run.build_agent_llms"
+        ) as build_llms:
+            with self.assertRaisesRegex(ValueError, "caller-owned Gemini policy"):
+                asyncio.run(
+                    run_agent_task(
+                        task="deterministic check",
+                        config=config,
+                        cdp_url="ws://127.0.0.1:9223/devtools/browser/test",
+                        policy=None,
+                    )
+                )
+        browser.assert_not_called()
+        build_llms.assert_not_called()
+
+    def test_equal_primary_and_fallback_models_are_rejected_at_configuration_boundary(self) -> None:
+        with self.assertRaisesRegex(ValueError, "different"):
+            BrowserStackConfig(
+                steel_base_url="http://127.0.0.1:3000",
+                controlled_page_url="http://controlled.test/",
+                storage_state_path=Path(".artifacts/model-config/state.json"),
+                gemini_model="same-model",
+                fallback_gemini_model="same-model",
+            )
+
+        args = self.make_run_args(
+            gemini_model="same-model",
+            fallback_gemini_model="same-model",
+        )
+        with patch("flight_search_demo.live_run.Steel") as steel:
+            with self.assertRaisesRegex(ValueError, "different"):
+                asyncio.run(run_spike(args))
+        steel.assert_not_called()
+
+    def test_deterministic_browser_paths_return_structured_zero_call_outcomes(self) -> None:
         calls = []
 
-        class ZeroBudgetRecordingBrowser:
-            async def start(self) -> None:
-                return None
+        class RecordingLLM:
+            model = "offline-primary"
 
+            async def ainvoke(self, *args, **kwargs):
+                calls.append((args, kwargs))
+                raise AssertionError("deterministic browser paths must not call the model")
+
+        class RecordingBrowser:
             async def navigate_to(self, url: str) -> None:
                 if "example.com" in url:
                     raise ValueError("Navigation to https://example.com/ blocked by security policy")
 
-            async def stop(self) -> None:
-                return None
+        class RecordingAgent:
+            def __init__(self, *, task, llm, browser_session, **kwargs):
+                self.task = task
+                self.llm = llm
+                self.browser_session = browser_session
+
+            async def run(self, max_steps):
+                if self.task == "domain":
+                    await self.browser_session.navigate_to("https://example.com/")
+                if self.task == "security":
+                    raise RuntimeError("CAPTCHA challenge requires human intervention")
+                return SimpleNamespace(
+                    structured_output=ControlledPageResult(
+                        page_title="Controlled Browser Stack Test",
+                        marker_value="wrong-marker" if self.task == "result" else "expected-marker",
+                        marker_persisted=True,
+                        current_url="http://controlled.test/",
+                    )
+                )
 
         config = BrowserStackConfig(
             steel_base_url="http://127.0.0.1:3000",
-            controlled_page_url="http://127.0.0.1:8765/",
+            controlled_page_url="http://controlled.test/",
             storage_state_path=Path(".artifacts/zero-budget/state.json"),
-            gemini_run_call_limit=0,
+            google_api_key="offline-test",
         )
-        good = ControlledPageResult(
-            page_title="Controlled Browser Stack Test",
-            marker_value="expected-marker",
-            marker_persisted=True,
-            current_url=config.controlled_page_url,
-        )
-        with patch(
-            "flight_search_demo.live_run.BrowserSession",
-            return_value=ZeroBudgetRecordingBrowser(),
-        ):
-            rejection = asyncio.run(
-                run_offsite_attempt(config=config, cdp_url="ws://127.0.0.1:9223/devtools/browser/test")
-            )
 
-        self.assertEqual(rejection, "ValueError")
-        self.assertEqual(calls, [])
-        self.assertEqual(debugger_metadata_url(config.steel_base_url), "http://127.0.0.1:9223/json/version")
-        assert_expected_results(
-            good,
-            good,
-            marker="expected-marker",
-            controlled_page_url=config.controlled_page_url,
+        def build_recording_llms(**kwargs):
+            return RecordingLLM(), RecordingLLM()
+
+        def run(task: str, cdp_url: str):
+            with tempfile.TemporaryDirectory() as tmpdir:
+                policy = GeminiCallPolicy(
+                    db_path=Path(tmpdir) / "usage.sqlite3",
+                    config=GeminiPolicyConfig(
+                        run_call_limit=0,
+                        daily_call_limits={"offline-primary": 1, "offline-fallback": 1},
+                    )
+                )
+                with patch("flight_search_demo.live_run.BrowserSession", return_value=RecordingBrowser()), patch(
+                    "flight_search_demo.live_run.build_agent_llms", side_effect=build_recording_llms
+                ), patch("flight_search_demo.live_run.Agent", RecordingAgent):
+                    return asyncio.run(
+                        run_agent_task(
+                            task=task,
+                            config=config,
+                            cdp_url=cdp_url,
+                            policy=policy,
+                            expected_marker="expected-marker",
+                            expected_controlled_page_url=config.controlled_page_url,
+                        )
+                    )
+
+        outcomes = [
+            run("domain", "ws://127.0.0.1:9223/devtools/browser/test"),
+            run("security", "ws://127.0.0.1:9223/devtools/browser/test"),
+            run("result", "ws://127.0.0.1:9223/devtools/browser/test"),
+            run("result", "ws://8.8.8.8:9223/devtools/browser/test"),
+        ]
+
+        self.assertTrue(all(isinstance(outcome, BrowserTaskOutcome) for outcome in outcomes))
+        self.assertEqual(
+            [outcome.classification for outcome in outcomes],
+            [
+                "domain_allowlist_rejection",
+                "security_condition",
+                "final_result_validation",
+                "private_cdp_endpoint_rejection",
+            ],
         )
+        self.assertEqual(calls, [])
+        for outcome in outcomes:
+            self.assertEqual(outcome.provenance["attempted_calls"], 0)
+            self.assertEqual(outcome.provenance["remaining_run_calls"], 0)
+            self.assertTrue(outcome.status)
 
     def test_steel_control_and_debugger_surfaces_must_be_private(self) -> None:
         from flight_search_demo.spike import debugger_metadata_url

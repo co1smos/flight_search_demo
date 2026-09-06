@@ -12,6 +12,22 @@ from .models import BrowserStackConfig, ControlledPageResult, HandoffStatus, Hum
 from .security import assert_private_url, normalize_loopback_url, redact_secrets
 
 
+@dataclass(frozen=True)
+class BrowserTaskOutcome:
+    status: str
+    classification: str
+    detail: str
+    provenance: dict[str, Any]
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "classification": self.classification,
+            "detail": self.detail,
+            "provenance": self.provenance,
+        }
+
+
 def build_cdp_url(websocket_url: str, steel_api_key: Optional[str]) -> str:
     normalized = normalize_loopback_url(websocket_url)
     if steel_api_key and "apiKey=" not in normalized:
@@ -79,6 +95,7 @@ class RunSummary:
     gemini_policy: dict[str, Any] = field(default_factory=dict)
     status: str = "SUCCEEDED"
     gemini_outcome: dict[str, Any] | None = None
+    browser_outcome: dict[str, Any] | None = None
 
 
 def ensure_storage_state_parent(path: Path) -> None:
