@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 from pathlib import Path
 import time
+from typing import Any, Callable
 from urllib.parse import urlparse
 
 from browser_use import Agent, BrowserSession
@@ -14,6 +16,12 @@ from dotenv import load_dotenv
 from steel import Steel
 
 from .controlled_page import ControlledPageServer
+from .gemini_policy import (
+    GeminiCallPolicy,
+    GeminiErrorClassification,
+    GeminiPolicyConfig,
+    GeminiPolicyError,
+)
 from .models import BrowserStackConfig, ControlledPageResult
 from .spike import (
     RunSummary,
@@ -52,10 +60,64 @@ def parse_args() -> argparse.Namespace:
 
 
 def build_agent_llms(*, primary_model: str, fallback_model: str, api_key: str):
-    return (
-        ChatGoogle(model=primary_model, api_key=api_key, max_retries=2),
-        ChatGoogle(model=fallback_model, api_key=api_key, max_retries=2),
+    from google.genai import types
+
+    http_options = types.HttpOptions(
+        retry_options=types.HttpRetryOptions(attempts=1),
     )
+    return (
+        # Application policy owns retries; browser-use's SDK retry loop is one attempt.
+        ChatGoogle(model=primary_model, api_key=api_key, max_retries=1, http_options=http_options),
+        ChatGoogle(model=fallback_model, api_key=api_key, max_retries=1, http_options=http_options),
+    )
+
+
+class PolicyBoundChatGoogle:
+    """Route browser-use Gemini calls through one application operation."""
+
+    def __init__(
+        self,
+        *,
+        primary: Any,
+        fallback: Any,
+        operation: Any,
+        diagnostic_sink: Callable[[dict[str, Any]], None] | None = None,
+    ) -> None:
+        self._primary = primary
+        self._fallback = fallback
+        self._operation = operation
+        self._diagnostic_sink = diagnostic_sink
+        self.model = primary.model
+        self.provider = "google"
+        self._verified_api_keys = True
+        self.last_policy_error: GeminiPolicyError | None = None
+
+    @property
+    def name(self) -> str:
+        return str(self.model)
+
+    @property
+    def model_name(self) -> str:
+        return str(self.model)
+
+    async def ainvoke(self, messages, output_format=None, **kwargs):
+        async def provider_call(model: str):
+            llm = self._primary if model == self._primary.model else self._fallback
+            return await llm.ainvoke(messages, output_format, **kwargs)
+
+        try:
+            return await self._operation.invoke_async(
+                model=self._primary.model,
+                purpose="browser_agent",
+                provider_call=provider_call,
+                fallback_model=self._fallback.model,
+            )
+        except GeminiPolicyError as exc:
+            self.last_policy_error = exc
+            raise
+        finally:
+            if self._diagnostic_sink is not None:
+                self._diagnostic_sink(self._operation.diagnostics())
 
 
 def classify_allowlist_rejection(exc: Exception) -> str:
@@ -85,6 +147,8 @@ async def run_agent_task(
     task: str,
     config: BrowserStackConfig,
     cdp_url: str,
+    policy: GeminiCallPolicy | None = None,
+    diagnostic_sink: Callable[[dict[str, Any]], None] | None = None,
 ) -> ControlledPageResult:
     browser = BrowserSession(
         cdp_url=cdp_url,
@@ -98,18 +162,53 @@ async def run_agent_task(
         fallback_model=config.fallback_gemini_model,
         api_key=config.google_api_key or "",
     )
+    if policy is None:
+        policy = GeminiCallPolicy(
+            db_path=config.gemini_usage_db_path,
+            config=GeminiPolicyConfig(
+                run_call_limit=config.gemini_run_call_limit,
+                daily_call_limits=config.gemini_daily_call_limits,
+                timezone_name=config.gemini_timezone_name,
+                operation_deadline_seconds=config.operation_deadline_seconds,
+            ),
+        )
+    operation = policy.operation(
+        f"browser-agent:{hashlib.sha256(task.encode('utf-8')).hexdigest()[:12]}",
+        task_id=hashlib.sha256(task.encode("utf-8")).hexdigest()[:12],
+        deadline_seconds=config.operation_deadline_seconds,
+    )
+    policy_llm = PolicyBoundChatGoogle(
+        primary=primary_llm,
+        fallback=fallback_llm,
+        operation=operation,
+        diagnostic_sink=diagnostic_sink,
+    )
     agent = Agent(
         task=task,
-        llm=primary_llm,
-        fallback_llm=fallback_llm,
+        llm=policy_llm,
         browser_session=browser,
         output_model_schema=ControlledPageResult,
         use_vision=False,
         max_actions_per_step=2,
         max_failures=2,
+        llm_timeout=max(1, int(config.operation_deadline_seconds)),
     )
-    history = await agent.run(max_steps=config.max_steps)
     try:
+        try:
+            history = await asyncio.wait_for(
+                agent.run(max_steps=config.max_steps),
+                timeout=config.operation_deadline_seconds,
+            )
+        except asyncio.TimeoutError as exc:
+            raise GeminiPolicyError(
+                "browser agent operation deadline exhausted",
+                classification=GeminiErrorClassification.TIMEOUT_CANCELLATION,
+                diagnostics=operation.diagnostics(
+                    terminal_error="browser agent operation deadline exhausted",
+                ),
+            ) from exc
+        if policy_llm.last_policy_error is not None:
+            raise policy_llm.last_policy_error
         if history.structured_output is None:
             raise RuntimeError("browser-use returned no structured output")
         return history.structured_output
@@ -154,12 +253,20 @@ async def run_in_fresh_session(
     client: Steel,
     config: BrowserStackConfig,
     task: str,
+    policy: GeminiCallPolicy | None = None,
+    diagnostic_sink: Callable[[dict[str, Any]], None] | None = None,
 ) -> ControlledPageResult:
     session = client.sessions.create(headless=True)
     endpoints = build_session_endpoints(session)
     try:
         cdp_url = discover_debugger_cdp_url(config.steel_base_url, os.environ.get("STEEL_API_KEY"))
-        return await run_agent_task(task=task, config=config, cdp_url=cdp_url)
+        return await run_agent_task(
+            task=task,
+            config=config,
+            cdp_url=cdp_url,
+            policy=policy,
+            diagnostic_sink=diagnostic_sink,
+        )
     finally:
         client.sessions.release(endpoints.session_id)
 
@@ -206,10 +313,22 @@ async def run_spike(args: argparse.Namespace) -> RunSummary:
             max_steps=args.max_steps,
         )
         ensure_storage_state_parent(config.storage_state_path)
+        gemini_policy = GeminiCallPolicy(
+            db_path=config.gemini_usage_db_path,
+            config=GeminiPolicyConfig(
+                run_call_limit=config.gemini_run_call_limit,
+                daily_call_limits=config.gemini_daily_call_limits,
+                timezone_name=config.gemini_timezone_name,
+                operation_deadline_seconds=config.operation_deadline_seconds,
+            ),
+        )
+        gemini_operations: list[dict[str, Any]] = []
 
         initial_result = await run_in_fresh_session(
             client=client,
             config=config,
+            policy=gemini_policy,
+            diagnostic_sink=gemini_operations.append,
             task=(
                 f"Open {config.controlled_page_url}. Enter the marker value '{args.marker}' "
                 "into the Marker input, click 'Save marker to this browser profile', and return "
@@ -220,6 +339,8 @@ async def run_spike(args: argparse.Namespace) -> RunSummary:
         persisted_result = await run_in_fresh_session(
             client=client,
             config=config,
+            policy=gemini_policy,
+            diagnostic_sink=gemini_operations.append,
             task=(
                 f"Open {config.controlled_page_url}. Do not change the page. Read the visible page title, "
                 "the persisted marker value, whether a marker is persisted, and the current URL."
@@ -264,6 +385,10 @@ async def run_spike(args: argparse.Namespace) -> RunSummary:
             persisted_result=persisted_result,
             offsite_rejection=offsite_rejection,
             handoff=handoff,
+            gemini_policy={
+                "limits": gemini_policy.limits_summary(),
+                "operations": gemini_operations,
+            },
         )
     finally:
         if server is not None:
@@ -284,6 +409,7 @@ def main() -> None:
                     "status": summary.handoff.status.value,
                     "details_written": True,
                 },
+                "gemini_policy": summary.gemini_policy,
             },
             indent=2,
         )

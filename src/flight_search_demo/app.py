@@ -14,6 +14,16 @@ from typing import Any, Callable, Dict, List, Mapping, Protocol
 from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from .gemini_policy import (
+    GeminiCallPolicy,
+    GeminiErrorClassification,
+    GeminiPolicyConfig,
+    GeminiPolicyError,
+    MalformedModelOutputError,
+    redact_sensitive,
+    redact_sensitive_text,
+)
+
 SUPPORTED_CABINS = {
     "economy": "Economy",
     "premium_economy": "Premium Economy",
@@ -248,9 +258,21 @@ class RequestParser(Protocol):
 
 
 class GoogleGenAIRequestParser:
-    def __init__(self, *, client: Any, model: str) -> None:
+    def __init__(
+        self,
+        *,
+        client: Any,
+        model: str,
+        policy: GeminiCallPolicy | None = None,
+        fallback_model: str | None = None,
+    ) -> None:
         self._client = client
         self._model = model
+        self._policy = policy
+        self._fallback_model = fallback_model
+
+    def with_policy(self, policy: GeminiCallPolicy) -> None:
+        self._policy = policy
 
     def parse(
         self,
@@ -273,53 +295,105 @@ class GoogleGenAIRequestParser:
             f"timezone: {timezone_name}\n"
             f"request: {original_text}\n"
         )
-        try:
-            interaction = self._client.interactions.create(
-                model=self._model,
-                input=prompt,
-                response_mime_type="application/json",
-                response_format=natural_language_parse_schema(),
-            )
-            payload = json.loads("".join(
-                output.text for output in interaction.outputs or []
-                if output.type == "text"
-            ))
-        except Exception as exc:
-            raise ParserFailure(
-                str(exc),
-                diagnostics={"provider": "google_genai", "model": self._model},
-            ) from exc
-
-        try:
-            program_selection = payload["program_selection"]
-            stated_program = payload.get("stated_program")
-            requests = [
-                ParsedNaturalLanguageRequest(
-                    program=str(item["program"]).strip().lower(),
-                    origin=str(item["origin"]).strip().upper(),
-                    destination=str(item["destination"]).strip().upper(),
-                    departure_date=str(item["departure_date"]).strip(),
-                    cabin=str(item["cabin"]).strip(),
-                    adults=item["adults"],
-                    trip_type=str(item["trip_type"]).strip().lower(),
-                    maximum_points=item["maximum_points"],
-                    missing_fields=item["missing_fields"],
+        def parse_response(model: str) -> RequestParseResult:
+            try:
+                interaction = self._client.interactions.create(
+                    model=model,
+                    input=prompt,
+                    response_mime_type="application/json",
+                    response_format=natural_language_parse_schema(),
                 )
-                for item in payload.get("requests", [])
-            ]
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ParserFailure(
-                "parser returned invalid structured data",
-                diagnostics={"provider": "google_genai", "model": self._model},
-            ) from exc
+                payload = json.loads("".join(
+                    output.text for output in interaction.outputs or []
+                    if output.type == "text"
+                ))
+            except json.JSONDecodeError as exc:
+                raise MalformedModelOutputError("model returned invalid JSON") from exc
+            except Exception:
+                raise
 
-        diagnostics = {"provider": "google_genai", "model": self._model}
+            try:
+                program_selection = payload["program_selection"]
+                stated_program = payload.get("stated_program")
+                requests = [
+                    ParsedNaturalLanguageRequest(
+                        program=str(item["program"]).strip().lower(),
+                        origin=str(item["origin"]).strip().upper(),
+                        destination=str(item["destination"]).strip().upper(),
+                        departure_date=str(item["departure_date"]).strip(),
+                        cabin=str(item["cabin"]).strip(),
+                        adults=item["adults"],
+                        trip_type=str(item["trip_type"]).strip().lower(),
+                        maximum_points=item["maximum_points"],
+                        missing_fields=item["missing_fields"],
+                    )
+                    for item in payload.get("requests", [])
+                ]
+            except (KeyError, TypeError, ValueError) as exc:
+                raise MalformedModelOutputError("model returned unusable structured data") from exc
+
+            if (
+                not isinstance(program_selection, str)
+                or program_selection not in PROGRAM_SELECTION_STATES
+                or any(
+                    not isinstance(item.missing_fields, list)
+                    or any(field_name not in PARSER_REQUIRED_FIELDS for field_name in item.missing_fields)
+                    for item in requests
+                )
+            ):
+                raise MalformedModelOutputError("model returned invalid parse fields")
+
+            return RequestParseResult(
+                requests=requests,
+                program_selection=program_selection,
+                stated_program=stated_program,
+                clarification=payload.get("clarification"),
+                unsupported_reason=payload.get("unsupported_reason"),
+                diagnostics={"provider": "google_genai", "model": model},
+            )
+
+        if self._policy is None:
+            try:
+                return parse_response(self._model)
+            except MalformedModelOutputError as exc:
+                raise ParserFailure(
+                    str(exc),
+                    diagnostics={"provider": "google_genai", "model": self._model},
+                ) from exc
+            except Exception as exc:
+                raise ParserFailure(
+                    str(exc),
+                    diagnostics={"provider": "google_genai", "model": self._model},
+                ) from exc
+
+        operation = self._policy.operation(
+            f"request-parse:{request_id}", request_id=request_id
+        )
+        try:
+            result = operation.invoke(
+                model=self._model,
+                purpose="request_parse",
+                provider_call=parse_response,
+                fallback_model=self._fallback_model,
+            )
+        except GeminiPolicyError as exc:
+            diagnostics = dict(exc.diagnostics)
+            diagnostics.update({
+                "provider": "google_genai",
+                "model": self._model,
+                "gemini_error_classification": exc.classification.value,
+                "gemini_usage": exc.diagnostics,
+            })
+            raise ParserFailure(redact_sensitive_text(str(exc)), diagnostics=diagnostics) from exc
+        assert isinstance(result, RequestParseResult)
+        diagnostics = dict(result.diagnostics or {})
+        diagnostics["gemini_usage"] = operation.diagnostics()
         return RequestParseResult(
-            requests=requests,
-            program_selection=program_selection,
-            stated_program=stated_program,
-            clarification=payload.get("clarification"),
-            unsupported_reason=payload.get("unsupported_reason"),
+            requests=result.requests,
+            program_selection=result.program_selection,
+            stated_program=result.stated_program,
+            clarification=result.clarification,
+            unsupported_reason=result.unsupported_reason,
             diagnostics=diagnostics,
         )
 
@@ -673,10 +747,16 @@ def execute_confirmed_request(
     adapter_registry: Mapping[str, AwardProviderAdapter],
     clock: Callable[[], datetime] | None = None,
     diagnostic_id: str | None = None,
+    gemini_usage: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     request_hash = build_request_hash(request_id, original_text, criteria)
     atomic_task_id = f"{criteria.program}-{request_hash[:12]}"
     result = adapter_registry[criteria.program].execute(criteria, atomic_task_id)
+    extra_fields: Dict[str, Any] = {}
+    if diagnostic_id:
+        extra_fields["diagnostic_id"] = diagnostic_id
+    if gemini_usage is not None:
+        extra_fields["gemini_usage"] = gemini_usage
     return emit_event(
         event_log_path=event_log_path,
         request_id=request_id,
@@ -686,7 +766,7 @@ def execute_confirmed_request(
         status=result["status"],
         detail=result["detail"],
         clock=clock,
-        extra_fields={"diagnostic_id": diagnostic_id} if diagnostic_id else None,
+        extra_fields=extra_fields or None,
     )
 
 
@@ -772,6 +852,7 @@ def run_request(
     current_date: date | None = None,
     timezone_name: str = "UTC",
     clock: Callable[[], datetime] | None = None,
+    gemini_policy: GeminiCallPolicy | None = None,
 ) -> List[Dict[str, Any]]:
     if "program" in request:
         return [
@@ -789,8 +870,11 @@ def run_request(
     request_id = str(request.get("request_id", "")).strip()
     original_text = str(request.get("original_text", "")).strip()
     diagnostic_id = uuid4().hex
+    gemini_usage: Dict[str, Any] | None = None
 
     def diagnostic(metadata: Dict[str, Any], error: str | None = None) -> None:
+        metadata = redact_sensitive(metadata)
+        error = redact_sensitive_text(error) if error is not None else None
         try:
             json.dumps(metadata)
         except (TypeError, ValueError):
@@ -801,6 +885,8 @@ def run_request(
         })
 
     def report(status: str, detail: str, criteria=None, **fields) -> List[Dict[str, Any]]:
+        if gemini_usage is not None:
+            fields["gemini_usage"] = gemini_usage
         return [emit_event(
             event_log_path=event_log_path, request_id=request_id,
             original_text=original_text, atomic_task_id=None,
@@ -822,7 +908,14 @@ def run_request(
 
     try:
         if parser is None:
-            parser = build_default_request_parser()
+            if gemini_policy is None:
+                gemini_policy = GeminiCallPolicy(
+                    db_path=event_log_path.with_suffix(".gemini.sqlite3"),
+                    config=GeminiPolicyConfig(timezone_name=timezone_name),
+                )
+            parser = build_default_request_parser(policy=gemini_policy)
+        elif gemini_policy is not None and isinstance(parser, GoogleGenAIRequestParser):
+            parser.with_policy(gemini_policy)
         parse_result = parser.parse(
             request_id=request_id, original_text=original_text,
             current_date=current_date, timezone_name=timezone_name,
@@ -854,10 +947,35 @@ def run_request(
         ):
             raise ParserFailure("parser returned invalid stated program")
     except Exception as exc:
-        diagnostic(getattr(exc, "diagnostics", {"parser_exception": type(exc).__name__}), str(exc))
+        metadata = getattr(exc, "diagnostics", {"parser_exception": type(exc).__name__})
+        if isinstance(metadata, dict):
+            gemini_usage = metadata.get("gemini_usage")
+            classification = metadata.get("gemini_error_classification")
+        else:
+            classification = None
+        diagnostic(redact_sensitive(metadata), redact_sensitive_text(str(exc)))
+        if classification in {
+            GeminiErrorClassification.RUN_BUDGET_EXHAUSTION.value,
+            GeminiErrorClassification.DAILY_QUOTA_EXHAUSTION.value,
+        }:
+            status = (
+                "GEMINI_BUDGET_EXHAUSTED"
+                if classification == GeminiErrorClassification.RUN_BUDGET_EXHAUSTION.value
+                else "GEMINI_QUOTA_EXHAUSTED"
+            )
+            detail = (
+                "Gemini call allowance exhausted; no model call was started"
+                if not gemini_usage or gemini_usage.get("attempted_calls", 0) == 0
+                else "Gemini call allowance exhausted; no additional model call was started"
+            )
+            return report(status, detail)
+        if classification is not None:
+            return report("GEMINI_FAILED", "Gemini provider call failed; see diagnostics")
         return report("PARSER_FAILED", "request parsing failed; see diagnostics")
 
     diagnostic(parse_result.diagnostics or {})
+    if parse_result.diagnostics:
+        gemini_usage = parse_result.diagnostics.get("gemini_usage")
     missing_fields = sorted({
         field_name
         for item in parse_result.requests
@@ -1011,7 +1129,7 @@ def run_request(
         execute_confirmed_request(
             request_id=request_id, original_text=original_text, criteria=criteria,
             event_log_path=event_log_path, adapter_registry=adapter_registry,
-            clock=clock, diagnostic_id=diagnostic_id,
+            clock=clock, diagnostic_id=diagnostic_id, gemini_usage=gemini_usage,
         )
         for criteria in normalized_requests
     ]
@@ -1377,14 +1495,30 @@ def render_terminal_report(event: Dict[str, Any]) -> str:
     )
 
 
-def build_default_request_parser(model: str | None = None) -> GoogleGenAIRequestParser:
+def build_default_request_parser(
+    model: str | None = None,
+    *,
+    policy: GeminiCallPolicy | None = None,
+    fallback_model: str | None = None,
+) -> GoogleGenAIRequestParser:
     try:
         from google import genai
     except ImportError as exc:
         raise RuntimeError("google-genai is required for natural-language requests") from exc
+    from google.genai import types
+
+    client = genai.Client(
+        http_options=types.HttpOptions(
+            retry_options=types.HttpRetryOptions(attempts=1),
+        )
+    )
+    primary_model = model or os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+    fallback = fallback_model or os.environ.get("FALLBACK_GEMINI_MODEL", "gemini-3.6-flash")
     return GoogleGenAIRequestParser(
-        client=genai.Client(),
-        model=model or os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"),
+        client=client,
+        model=primary_model,
+        policy=policy,
+        fallback_model=fallback,
     )
 
 

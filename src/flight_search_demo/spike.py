@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 import json
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 from urllib.parse import urlparse
 import urllib.request
 
@@ -76,6 +76,7 @@ class RunSummary:
     persisted_result: ControlledPageResult
     offsite_rejection: str
     handoff: HumanTakeoverGate
+    gemini_policy: dict[str, Any] = field(default_factory=dict)
 
 
 def ensure_storage_state_parent(path: Path) -> None:
