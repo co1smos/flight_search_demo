@@ -1,13 +1,44 @@
 ## Agent skills
 
+### Model routing
+
+Use the cheapest model appropriate for the task. The default Codex session uses
+`gpt-5.6-luna` with medium reasoning.
+
+Handle simple tasks directly in the current Luna agent. Simple tasks are
+mechanical edits, renames, formatting, boilerplate, straightforward tests,
+obvious small fixes, and changes whose implementation is already explicit.
+
+Use the `sol_worker` tier (`gpt-5.6-sol`, medium) for normal engineering work:
+features with clear requirements, normal bug fixes, related multi-file changes,
+business logic, normal code review, and refactoring that requires understanding
+existing code.
+
+Use the `astra_worker` tier (`gpt-6-astra`, low) for hard work: unclear root
+causes, difficult debugging, unfamiliar architecture, concurrency or distributed
+systems, large cross-component changes, ambiguous requirements, subtle
+correctness problems, or a failed Sol attempt.
+
+Do not escalate merely to improve confidence, and do not spawn agents only to
+classify a task. Escalate Luna to Sol when substantial reasoning beyond
+mechanical execution is required. Escalate Sol to Astra only when the problem
+remains unresolved, important assumptions cannot be established, verification
+fails, or the task clearly belongs in the hard category.
+
+Before launching a delegated worker, preflight its exact model and reasoning
+effort. If that tier is unavailable, preflight the configured Gemini 3.8 model
+ID and use it with provider-default reasoning. If Gemini 3.8 is unavailable or
+not configured, use the authenticated Codex account's verified default and
+report the fallback.
+
 ### Implementation workflow
 
 - Use the official OpenAI Codex CLI as the default coding agent for implementation work in this repository.
-- For bounded Sandcastle/Codex implementation runs, prefer `gpt-5.6-luna` with high reasoning effort when it is available to the authenticated Codex account; preflight the exact model before starting the real iteration and fall back to the account's verified default only if the preflight fails.
-- Use Herdr to launch and coordinate Codex agents or subagents so their work is visible in separate tabs or panes.
-- Ask the user before creating a new Herdr tab. Keep the current tab focused unless the user requests otherwise, and close agent tabs after their work is complete.
-- Give each agent a narrow, self-contained task. Parallelize independent tasks, but avoid concurrent edits to the same files.
-- Review each agent's changes and run the relevant tests, linters, or build before reporting completion.
+- Apply the same model routing to direct Codex work and bounded Sandcastle/Codex iterations.
+- Keep every delegated worker visible in a separate Herdr pane or tab. Do not use Codex's hidden native subagent spawning for repository work, even though `.codex/agents/*.toml` records the tier definitions.
+- Ask the user before creating a new Herdr tab. A sibling pane in the current tab is the default and does not require another prompt. Keep the current tab focused unless the user requests otherwise, and close panes or tabs created for workers after their work is complete.
+- Give each worker a narrow, self-contained task and launch it with the model and reasoning values recorded in the matching `.codex/agents/*.toml` file. Parallelize independent tasks, but avoid concurrent edits to the same files.
+- Review each worker's changes and run the relevant tests, linters, or build before reporting completion.
 
 ### Issue tracker
 
