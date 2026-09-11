@@ -816,6 +816,33 @@ def test_search_policy_allows_safe_login_aircanada_authorization_parameters():
     )
 
 
+@pytest.mark.parametrize(
+    "identity_url",
+    [
+        (
+            "https://aircanada.b2clogin.com/aircanada.onmicrosoft.com/"
+            "B2C_1A_signin/oauth2/v2.0/authorize"
+        ),
+        "https://login.aircanada.com/authorize",
+    ],
+)
+@pytest.mark.parametrize(
+    "redirect_uri",
+    [
+        "https%3A%2F%2Fwww.aircanada.com%2Fsearch%3Faction%3Dbook",
+        (
+            "https%3A%2F%2Fwww.aircanada.com%2Faeroplan%2Fredeem%2Favailability"
+            "%3Fpayment%3Dtrue"
+        ),
+    ],
+)
+def test_search_policy_rejects_unsafe_queries_inside_authentication_redirects(
+    identity_url, redirect_uri
+):
+    with pytest.raises(PolicyViolation):
+        SearchPolicy().validate_url(f"{identity_url}?redirect_uri={redirect_uri}")
+
+
 def test_agent_outcome_is_rejected_when_step_bound_or_domain_policy_is_broken(criteria):
     for outcome in (
         BrowserAgentOutcome("completed", None, 7, (), (), "too many steps"),

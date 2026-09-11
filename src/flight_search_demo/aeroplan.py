@@ -232,21 +232,11 @@ class SearchPolicy:
         }:
             raise PolicyViolation("authentication scope is not permitted")
         if "redirect_uri" in values:
-            redirect = urlparse(values["redirect_uri"])
             try:
-                redirect_port = redirect.port
-            except ValueError as exc:
-                raise PolicyViolation("authentication redirect is malformed") from exc
-            redirect_path = unquote(redirect.path).rstrip("/") or "/"
-            if (
-                redirect.scheme != "https"
-                or redirect.hostname not in APPROVED_AIR_CANADA_DOMAINS
-                or redirect.username is not None
-                or redirect.password is not None
-                or redirect_port not in {None, 443}
-                or redirect_path not in self._AIR_CANADA_SEARCH_PATHS
-                or redirect.fragment
-            ):
+                self.validate_url(values["redirect_uri"])
+            except PolicyViolation as exc:
+                raise PolicyViolation("authentication redirect is not search-only") from exc
+            if urlparse(values["redirect_uri"]).hostname not in APPROVED_AIR_CANADA_DOMAINS:
                 raise PolicyViolation("authentication redirect is not search-only")
 
     def validate_action(self, action: Mapping[str, Any]) -> None:
