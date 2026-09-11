@@ -278,7 +278,7 @@ def classify_page(page: PageSnapshot) -> PageKind:
         return PageKind.UNKNOWN
 
 
-def _parse_results(page: PageSnapshot) -> tuple[list[dict[str, Any]], str]:
+def _parse_results(page: PageSnapshot) -> tuple[list[dict[str, Any]], list[str]]:
     parser = _ResultsScriptParser()
     parser.feed(page.html)
     if not parser.results_json.strip():
@@ -290,48 +290,18 @@ def _parse_results(page: PageSnapshot) -> tuple[list[dict[str, Any]], str]:
     itineraries = payload.get("itineraries")
     if not isinstance(itineraries, list):
         raise ValueError("results extraction payload has no itinerary list")
-    return itineraries, " ".join(parser.visible_text)
+    return itineraries, parser.visible_text
 
 
-def _is_exact_visible_text(value: str, visible_text: str) -> bool:
-    normalized_value = " ".join(value.split())
-    normalized_visible = " ".join(visible_text.split())
-    return re.search(
-        rf"(?<![\w,.]){re.escape(normalized_value)}(?![\w,.])",
-        normalized_visible,
-        re.IGNORECASE,
-    ) is not None
-
-
-def _is_exact_visible_price(value: str, visible_text: str) -> bool:
-    normalized_value = " ".join(value.split())
-    normalized_visible = " ".join(visible_text.split())
-    price_pattern = re.compile(
-        rf"(?<![\w,.]){re.escape(normalized_value)}(?![\w,.])",
-        re.IGNORECASE,
-    )
-    prefix_qualifier_pattern = re.compile(
-        r"\b(?:from|at\s+least|starting\s+(?:at|from)|as\s+low\s+as|estimated|"
-        r"approximately|about|around|roughly|circa)(?:\s+at)?"
-        r"(?:\s+(?:only|just))?\s*[:\-–—]?\s*$",
-        re.IGNORECASE,
-    )
-    suffix_qualifier_pattern = re.compile(
-        r"^(?:\+|\s*(?:and\s+up|or\s+(?:more|higher)|estimated|approximately|"
-        r"about|minimum)\b)",
-        re.IGNORECASE,
-    )
-    for match in price_pattern.finditer(normalized_visible):
-        if (
-            prefix_qualifier_pattern.search(normalized_visible[: match.start()]) is None
-            and suffix_qualifier_pattern.search(normalized_visible[match.end() :]) is None
-        ):
-            return True
-    return False
+def _is_exact_visible_price(
+    value: str, displayed_total: str, currency: str, visible_text: list[str]
+) -> bool:
+    expected = " ".join(f"{value} + {displayed_total} {currency}".split()).casefold()
+    return any(" ".join(text.split()).casefold() == expected for text in visible_text)
 
 
 def _validated_itinerary(
-    raw: Mapping[str, Any], criteria: NormalizedCriteria, visible_text: str
+    raw: Mapping[str, Any], criteria: NormalizedCriteria, visible_text: list[str]
 ) -> tuple[dict[str, Any] | None, str | None]:
     points = raw.get("points_per_passenger")
     label = raw.get("price_label")
@@ -351,7 +321,6 @@ def _validated_itinerary(
         or raw.get("price_kind") != "exact"
         or re.fullmatch(r"\s*\d[\d,]*\s+(?:pts|points)\s*", label, re.IGNORECASE) is None
         or int(re.sub(r"\D", "", label)) != points
-        or not _is_exact_visible_price(label, visible_text)
     ):
         return None, "UNVERIFIED_PRICE"
 
@@ -361,8 +330,9 @@ def _validated_itinerary(
         for field in ("displayed_total", "currency")
     ):
         return None, "PARSER_FAILED"
-    if not all(_is_exact_visible_text(str(cash[field]), visible_text)
-               for field in ("displayed_total", "currency")):
+    if not _is_exact_visible_price(
+        label, cash["displayed_total"], cash["currency"], visible_text
+    ):
         return None, "UNVERIFIED_PRICE"
     segments = raw.get("segments")
     required_segment_fields = (
