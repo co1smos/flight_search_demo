@@ -181,6 +181,54 @@ def test_exact_visible_price_can_span_nested_inline_nodes(criteria, tmp_path):
     assert result["status"] == "MATCH_FOUND"
 
 
+def test_exact_visible_price_can_be_a_standalone_inline_element(criteria, tmp_path):
+    fixture = tmp_path / "inline-price.html"
+    fixture.write_text(
+        """<!doctype html><html><body><main data-page-kind="results">
+        <div>Flight AC 872 <span>60,000 pts + $82.40 CAD</span></div>
+        <script id="aeroplan-results-data" type="application/json">
+        {"itineraries":[{"visible":true,"complete_itinerary":true,
+        "price_kind":"exact","price_label":"60,000 pts","points_per_passenger":60000,
+        "cash":{"displayed_total":"$82.40","currency":"CAD"},
+        "segments":[{"departure":"2026-11-05T20:30:00-05:00",
+        "arrival":"2026-11-06T08:35:00+01:00","flight_number":"AC 872",
+        "marketing_carrier":"Air Canada","operating_carrier":"Air Canada",
+        "cabin":"Business"}]}]}
+        </script></main></body></html>""",
+        encoding="utf-8",
+    )
+
+    result = AeroplanSearchAdapter(
+        browser=AeroplanFixtureBrowser(fixture)
+    ).execute(criteria, "inline-price")
+
+    assert result["status"] == "MATCH_FOUND"
+
+
+def test_qualified_price_in_standalone_inline_element_is_rejected(criteria, tmp_path):
+    fixture = tmp_path / "qualified-inline-price.html"
+    fixture.write_text(
+        """<!doctype html><html><body><main data-page-kind="results">
+        <div>Flight AC 872 from <span>60,000 pts + $82.40 CAD</span></div>
+        <script id="aeroplan-results-data" type="application/json">
+        {"itineraries":[{"visible":true,"complete_itinerary":true,
+        "price_kind":"exact","price_label":"60,000 pts","points_per_passenger":60000,
+        "cash":{"displayed_total":"$82.40","currency":"CAD"},
+        "segments":[{"departure":"2026-11-05T20:30:00-05:00",
+        "arrival":"2026-11-06T08:35:00+01:00","flight_number":"AC 872",
+        "marketing_carrier":"Air Canada","operating_carrier":"Air Canada",
+        "cabin":"Business"}]}]}
+        </script></main></body></html>""",
+        encoding="utf-8",
+    )
+
+    result = AeroplanSearchAdapter(
+        browser=AeroplanFixtureBrowser(fixture)
+    ).execute(criteria, "qualified-inline-price")
+
+    assert result["status"] == "UNVERIFIED_PRICE"
+
+
 def test_nested_inline_price_with_visible_qualifier_is_rejected(criteria, tmp_path):
     fixture = tmp_path / "nested-qualified-price.html"
     fixture.write_text(
@@ -663,6 +711,42 @@ def test_price_hidden_by_stylesheet_class_does_not_qualify(criteria, tmp_path):
     result = AeroplanSearchAdapter(
         browser=AeroplanFixtureBrowser(fixture)
     ).execute(criteria, "css-hidden-price")
+
+    assert result["status"] == "UNVERIFIED_PRICE"
+
+
+@pytest.mark.parametrize(
+    "style_rule, price_attribute",
+    [
+        (".card .price { display: none; }", 'class="price"'),
+        (".card > .price { visibility: hidden; }", 'class="price"'),
+        (".card span.price { opacity: 0; }", 'class="price"'),
+        ("", 'style="opacity: 0"'),
+    ],
+)
+def test_price_hidden_by_computed_style_does_not_qualify(
+    criteria, tmp_path, style_rule, price_attribute
+):
+    fixture = tmp_path / "computed-hidden-price.html"
+    fixture.write_text(
+        f"""<!doctype html><html><head><style>{style_rule}</style></head><body>
+        <main data-page-kind="results"><div class="card">
+        <span {price_attribute}>60,000 pts + $82.40 CAD</span></div>
+        <script id="aeroplan-results-data" type="application/json">
+        {{"itineraries":[{{"visible":true,"complete_itinerary":true,
+        "price_kind":"exact","price_label":"60,000 pts","points_per_passenger":60000,
+        "cash":{{"displayed_total":"$82.40","currency":"CAD"}},
+        "segments":[{{"departure":"2026-11-05T20:30:00-05:00",
+        "arrival":"2026-11-06T08:35:00+01:00","flight_number":"AC 872",
+        "marketing_carrier":"Air Canada","operating_carrier":"Air Canada",
+        "cabin":"Business"}}]}}]}}
+        </script></main></body></html>""",
+        encoding="utf-8",
+    )
+
+    result = AeroplanSearchAdapter(
+        browser=AeroplanFixtureBrowser(fixture)
+    ).execute(criteria, "computed-hidden-price")
 
     assert result["status"] == "UNVERIFIED_PRICE"
 

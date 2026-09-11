@@ -243,18 +243,24 @@ class _ResultsScriptParser(HTMLParser):
             "ul",
         }
     )
+    _INLINE_TEXT_ELEMENTS = frozenset({"b", "em", "i", "small", "span", "strong"})
 
     def __init__(self) -> None:
         super().__init__()
         self.page_kind: str | None = None
         self._in_results_script = False
-        self._element_stack: list[tuple[str, bool, list[str]]] = []
-        self._stylesheet_hidden_classes: set[str] = set()
-        self._stylesheet_hidden_ids: set[str] = set()
-        self._stylesheet_hidden_tags: set[str] = set()
+        self._element_stack: list[tuple[str, bool, list[str], str, frozenset[str]]] = []
+        self._stylesheet_hidden_selectors: list[str] = []
+        self._visible_region_parts: list[tuple[str, list[str]]] = []
         self.results_json = ""
         self.visible_text: list[str] = []
-        self.visible_regions: list[str] = []
+
+    @property
+    def visible_regions(self) -> list[tuple[str, str]]:
+        return [
+            (text, " ".join(context_parts))
+            for text, context_parts in self._visible_region_parts
+        ]
 
     @staticmethod
     def _hidden_by_declarations(declarations: str) -> bool:
@@ -268,7 +274,65 @@ class _ResultsScriptParser(HTMLParser):
             styles.get("display") == "none"
             or styles.get("visibility") in {"hidden", "collapse"}
             or styles.get("content-visibility") == "hidden"
+            or re.fullmatch(r"0(?:\.0+)?", styles.get("opacity", "")) is not None
         )
+
+    @staticmethod
+    def _matches_compound_selector(
+        selector: str, element: tuple[str, str, frozenset[str]]
+    ) -> bool:
+        match = re.fullmatch(r"([a-z][\w-]*)?((?:[.#][\w-]+)*)", selector)
+        if match is None or not any(match.groups()):
+            return False
+        tag, element_id, classes = element
+        if match.group(1) and match.group(1) != tag:
+            return False
+        for prefix, name in re.findall(r"([.#])([\w-]+)", match.group(2)):
+            if prefix == "." and name not in classes:
+                return False
+            if prefix == "#" and name != element_id:
+                return False
+        return True
+
+    def _matches_selector(
+        self, selector: str, current: tuple[str, str, frozenset[str]]
+    ) -> bool:
+        tokens = re.findall(r"[^\s>]+|>", selector)
+        compounds = [token for token in tokens if token != ">"]
+        if not compounds:
+            return False
+        combinators: list[str] = []
+        cursor = 0
+        for left, right in zip(compounds, compounds[1:]):
+            left_index = tokens.index(left, cursor)
+            right_index = tokens.index(right, left_index + 1)
+            combinators.append(">" if ">" in tokens[left_index + 1:right_index] else " ")
+            cursor = right_index
+
+        elements = [
+            (tag, element_id, classes)
+            for tag, _, _, element_id, classes in self._element_stack
+        ] + [current]
+        element_index = len(elements) - 1
+        if not self._matches_compound_selector(compounds[-1], elements[element_index]):
+            return False
+        for compound_index in range(len(compounds) - 2, -1, -1):
+            combinator = combinators[compound_index]
+            if combinator == ">":
+                element_index -= 1
+                if element_index < 0 or not self._matches_compound_selector(
+                    compounds[compound_index], elements[element_index]
+                ):
+                    return False
+                continue
+            element_index -= 1
+            while element_index >= 0 and not self._matches_compound_selector(
+                compounds[compound_index], elements[element_index]
+            ):
+                element_index -= 1
+            if element_index < 0:
+                return False
+        return True
 
     def feed(self, data: str) -> None:
         css = " ".join(re.findall(r"<style\b[^>]*>(.*?)</style\s*>", data, re.I | re.S))
@@ -278,12 +342,11 @@ class _ResultsScriptParser(HTMLParser):
                 continue
             for selector in selectors.split(","):
                 selector = selector.strip().lower()
-                if re.fullmatch(r"\.[\w-]+", selector):
-                    self._stylesheet_hidden_classes.add(selector[1:])
-                elif re.fullmatch(r"#[\w-]+", selector):
-                    self._stylesheet_hidden_ids.add(selector[1:])
-                elif re.fullmatch(r"[a-z][\w-]*", selector):
-                    self._stylesheet_hidden_tags.add(selector)
+                if re.fullmatch(
+                    r"[a-z.#][\w.#-]*(?:(?:\s+|\s*>\s*)[a-z.#][\w.#-]*)*",
+                    selector,
+                ):
+                    self._stylesheet_hidden_selectors.append(selector)
         super().feed(data)
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
@@ -295,27 +358,45 @@ class _ResultsScriptParser(HTMLParser):
         parent_hidden = self._element_stack[-1][1] if self._element_stack else False
         style = attributes.get("style", "") or ""
         classes = set((attributes.get("class") or "").lower().split())
+        identity = (
+            tag,
+            (attributes.get("id") or "").lower(),
+            frozenset(classes),
+        )
         element_hidden = (
             parent_hidden
             or tag in self._NON_VISIBLE_ELEMENTS
             or "hidden" in attributes
             or (attributes.get("aria-hidden") or "").strip().lower() == "true"
             or self._hidden_by_declarations(style)
-            or bool(classes & self._stylesheet_hidden_classes)
-            or (attributes.get("id") or "").lower() in self._stylesheet_hidden_ids
-            or tag in self._stylesheet_hidden_tags
+            or any(
+                self._matches_selector(selector, identity)
+                for selector in self._stylesheet_hidden_selectors
+            )
         )
         if tag not in self._VOID_ELEMENTS:
-            self._element_stack.append((tag, element_hidden, []))
+            self._element_stack.append(
+                (tag, element_hidden, [], identity[1], identity[2])
+            )
 
     def handle_endtag(self, tag: str) -> None:
         if tag == "script" and self._in_results_script:
             self._in_results_script = False
         for index in range(len(self._element_stack) - 1, -1, -1):
             if self._element_stack[index][0] == tag:
-                _, hidden, text_parts = self._element_stack[index]
-                if tag in self._TEXT_REGION_ELEMENTS and not hidden and text_parts:
-                    self.visible_regions.append(" ".join(text_parts))
+                _, hidden, text_parts, _, _ = self._element_stack[index]
+                if not hidden and text_parts:
+                    if tag in self._TEXT_REGION_ELEMENTS:
+                        self._visible_region_parts.append((" ".join(text_parts), text_parts))
+                    elif tag in self._INLINE_TEXT_ELEMENTS:
+                        context_parts = text_parts
+                        for ancestor in reversed(self._element_stack[:index]):
+                            if ancestor[0] in self._TEXT_REGION_ELEMENTS:
+                                context_parts = ancestor[2]
+                                break
+                        self._visible_region_parts.append(
+                            (" ".join(text_parts), context_parts)
+                        )
                 del self._element_stack[index:]
                 break
 
@@ -327,7 +408,7 @@ class _ResultsScriptParser(HTMLParser):
         ):
             text = data.strip()
             self.visible_text.append(text)
-            for _, hidden, text_parts in self._element_stack:
+            for _, hidden, text_parts, _, _ in self._element_stack:
                 if not hidden:
                     text_parts.append(text)
 
@@ -353,7 +434,7 @@ def classify_page(page: PageSnapshot) -> PageKind:
         return PageKind.UNKNOWN
 
 
-def _parse_results(page: PageSnapshot) -> tuple[list[dict[str, Any]], list[str]]:
+def _parse_results(page: PageSnapshot) -> tuple[list[dict[str, Any]], list[tuple[str, str]]]:
     parser = _ResultsScriptParser()
     parser.feed(page.html)
     if not parser.results_json.strip():
@@ -369,14 +450,29 @@ def _parse_results(page: PageSnapshot) -> tuple[list[dict[str, Any]], list[str]]
 
 
 def _is_exact_visible_price(
-    value: str, displayed_total: str, currency: str, visible_text: list[str]
+    value: str,
+    displayed_total: str,
+    currency: str,
+    visible_text: list[tuple[str, str]],
 ) -> bool:
     expected = " ".join(f"{value} + {displayed_total} {currency}".split()).casefold()
-    return any(" ".join(text.split()).casefold() == expected for text in visible_text)
+    qualifier = re.compile(
+        r"(?:\bfrom\b|\bestimat(?:e|ed)\b|\bat\s+least\b|\bas\s+low\s+as\b|"
+        r"\bstarting\b|\bminimum\b|\bapprox(?:imately)?\b|\babout\b|"
+        r"\band\s+up\b|\bupwards?\b|\*)",
+        re.IGNORECASE,
+    )
+    return any(
+        " ".join(text.split()).casefold() == expected
+        and qualifier.search(" ".join(context.split())) is None
+        for text, context in visible_text
+    )
 
 
 def _validated_itinerary(
-    raw: Mapping[str, Any], criteria: NormalizedCriteria, visible_text: list[str]
+    raw: Mapping[str, Any],
+    criteria: NormalizedCriteria,
+    visible_text: list[tuple[str, str]],
 ) -> tuple[dict[str, Any] | None, str | None]:
     points = raw.get("points_per_passenger")
     label = raw.get("price_label")
