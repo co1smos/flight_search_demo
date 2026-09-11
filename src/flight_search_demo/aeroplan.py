@@ -264,6 +264,7 @@ class _ResultsScriptParser(HTMLParser):
             "tr",
         }
     )
+    _FULL_CARD_CONTEXT_ELEMENTS = frozenset({"article"})
 
     def __init__(self) -> None:
         super().__init__()
@@ -409,9 +410,14 @@ class _ResultsScriptParser(HTMLParser):
                     if tag in self._TEXT_REGION_ELEMENTS:
                         context_parts = text_parts
                         for ancestor in reversed(self._element_stack[:index]):
-                            if ancestor[0] in self._CARD_CONTEXT_ELEMENTS:
+                            if ancestor[0] in self._FULL_CARD_CONTEXT_ELEMENTS:
                                 context_parts = ancestor[2]
                                 break
+                        else:
+                            for ancestor in reversed(self._element_stack[:index]):
+                                if ancestor[0] in self._CARD_CONTEXT_ELEMENTS:
+                                    context_parts = ancestor[2]
+                                    break
                         self._visible_region_parts.append(
                             (" ".join(text_parts), context_parts)
                         )
@@ -470,6 +476,8 @@ def _parse_results(page: PageSnapshot) -> tuple[list[dict[str, Any]], list[tuple
         payload = json.loads(parser.results_json)
     except json.JSONDecodeError as exc:
         raise ValueError("results extraction payload is malformed") from exc
+    if not isinstance(payload, Mapping):
+        raise ValueError("results extraction payload is not structured data")
     itineraries = payload.get("itineraries")
     if not isinstance(itineraries, list):
         raise ValueError("results extraction payload has no itinerary list")

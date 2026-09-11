@@ -76,6 +76,7 @@ def test_default_fixture_adapter_uses_the_validated_pipeline(criteria):
         ("challenge.html", "CHALLENGE_BLOCKED"),
         ("site_error.html", "SITE_ERROR"),
         ("parser_failure.html", "PARSER_FAILED"),
+        ("non_object_payload.html", "PARSER_FAILED"),
     ],
 )
 def test_controlled_fixtures_have_distinct_terminal_outcomes(criteria, fixture, expected):
@@ -273,6 +274,30 @@ def test_split_sibling_from_qualifier_is_rejected(criteria, tmp_path):
     result = AeroplanSearchAdapter(
         browser=AeroplanFixtureBrowser(fixture)
     ).execute(criteria, "split-sibling-from-price")
+
+    assert result["status"] == "UNVERIFIED_PRICE"
+
+
+def test_nested_price_wrapper_uses_full_itinerary_card_context(criteria, tmp_path):
+    fixture = tmp_path / "nested-wrapper-from-price.html"
+    fixture.write_text(
+        """<!doctype html><html><body><main data-page-kind="results">
+        <article><div>From</div><section><div>60,000 pts + $82.40 CAD</div></section></article>
+        <script id="aeroplan-results-data" type="application/json">
+        {"itineraries":[{"visible":true,"complete_itinerary":true,
+        "price_kind":"exact","price_label":"60,000 pts","points_per_passenger":60000,
+        "cash":{"displayed_total":"$82.40","currency":"CAD"},
+        "segments":[{"departure":"2026-11-05T20:30:00-05:00",
+        "arrival":"2026-11-06T08:35:00+01:00","flight_number":"AC 872",
+        "marketing_carrier":"Air Canada","operating_carrier":"Air Canada",
+        "cabin":"Business"}]}]}
+        </script></main></body></html>""",
+        encoding="utf-8",
+    )
+
+    result = AeroplanSearchAdapter(
+        browser=AeroplanFixtureBrowser(fixture)
+    ).execute(criteria, "nested-wrapper-from-price")
 
     assert result["status"] == "UNVERIFIED_PRICE"
 
