@@ -641,6 +641,32 @@ def test_prices_inside_hidden_dom_containers_do_not_qualify(
     assert result["status"] == "UNVERIFIED_PRICE"
 
 
+def test_price_hidden_by_stylesheet_class_does_not_qualify(criteria, tmp_path):
+    fixture = tmp_path / "css-hidden-price.html"
+    fixture.write_text(
+        """<!doctype html><html><head>
+        <style>.hidden-price { display: none; }</style>
+        </head><body><main data-page-kind="results">
+        <div class="hidden-price"><span>60,000 pts + $82.40 CAD</span></div>
+        <script id="aeroplan-results-data" type="application/json">
+        {"itineraries":[{"visible":true,"complete_itinerary":true,
+        "price_kind":"exact","price_label":"60,000 pts","points_per_passenger":60000,
+        "cash":{"displayed_total":"$82.40","currency":"CAD"},
+        "segments":[{"departure":"2026-11-05T20:30:00-05:00",
+        "arrival":"2026-11-06T08:35:00+01:00","flight_number":"AC 872",
+        "marketing_carrier":"Air Canada","operating_carrier":"Air Canada",
+        "cabin":"Business"}]}]}
+        </script></main></body></html>""",
+        encoding="utf-8",
+    )
+
+    result = AeroplanSearchAdapter(
+        browser=AeroplanFixtureBrowser(fixture)
+    ).execute(criteria, "css-hidden-price")
+
+    assert result["status"] == "UNVERIFIED_PRICE"
+
+
 def test_app_json_and_terminal_reports_use_official_entry_not_transient_url(criteria):
     request = {
         "request_id": "issue-5-report",

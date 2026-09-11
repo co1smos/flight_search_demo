@@ -249,9 +249,42 @@ class _ResultsScriptParser(HTMLParser):
         self.page_kind: str | None = None
         self._in_results_script = False
         self._element_stack: list[tuple[str, bool, list[str]]] = []
+        self._stylesheet_hidden_classes: set[str] = set()
+        self._stylesheet_hidden_ids: set[str] = set()
+        self._stylesheet_hidden_tags: set[str] = set()
         self.results_json = ""
         self.visible_text: list[str] = []
         self.visible_regions: list[str] = []
+
+    @staticmethod
+    def _hidden_by_declarations(declarations: str) -> bool:
+        styles = {
+            name.strip().lower(): value.strip().lower().removesuffix("!important").strip()
+            for declaration in declarations.split(";")
+            if ":" in declaration
+            for name, value in [declaration.split(":", 1)]
+        }
+        return (
+            styles.get("display") == "none"
+            or styles.get("visibility") in {"hidden", "collapse"}
+            or styles.get("content-visibility") == "hidden"
+        )
+
+    def feed(self, data: str) -> None:
+        css = " ".join(re.findall(r"<style\b[^>]*>(.*?)</style\s*>", data, re.I | re.S))
+        css = re.sub(r"/\*.*?\*/", "", css, flags=re.S)
+        for selectors, declarations in re.findall(r"([^{}]+)\{([^{}]*)\}", css):
+            if not self._hidden_by_declarations(declarations):
+                continue
+            for selector in selectors.split(","):
+                selector = selector.strip().lower()
+                if re.fullmatch(r"\.[\w-]+", selector):
+                    self._stylesheet_hidden_classes.add(selector[1:])
+                elif re.fullmatch(r"#[\w-]+", selector):
+                    self._stylesheet_hidden_ids.add(selector[1:])
+                elif re.fullmatch(r"[a-z][\w-]*", selector):
+                    self._stylesheet_hidden_tags.add(selector)
+        super().feed(data)
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         attributes = dict(attrs)
@@ -261,20 +294,16 @@ class _ResultsScriptParser(HTMLParser):
             self._in_results_script = True
         parent_hidden = self._element_stack[-1][1] if self._element_stack else False
         style = attributes.get("style", "") or ""
-        style_declarations = {
-            name.strip().lower(): value.strip().lower().removesuffix("!important").strip()
-            for declaration in style.split(";")
-            if ":" in declaration
-            for name, value in [declaration.split(":", 1)]
-        }
+        classes = set((attributes.get("class") or "").lower().split())
         element_hidden = (
             parent_hidden
             or tag in self._NON_VISIBLE_ELEMENTS
             or "hidden" in attributes
             or (attributes.get("aria-hidden") or "").strip().lower() == "true"
-            or style_declarations.get("display") == "none"
-            or style_declarations.get("visibility") in {"hidden", "collapse"}
-            or style_declarations.get("content-visibility") == "hidden"
+            or self._hidden_by_declarations(style)
+            or bool(classes & self._stylesheet_hidden_classes)
+            or (attributes.get("id") or "").lower() in self._stylesheet_hidden_ids
+            or tag in self._stylesheet_hidden_tags
         )
         if tag not in self._VOID_ELEMENTS:
             self._element_stack.append((tag, element_hidden, []))
