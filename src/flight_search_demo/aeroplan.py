@@ -157,11 +157,19 @@ class SearchPolicy:
             raise PolicyViolation("navigation is not an approved search-only Air Canada path")
 
     def validate_action(self, action: Mapping[str, Any]) -> None:
+        keys = list(action)
+        if any(
+            not isinstance(key, str) or key != key.strip().lower()
+            for key in keys
+        ):
+            raise PolicyViolation("action keys must use canonical lowercase names")
+        normalized_keys = [key.strip().lower() for key in keys]
+        if len(normalized_keys) != len(set(normalized_keys)):
+            raise PolicyViolation("action contains duplicate normalized fields")
         name = str(action.get("action", "")).strip().lower()
         if name not in self._ALLOWED_ACTIONS:
             raise PolicyViolation(f"action is not permitted for search-only automation: {name}")
-        normalized_keys = {str(key).strip().lower() for key in action}
-        if normalized_keys - self._ALLOWED_ACTION_KEYS[name]:
+        if set(normalized_keys) - self._ALLOWED_ACTION_KEYS[name]:
             raise PolicyViolation("action contains unsupported automation fields")
         if name == "navigate":
             url = str(action.get("url", ""))
@@ -178,10 +186,31 @@ class SearchPolicy:
 
 
 class _ResultsScriptParser(HTMLParser):
+    _VOID_ELEMENTS = frozenset(
+        {
+            "area",
+            "base",
+            "br",
+            "col",
+            "embed",
+            "hr",
+            "img",
+            "input",
+            "link",
+            "meta",
+            "param",
+            "source",
+            "track",
+            "wbr",
+        }
+    )
+    _NON_VISIBLE_ELEMENTS = frozenset({"head", "script", "style", "template"})
+
     def __init__(self) -> None:
         super().__init__()
         self.page_kind: str | None = None
         self._in_results_script = False
+        self._element_stack: list[tuple[str, bool]] = []
         self.results_json = ""
         self.visible_text: list[str] = []
 
@@ -191,15 +220,40 @@ class _ResultsScriptParser(HTMLParser):
             self.page_kind = attributes["data-page-kind"]
         if tag == "script" and attributes.get("id") == "aeroplan-results-data":
             self._in_results_script = True
+        parent_hidden = self._element_stack[-1][1] if self._element_stack else False
+        style = attributes.get("style", "") or ""
+        style_declarations = {
+            name.strip().lower(): value.strip().lower().removesuffix("!important").strip()
+            for declaration in style.split(";")
+            if ":" in declaration
+            for name, value in [declaration.split(":", 1)]
+        }
+        element_hidden = (
+            parent_hidden
+            or tag in self._NON_VISIBLE_ELEMENTS
+            or "hidden" in attributes
+            or (attributes.get("aria-hidden") or "").strip().lower() == "true"
+            or style_declarations.get("display") == "none"
+            or style_declarations.get("visibility") in {"hidden", "collapse"}
+            or style_declarations.get("content-visibility") == "hidden"
+        )
+        if tag not in self._VOID_ELEMENTS:
+            self._element_stack.append((tag, element_hidden))
 
     def handle_endtag(self, tag: str) -> None:
         if tag == "script" and self._in_results_script:
             self._in_results_script = False
+        for index in range(len(self._element_stack) - 1, -1, -1):
+            if self._element_stack[index][0] == tag:
+                del self._element_stack[index:]
+                break
 
     def handle_data(self, data: str) -> None:
         if self._in_results_script:
             self.results_json += data
-        elif data.strip():
+        elif data.strip() and not (
+            self._element_stack and self._element_stack[-1][1]
+        ):
             self.visible_text.append(data.strip())
 
 

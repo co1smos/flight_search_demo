@@ -193,6 +193,25 @@ def test_search_policy_rejects_forbidden_intent_hidden_in_allowed_actions(action
         SearchPolicy().validate_action(action)
 
 
+@pytest.mark.parametrize(
+    "action",
+    [
+        {"action": "read_results", "Action": "execute_script"},
+        {
+            "action": "fill_search_field",
+            "field": "origin",
+            "FIELD": "password",
+            "value": "JFK",
+        },
+        {"action": "read_results", " action ": "execute_script"},
+        {"Action": "read_results"},
+    ],
+)
+def test_search_policy_rejects_noncanonical_and_case_colliding_action_keys(action):
+    with pytest.raises(PolicyViolation):
+        SearchPolicy().validate_action(action)
+
+
 def test_search_policy_allows_passenger_count_as_search_criteria():
     SearchPolicy().validate_action(
         {"action": "select_search_option", "field": "passenger_count", "value": 2}
@@ -352,6 +371,41 @@ def test_points_limit_is_per_passenger_and_cash_is_not_converted(criteria):
     assert itinerary["cash"] == {"displayed_total": "US$146.80", "currency": "USD"}
     assert itinerary["connections"] == 1
     assert len(itinerary["segments"]) == 2
+
+
+@pytest.mark.parametrize(
+    "hidden_attribute",
+    [
+        "hidden",
+        'aria-hidden="true"',
+        'style="display: none"',
+        'style="visibility:hidden"',
+    ],
+)
+def test_prices_inside_hidden_dom_containers_do_not_qualify(
+    criteria, tmp_path, hidden_attribute
+):
+    fixture = tmp_path / "hidden-price.html"
+    fixture.write_text(
+        f"""<!doctype html><html><body><main data-page-kind="results">
+        <div {hidden_attribute}><span>60,000 pts + $82.40 CAD</span></div>
+        <script id="aeroplan-results-data" type="application/json">
+        {{"itineraries":[{{"visible":true,"complete_itinerary":true,
+        "price_kind":"exact","price_label":"60,000 pts","points_per_passenger":60000,
+        "cash":{{"displayed_total":"$82.40","currency":"CAD"}},
+        "segments":[{{"departure":"2026-11-05T20:30:00-05:00",
+        "arrival":"2026-11-06T08:35:00+01:00","flight_number":"AC 872",
+        "marketing_carrier":"Air Canada","operating_carrier":"Air Canada",
+        "cabin":"Business"}}]}}]}}
+        </script></main></body></html>""",
+        encoding="utf-8",
+    )
+
+    result = AeroplanSearchAdapter(
+        browser=AeroplanFixtureBrowser(fixture)
+    ).execute(criteria, "hidden-price")
+
+    assert result["status"] == "UNVERIFIED_PRICE"
 
 
 def test_app_json_and_terminal_reports_use_official_entry_not_transient_url(criteria):
