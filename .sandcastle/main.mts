@@ -108,6 +108,21 @@ async function readPane(paneId: string) {
   return result.stdout || result.stderr;
 }
 
+async function readPaneInfo(paneId: string) {
+  const result = await run("herdr", ["pane", "get", paneId]);
+  if (result.exitCode !== 0) return { error: result.stderr || result.stdout };
+  try {
+    return JSON.parse(result.stdout)?.result?.pane;
+  } catch {
+    return { error: "Herdr returned invalid pane metadata" };
+  }
+}
+
+async function readPaneEvidence(paneId: string) {
+  const paneInfo = await readPaneInfo(paneId);
+  return `Herdr pane metadata:\n${JSON.stringify(paneInfo, null, 2)}\n\nRecent pane output:\n${await readPane(paneId)}`;
+}
+
 async function readRollouts(worktreePath: string, phaseStartedAt: string) {
   const rootDir = join(process.env.CODEX_HOME || join(homedir(), ".codex"), "sessions");
   const found: any[] = [];
@@ -182,17 +197,17 @@ async function runPhase({
   try {
     await requireOk("herdr", ["pane", "run", paneId, command]);
     const receipt = await waitForJson(receiptPath, options.timeoutMs);
-    const paneText = await readPane(paneId);
+    const paneInfo = await readPaneInfo(paneId);
     validateSessionEvidence({
       receiptSessionId: receipt.session_id,
-      paneText,
+      paneSession: paneInfo?.agent_session,
       rollouts: await readRollouts(worktreePath, phaseStartedAt),
       worktreePath,
       phaseStartedAt,
     });
     return { receipt, paneId };
   } catch (error) {
-    await writeFile(paneEvidencePath, await readPane(paneId));
+    await writeFile(paneEvidencePath, await readPaneEvidence(paneId));
     throw error;
   } finally {
     await closePane(paneId);

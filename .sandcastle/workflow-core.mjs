@@ -251,8 +251,10 @@ export function validateReviewerReceipt(receipt, expected) {
 
 export function validateSessionEvidence(options) {
   validateSessionId(options.receiptSessionId);
-  const paneIds = new Set(options.paneText.match(SESSION_ID_RE) || []);
-  if (!paneIds.has(options.receiptSessionId) || paneIds.size !== 1) {
+  const paneSession = options.paneSession;
+  if (paneSession?.agent !== "codex"
+    || paneSession.kind !== "id"
+    || paneSession.value !== options.receiptSessionId) {
     throw new Error("pane evidence does not identify the exact receipt session");
   }
   const phaseStarted = Date.parse(options.phaseStartedAt);

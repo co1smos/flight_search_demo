@@ -267,7 +267,12 @@ test("validateSessionEvidence requires exact pane and rollout agreement", () => 
   const sessionId = "01a08d05-d511-7582-bcff-2c26d5ae3c5a";
   const evidence = validateSessionEvidence({
     receiptSessionId: sessionId,
-    paneText: `OpenAI Codex\nsession id: ${sessionId}\ncompleted`,
+    paneSession: {
+      agent: "codex",
+      kind: "id",
+      source: "herdr:codex",
+      value: sessionId,
+    },
     rollouts: [
       {
         sessionId,
@@ -284,13 +289,54 @@ test("validateSessionEvidence requires exact pane and rollout agreement", () => 
   assert.throws(
     () => validateSessionEvidence({
       receiptSessionId: sessionId,
-      paneText: "no session here",
+      paneSession: undefined,
       rollouts: [],
       worktreePath: "/tmp/worktree",
       phaseStartedAt: "2026-09-11T00:00:00.000Z",
     }),
     /pane evidence/,
   );
+  assert.throws(
+    () => validateSessionEvidence({
+      receiptSessionId: sessionId,
+      paneSession: {
+        agent: "codex",
+        kind: "id",
+        source: "herdr:codex",
+        value: "01a08da0-ad62-75d2-b850-b0cbf944a1c9",
+      },
+      rollouts: [],
+      worktreePath: "/tmp/worktree",
+      phaseStartedAt: "2026-09-11T00:00:00.000Z",
+    }),
+    /pane evidence/,
+  );
+});
+
+test("validateSessionEvidence accepts Herdr pane identity after long output evicts the session header", () => {
+  const sessionId = "01a08ef7-dc47-7341-9bd0-ba1569b4a2f7";
+  const evidence = validateSessionEvidence({
+    receiptSessionId: sessionId,
+    paneText: "the last 300 lines contain only the end of a very large diff",
+    paneSession: {
+      agent: "codex",
+      kind: "id",
+      source: "herdr:codex",
+      value: sessionId,
+    },
+    rollouts: [
+      {
+        sessionId,
+        cwd: "/tmp/worktree",
+        startedAt: "2026-09-11T05:30:01.000Z",
+        path: "/home/ubuntu/.codex/sessions/rollout.jsonl",
+      },
+    ],
+    worktreePath: "/tmp/worktree",
+    phaseStartedAt: "2026-09-11T05:30:00.000Z",
+  });
+
+  assert.equal(evidence.rolloutPath, "/home/ubuntu/.codex/sessions/rollout.jsonl");
 });
 
 test("lingering Unsnooze resuming state is warning evidence", () => {
