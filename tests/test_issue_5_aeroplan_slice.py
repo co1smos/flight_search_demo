@@ -302,6 +302,31 @@ def test_nested_price_wrapper_uses_full_itinerary_card_context(criteria, tmp_pat
     assert result["status"] == "UNVERIFIED_PRICE"
 
 
+def test_payload_price_is_verified_against_its_own_itinerary_card(criteria, tmp_path):
+    fixture = tmp_path / "separate-card-price.html"
+    fixture.write_text(
+        """<!doctype html><html><body><main data-page-kind="results">
+        <article><div>AC 111</div><div>60,000 pts + $82.40 CAD</div></article>
+        <article><div>AC 872</div><div>From 60,000 pts + $82.40 CAD</div></article>
+        <script id="aeroplan-results-data" type="application/json">
+        {"itineraries":[{"visible":true,"complete_itinerary":true,
+        "price_kind":"exact","price_label":"60,000 pts","points_per_passenger":60000,
+        "cash":{"displayed_total":"$82.40","currency":"CAD"},
+        "segments":[{"departure":"2026-11-05T20:30:00-05:00",
+        "arrival":"2026-11-06T08:35:00+01:00","flight_number":"AC 872",
+        "marketing_carrier":"Air Canada","operating_carrier":"Air Canada",
+        "cabin":"Business"}]}]}
+        </script></main></body></html>""",
+        encoding="utf-8",
+    )
+
+    result = AeroplanSearchAdapter(
+        browser=AeroplanFixtureBrowser(fixture)
+    ).execute(criteria, "separate-card-price")
+
+    assert result["status"] == "UNVERIFIED_PRICE"
+
+
 def test_malformed_scalar_warnings_return_parser_failed(criteria, tmp_path):
     fixture = tmp_path / "scalar-warnings.html"
     fixture.write_text(
@@ -611,6 +636,29 @@ def test_search_policy_rejects_agent_navigation_to_identity_domains(url):
         SearchPolicy().validate_action({"action": "navigate", "url": url})
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://login.aircanada.com/account/delete",
+        "https://aircanada.b2clogin.com/password-reset",
+    ],
+)
+def test_search_policy_rejects_non_authentication_identity_paths(url):
+    with pytest.raises(PolicyViolation):
+        SearchPolicy().validate_url(url)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://login.aircanada.com/login",
+        "https://aircanada.b2clogin.com/aircanada.onmicrosoft.com/B2C_1A_signin/oauth2/v2.0/authorize",
+    ],
+)
+def test_search_policy_allows_required_identity_authentication_paths(url):
+    SearchPolicy().validate_url(url)
+
+
 def test_agent_outcome_is_rejected_when_step_bound_or_domain_policy_is_broken(criteria):
     for outcome in (
         BrowserAgentOutcome("completed", None, 7, (), (), "too many steps"),
@@ -641,6 +689,13 @@ def test_agent_outcome_is_rejected_when_step_bound_or_domain_policy_is_broken(cr
             None,
             1,
             ("https://example.com/",),
+            ({"action": "read_results"},),
+        ),
+        BrowserAgentOutcome(
+            "completed",
+            None,
+            1,
+            ("https://login.aircanada.com/account/delete",),
             ({"action": "read_results"},),
         ),
     ):

@@ -90,6 +90,18 @@ class SearchPolicy:
         "/aeroplan/redeem/availability",
         "/search",
     })
+    _IDENTITY_PATHS = {
+        "login.aircanada.com": frozenset({
+            "/",
+            "/authorize",
+            "/login",
+            "/oauth2/authorize",
+            "/oauth2/v2.0/authorize",
+        }),
+    }
+    _B2C_AUTHORIZE_PATH = re.compile(
+        r"/[A-Za-z0-9.-]+/[A-Za-z0-9._~-]+/oauth2/v2\.0/authorize"
+    )
     _ALLOWED_SEARCH_FIELDS = frozenset({
         "adults",
         "cabin",
@@ -156,6 +168,16 @@ class SearchPolicy:
             and normalized_path not in self._AIR_CANADA_SEARCH_PATHS
         ):
             raise PolicyViolation("navigation is not an approved search-only Air Canada path")
+        if parsed.hostname in REQUIRED_IDENTITY_DOMAINS:
+            allowed_paths = self._IDENTITY_PATHS.get(parsed.hostname, frozenset())
+            if (
+                normalized_path not in allowed_paths
+                and not (
+                    parsed.hostname == "aircanada.b2clogin.com"
+                    and self._B2C_AUTHORIZE_PATH.fullmatch(normalized_path)
+                )
+            ):
+                raise PolicyViolation("navigation is not a required authentication path")
 
     def validate_action(self, action: Mapping[str, Any]) -> None:
         keys = list(action)
@@ -489,6 +511,7 @@ def _is_exact_visible_price(
     displayed_total: str,
     currency: str,
     visible_text: list[tuple[str, str]],
+    flight_numbers: Sequence[str],
 ) -> bool:
     expected = " ".join(f"{value} + {displayed_total} {currency}".split()).casefold()
     qualifier = re.compile(
@@ -497,10 +520,40 @@ def _is_exact_visible_price(
         r"\band\s+up\b|\bupwards?\b|\*)",
         re.IGNORECASE,
     )
+    candidates: list[tuple[str, str]] = []
+    for text, context in visible_text:
+        normalized_text = " ".join(text.split()).casefold()
+        start = normalized_text.find(expected)
+        if start < 0 or (start > 0 and normalized_text[start - 1] in "0123456789,"):
+            continue
+        candidates.append((normalized_text, " ".join(context.split())))
+
+    flight_patterns = []
+    for number in flight_numbers:
+        match = re.fullmatch(r"\s*([A-Za-z0-9]{2,3})\s*(\d{1,4}[A-Za-z]?)\s*", number)
+        if match is not None:
+            flight_patterns.append(
+                re.compile(
+                    rf"(?<![A-Za-z0-9]){re.escape(match.group(1))}\s*"
+                    rf"{re.escape(match.group(2))}(?![A-Za-z0-9])",
+                    re.IGNORECASE,
+                )
+            )
+    related = [
+        candidate
+        for candidate in candidates
+        if any(pattern.search(candidate[1]) for pattern in flight_patterns)
+    ]
+    if related:
+        candidates = related
+    elif any(
+        re.search(r"\b[A-Z]{2}\s*\d{1,4}\b", context, re.IGNORECASE)
+        for _, context in candidates
+    ):
+        return False
     return any(
-        " ".join(text.split()).casefold() == expected
-        and qualifier.search(" ".join(context.split())) is None
-        for text, context in visible_text
+        text == expected and qualifier.search(context) is None
+        for text, context in candidates
     )
 
 
@@ -536,10 +589,6 @@ def _validated_itinerary(
         for field in ("displayed_total", "currency")
     ):
         return None, "PARSER_FAILED"
-    if not _is_exact_visible_price(
-        label, cash["displayed_total"], cash["currency"], visible_text
-    ):
-        return None, "UNVERIFIED_PRICE"
     segments = raw.get("segments")
     required_segment_fields = (
         "departure",
@@ -556,6 +605,14 @@ def _validated_itinerary(
         for segment in segments
     ):
         return None, "PARSER_FAILED"
+    if not _is_exact_visible_price(
+        label,
+        cash["displayed_total"],
+        cash["currency"],
+        visible_text,
+        [segment["flight_number"] for segment in segments],
+    ):
+        return None, "UNVERIFIED_PRICE"
     cabins = {segment["cabin"] for segment in segments}
     warnings_payload = raw.get("warnings", [])
     if not isinstance(warnings_payload, list) or any(
