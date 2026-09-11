@@ -8,6 +8,10 @@ Issue body:
 
 {{ISSUE_BODY}}
 
+Round context:
+
+{{ROUND_CONTEXT}}
+
 Rules:
 
 - Work only in the current Sandcastle worktree and only on this issue.

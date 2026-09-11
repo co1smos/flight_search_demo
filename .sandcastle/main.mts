@@ -7,13 +7,16 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 
 import {
+  buildImplementerRoundContext,
   buildCodexPhaseCommand,
   declaredBlockerNumbers,
   hasLingeringUnsnoozeState,
   parseCliOptions,
   parseProviderEnvName,
+  roundArtifactPaths,
   selectReadyIssue,
   shellQuote,
+  validateFreshSessionId,
   validateImplementerReceipt,
   validateReviewerReceipt,
   validateSessionEvidence,
@@ -153,6 +156,7 @@ async function runPhase({
   promptPath,
   schemaPath,
   receiptPath,
+  paneEvidencePath,
   providerEnvName,
 }: {
   phase: "implementer" | "reviewer";
@@ -160,6 +164,7 @@ async function runPhase({
   promptPath: string;
   schemaPath: string;
   receiptPath: string;
+  paneEvidencePath: string;
   providerEnvName: string;
 }) {
   const credential = process.env[providerEnvName];
@@ -187,7 +192,7 @@ async function runPhase({
     });
     return { receipt, paneId };
   } catch (error) {
-    await writeFile(join(artifactRoot, `${phase}-pane.txt`), await readPane(paneId));
+    await writeFile(paneEvidencePath, await readPane(paneId));
     throw error;
   } finally {
     await closePane(paneId);
@@ -212,7 +217,6 @@ const plan = {
   branch,
   model: options.model,
   effort: options.effort,
-  maxModelCalls: options.maxModelCalls,
   timeoutMs: options.timeoutMs,
   tests: { focused: options.focusedTest, final: options.finalTest },
   providerEnvName,
@@ -221,7 +225,7 @@ const plan = {
 };
 
 if (options.dryRun) {
-  const controlDir = join("<artifacts>", "control");
+  const artifacts = roundArtifactPaths("<artifacts>", 1);
   console.log(JSON.stringify({
     status: "preflight-ok",
     ...plan,
@@ -230,17 +234,17 @@ if (options.dryRun) {
         model: options.model,
         effort: options.effort,
         worktreePath: "<worktree>",
-        schemaPath: join(controlDir, "implementer-schema.json"),
-        receiptPath: join("<artifacts>", "implementer.json"),
-        promptPath: join(controlDir, "implementer.md"),
+        schemaPath: artifacts.implementerSchemaPath,
+        receiptPath: artifacts.implementerReceiptPath,
+        promptPath: artifacts.implementerPromptPath,
       }),
       reviewer: buildCodexPhaseCommand({
         model: options.model,
         effort: options.effort,
         worktreePath: "<worktree>",
-        schemaPath: join(controlDir, "reviewer-schema.json"),
-        receiptPath: join("<artifacts>", "reviewer.json"),
-        promptPath: join(controlDir, "reviewer.md"),
+        schemaPath: artifacts.reviewerSchemaPath,
+        receiptPath: artifacts.reviewerReceiptPath,
+        promptPath: artifacts.reviewerPromptPath,
       }),
     },
   }, null, 2));
@@ -267,69 +271,99 @@ const templates = {
   implementer: await readFile(join(root, ".sandcastle", "implementer-prompt.md"), "utf8"),
   reviewer: await readFile(join(root, ".sandcastle", "reviewer-prompt.md"), "utf8"),
 };
-const implementerPrompt = fillTemplate(templates.implementer, {
-  ISSUE_NUMBER: issue.number,
-  ISSUE_TITLE: issue.title,
-  ISSUE_BODY: issue.body,
-  BASE_SHA: baseSha,
-  BRANCH: branch,
-});
-const implementerPromptPath = join(controlDir, "implementer.md");
-const implementerSchemaPath = join(controlDir, "implementer-schema.json");
-const implementerReceiptPath = join(artifactRoot, "implementer.json");
-await writeFile(implementerPromptPath, implementerPrompt);
-await copyFile(join(root, ".sandcastle", "implementer-schema.json"), implementerSchemaPath);
+const usedSessionIds = new Set<string>();
+const implementerSessionIds: string[] = [];
+const reviewerSessionIds: string[] = [];
+let round = 1;
+let candidateHead = baseSha;
+let reviewerFindings: string[] = [];
+let focusedTestEvidence = "";
 
-const implementer = await runPhase({
-  phase: "implementer",
-  worktreePath,
-  promptPath: implementerPromptPath,
-  schemaPath: implementerSchemaPath,
-  receiptPath: implementerReceiptPath,
-  providerEnvName,
-});
-const implementationHeadResult = await execInWorktree("git rev-parse HEAD");
-if (implementationHeadResult.exitCode !== 0) throw new Error(implementationHeadResult.stderr);
-const implementationHead = implementationHeadResult.stdout.trim();
-validateImplementerReceipt(implementer.receipt, { issueNumber: issue.number, head: implementationHead });
-if (implementationHead === baseSha) throw new Error("implementer did not create a candidate commit");
+while (true) {
+  const artifacts = roundArtifactPaths(artifactRoot, round);
+  const previousCandidateHead = candidateHead;
+  const implementerPrompt = fillTemplate(templates.implementer, {
+    ISSUE_NUMBER: issue.number,
+    ISSUE_TITLE: issue.title,
+    ISSUE_BODY: issue.body,
+    BASE_SHA: baseSha,
+    BRANCH: branch,
+    ROUND_CONTEXT: buildImplementerRoundContext({
+      round,
+      currentHead: candidateHead,
+      reviewerFindings,
+      focusedTestEvidence,
+    }),
+  });
+  await writeFile(artifacts.implementerPromptPath, implementerPrompt);
+  await copyFile(join(root, ".sandcastle", "implementer-schema.json"), artifacts.implementerSchemaPath);
 
-const focused = await execInWorktree(options.focusedTest);
-await writeFile(join(artifactRoot, "focused-test.txt"), `${focused.stdout}\n${focused.stderr}`);
-if (focused.exitCode !== 0) throw new Error("focused implementation gate failed");
+  const implementer = await runPhase({
+    phase: "implementer",
+    worktreePath,
+    promptPath: artifacts.implementerPromptPath,
+    schemaPath: artifacts.implementerSchemaPath,
+    receiptPath: artifacts.implementerReceiptPath,
+    paneEvidencePath: artifacts.implementerPanePath,
+    providerEnvName,
+  });
+  const implementationHeadResult = await execInWorktree("git rev-parse HEAD");
+  if (implementationHeadResult.exitCode !== 0) throw new Error(implementationHeadResult.stderr);
+  candidateHead = implementationHeadResult.stdout.trim();
+  validateImplementerReceipt(implementer.receipt, { issueNumber: issue.number, head: candidateHead });
+  validateFreshSessionId(implementer.receipt.session_id, usedSessionIds);
+  usedSessionIds.add(implementer.receipt.session_id);
+  implementerSessionIds.push(implementer.receipt.session_id);
+  if (candidateHead === previousCandidateHead) throw new Error("implementer did not create a new candidate commit");
 
-const reviewerPrompt = fillTemplate(templates.reviewer, {
-  ISSUE_NUMBER: issue.number,
-  ISSUE_TITLE: issue.title,
-  ISSUE_BODY: issue.body,
-  BASE_SHA: baseSha,
-  CANDIDATE_HEAD: implementationHead,
-  TEST_EVIDENCE: focused.stdout.slice(-6000),
-});
-const reviewerPromptPath = join(controlDir, "reviewer.md");
-const reviewerSchemaPath = join(controlDir, "reviewer-schema.json");
-const reviewerReceiptPath = join(artifactRoot, "reviewer.json");
-await writeFile(reviewerPromptPath, reviewerPrompt);
-await copyFile(join(root, ".sandcastle", "reviewer-schema.json"), reviewerSchemaPath);
+  const focused = await execInWorktree(options.focusedTest);
+  focusedTestEvidence = `${focused.stdout}\n${focused.stderr}`;
+  await writeFile(artifacts.focusedTestPath, focusedTestEvidence);
+  if (focused.exitCode !== 0) throw new Error("focused implementation gate failed");
 
-const reviewer = await runPhase({
-  phase: "reviewer",
-  worktreePath,
-  promptPath: reviewerPromptPath,
-  schemaPath: reviewerSchemaPath,
-  receiptPath: reviewerReceiptPath,
-  providerEnvName,
-});
-validateReviewerReceipt(reviewer.receipt, {
-  reviewedHead: implementationHead,
-  implementerSessionId: implementer.receipt.session_id,
-});
-if (reviewer.receipt.verdict !== "approved") {
-  throw new Error(`reviewer verdict ${reviewer.receipt.verdict}: ${reviewer.receipt.findings.join("; ")}`);
+  const reviewerPrompt = fillTemplate(templates.reviewer, {
+    ISSUE_NUMBER: issue.number,
+    ISSUE_TITLE: issue.title,
+    ISSUE_BODY: issue.body,
+    BASE_SHA: baseSha,
+    CANDIDATE_HEAD: candidateHead,
+    TEST_EVIDENCE: focusedTestEvidence,
+  });
+  await writeFile(artifacts.reviewerPromptPath, reviewerPrompt);
+  await copyFile(join(root, ".sandcastle", "reviewer-schema.json"), artifacts.reviewerSchemaPath);
+
+  const reviewer = await runPhase({
+    phase: "reviewer",
+    worktreePath,
+    promptPath: artifacts.reviewerPromptPath,
+    schemaPath: artifacts.reviewerSchemaPath,
+    receiptPath: artifacts.reviewerReceiptPath,
+    paneEvidencePath: artifacts.reviewerPanePath,
+    providerEnvName,
+  });
+  validateReviewerReceipt(reviewer.receipt, {
+    reviewedHead: candidateHead,
+    implementerSessionId: implementer.receipt.session_id,
+  });
+  validateFreshSessionId(reviewer.receipt.session_id, usedSessionIds);
+  usedSessionIds.add(reviewer.receipt.session_id);
+  reviewerSessionIds.push(reviewer.receipt.session_id);
+
+  const headAfterReview = await execInWorktree("git rev-parse HEAD");
+  if (headAfterReview.stdout.trim() !== candidateHead) throw new Error("reviewer changed Git HEAD");
+  const dirtyAfterReview = await execInWorktree("git status --short --untracked-files=no");
+  if (dirtyAfterReview.stdout.trim()) {
+    throw new Error(`reviewer left tracked worktree changes:\n${dirtyAfterReview.stdout}`);
+  }
+
+  if (reviewer.receipt.verdict === "approved") break;
+  if (reviewer.receipt.verdict === "blocked") {
+    throw new Error(`reviewer verdict blocked: ${reviewer.receipt.findings.join("; ")}`);
+  }
+  reviewerFindings = reviewer.receipt.findings;
+  round += 1;
 }
 
-const headAfterReview = await execInWorktree("git rev-parse HEAD");
-if (headAfterReview.stdout.trim() !== implementationHead) throw new Error("reviewer changed Git HEAD");
 const final = await execInWorktree(options.finalTest);
 await writeFile(join(artifactRoot, "final-test.txt"), `${final.stdout}\n${final.stderr}`);
 if (final.exitCode !== 0) throw new Error("final acceptance gate failed");
@@ -337,7 +371,7 @@ const dirty = await execInWorktree("git status --short --untracked-files=no");
 if (dirty.stdout.trim()) throw new Error(`tracked worktree changes remain:\n${dirty.stdout}`);
 
 const unsnoozeStatus = await commandOk("unsnooze status");
-const warnings = [implementer.receipt.session_id, reviewer.receipt.session_id]
+const warnings = [...implementerSessionIds, ...reviewerSessionIds]
   .filter((sessionId) => hasLingeringUnsnoozeState(unsnoozeStatus.stdout, sessionId))
   .map((sessionId) => `Unsnooze still tracks ${sessionId}; retained as cleanup evidence`);
 await writeFile(join(artifactRoot, "result.json"), `${JSON.stringify({
@@ -345,10 +379,11 @@ await writeFile(join(artifactRoot, "result.json"), `${JSON.stringify({
   issue: issue.number,
   branch,
   baseSha,
-  head: implementationHead,
-  implementerSessionId: implementer.receipt.session_id,
-  reviewerSessionId: reviewer.receipt.session_id,
-  verdict: reviewer.receipt.verdict,
+  head: candidateHead,
+  rounds: round,
+  implementerSessionIds,
+  reviewerSessionIds,
+  verdict: "approved",
   warnings,
 }, null, 2)}\n`);
 
@@ -356,7 +391,7 @@ console.log(JSON.stringify({
   status: "reviewed-local-candidate",
   issue: issue.number,
   branch,
-  head: implementationHead,
+  head: candidateHead,
   artifacts: artifactRoot,
   warnings,
 }, null, 2));

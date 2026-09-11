@@ -22,16 +22,16 @@ The concise form `Implement issue #5` is also sufficient when Hermes is running 
 - Unsnooze monitors and resumes Codex quota stops. The runner calls `unsnooze _run codex` explicitly; it does not depend on shell wrappers or a background daemon.
 - Herdr provides visible panes. The controller closes only panes it creates.
 
-## Token budget
+## Model routing
 
 Hermes applies the `AGENTS.md` routing rule to the resolved issue before preflight, then passes the selected tuple through `SANDCASTLE_MODEL` and `SANDCASTLE_EFFORT`. The runner has no hard-coded model default and fails closed when Hermes has not routed the work.
 
-The initial workflow makes exactly two model calls per run using that routed tuple:
+Each round uses that routed tuple for:
 
 1. one implementer;
 2. one fresh reviewer.
 
-No automatic correction or re-review call is allowed. A failed gate or non-approved verdict stops for Hermes/human classification. This protects the shared ChatGPT Plus five-hour quota. Change this policy only after reviewing measured usage.
+When the reviewer requests correctable changes, the controller starts another fresh implementer session, runs the focused gate, and starts another fresh reviewer session. Approval advances to final tests. Failed gates, blocked verdicts, and errors remain terminal.
 
 ## Preflight
 
@@ -46,7 +46,7 @@ The preflight verifies:
 - required commands;
 - one open, dependency-ready `ready-for-agent` issue (or `--issue N` override);
 - exact base SHA and candidate branch;
-- model, effort, two-call budget, timeout, and test commands;
+- model, effort, timeout, and test commands;
 - the active Codex provider's credential variable by name and presence only.
 
 It never prints the credential value.
@@ -69,7 +69,6 @@ SANDCASTLE_EFFORT               required; paired with the routed model
 SANDCASTLE_FOCUSED_TEST         default uv run --with pytest pytest -q
 SANDCASTLE_FINAL_TEST           default uv run --with pytest pytest -q
 SANDCASTLE_TIMEOUT_SECONDS      default 3600 per phase
-SANDCASTLE_MAX_MODEL_CALLS      must be 2 initially
 ```
 
 ## Run
@@ -89,7 +88,7 @@ herdr pane run <returned-pane-id> "SANDCASTLE_MODEL=gpt-5.6-sol SANDCASTLE_EFFOR
 
 Use the pane ID returned by the split command. This controller pane is not a Codex session and consumes no model quota while it waits.
 
-Do not start it through an outer Codex session. The controller launches the two model-backed panes itself.
+Do not start it through an outer Codex session. The controller launches each model-backed pane itself.
 
 Sequence:
 
@@ -101,6 +100,8 @@ validate exact session ID + rollout + committed HEAD
 focused controller-owned tests
 fresh Unsnooze-managed Codex reviewer
 validate independent session + structured verdict + unchanged HEAD
+if changes_requested: fresh implementer correction commit, focused tests, fresh reviewer
+repeat correction rounds until approved; blocked/errors stop
 final controller-owned tests
 stop at local reviewed candidate branch
 ```
@@ -116,7 +117,7 @@ The workflow stops without advancing when:
 - a phase times out;
 - implementer does not commit;
 - either test gate fails;
-- reviewer requests changes or is blocked;
+- reviewer is blocked;
 - reviewer modifies Git HEAD or leaves tracked changes.
 
 The runner never intentionally uses `codex resume --last`. Real Codex rollout IDs are required for validation. A lingering Unsnooze state after pane cleanup is retained as warning evidence, not treated as success.

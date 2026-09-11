@@ -1,13 +1,13 @@
 # Sandcastle + Unsnooze workflow
 
 This repository uses a deterministic Sandcastle controller with `noSandbox()`.
-Hermes launches the controller in Herdr; the controller launches one fresh
-Unsnooze-managed Codex implementer and one fresh reviewer in visible sibling
+Hermes launches the controller in Herdr; the controller launches fresh
+Unsnooze-managed Codex implementer and reviewer sessions in visible sibling
 panes.
 
-The initial workflow is deliberately capped at two model calls. It stops at a
-local reviewed candidate branch and never pushes, merges, or mutates GitHub
-issues.
+The workflow repeats implementer and reviewer rounds when the reviewer requests
+correctable changes. It stops at a local reviewed candidate branch and never
+pushes, merges, or mutates GitHub issues.
 
 Full policy and options:
 
@@ -23,8 +23,8 @@ SANDCASTLE_MODEL=gpt-5.6-sol SANDCASTLE_EFFORT=medium npm run sandcastle:preflig
 ```
 
 Preflight resolves the issue/frontier and validates tools, branch/base, test
-commands, provider credential presence, timeout, and the two-call budget. It
-prints the credential variable name but never its value.
+commands, provider credential presence, and timeout. It prints the credential
+variable name but never its value.
 
 ## Run one local reviewed candidate
 
@@ -47,7 +47,6 @@ Defaults:
 
 ```text
 model and effort: required; Hermes selects them from AGENTS.md
-model calls: exactly 2
 timeout: 3600 seconds per phase
 focused test: uv run --with pytest pytest -q
 final test: uv run --with pytest pytest -q

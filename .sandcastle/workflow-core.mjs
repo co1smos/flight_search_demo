@@ -1,3 +1,5 @@
+import { join } from "node:path";
+
 const DEFAULTS = Object.freeze({
   baseSha: "HEAD",
   focusedTest: "uv run --with pytest pytest -q",
@@ -20,7 +22,6 @@ export function parseCliOptions(argv, env = process.env) {
     focusedTest: env.SANDCASTLE_FOCUSED_TEST || DEFAULTS.focusedTest,
     finalTest: env.SANDCASTLE_FINAL_TEST || DEFAULTS.finalTest,
     timeoutMs: parseTimeout(env.SANDCASTLE_TIMEOUT_SECONDS || DEFAULTS.timeoutSeconds),
-    maxModelCalls: positiveInteger(env.SANDCASTLE_MAX_MODEL_CALLS || "2", "max model calls"),
     dryRun: parseBoolean(env.SANDCASTLE_DRY_RUN || env.SANDCASTLE_PREFLIGHT || "false"),
   };
 
@@ -63,9 +64,6 @@ export function parseCliOptions(argv, env = process.env) {
   }
   required(values.focusedTest, "focused test");
   required(values.finalTest, "final test");
-  if (values.maxModelCalls !== 2) {
-    throw new Error("initial workflow requires exactly 2 model calls: implementer and reviewer");
-  }
   return values;
 }
 
@@ -169,6 +167,51 @@ export function buildCodexPhaseCommand(options) {
     "-",
   ];
   return `${args.map(shellQuote).join(" ")} < ${shellQuote(options.promptPath)}`;
+}
+
+export function roundArtifactPaths(artifactRoot, round) {
+  const prefix = `round-${round}`;
+  const controlDir = join(artifactRoot, "control");
+  return {
+    implementerPromptPath: join(controlDir, `${prefix}-implementer.md`),
+    implementerSchemaPath: join(controlDir, `${prefix}-implementer-schema.json`),
+    implementerReceiptPath: join(artifactRoot, `${prefix}-implementer.json`),
+    implementerPanePath: join(artifactRoot, `${prefix}-implementer-pane.txt`),
+    focusedTestPath: join(artifactRoot, `${prefix}-focused-test.txt`),
+    reviewerPromptPath: join(controlDir, `${prefix}-reviewer.md`),
+    reviewerSchemaPath: join(controlDir, `${prefix}-reviewer-schema.json`),
+    reviewerReceiptPath: join(artifactRoot, `${prefix}-reviewer.json`),
+    reviewerPanePath: join(artifactRoot, `${prefix}-reviewer-pane.txt`),
+  };
+}
+
+export function buildImplementerRoundContext({
+  round,
+  currentHead,
+  reviewerFindings,
+  focusedTestEvidence,
+}) {
+  if (round === 1) {
+    return "This is the initial implementation round. Create the first candidate commit.";
+  }
+  return `This is correction round ${round}.
+Current candidate HEAD: ${currentHead}
+
+Exact reviewer findings from the previous round:
+${JSON.stringify(reviewerFindings)}
+
+Previous controller-owned focused-test evidence:
+${focusedTestEvidence.trimEnd()}
+
+You must correct these findings and create a new commit on top of the current candidate HEAD.`;
+}
+
+export function validateFreshSessionId(sessionId, usedSessionIds) {
+  validateSessionId(sessionId);
+  if (usedSessionIds.has(sessionId)) {
+    throw new Error(`Codex session_id reuses a prior session in this run: ${sessionId}`);
+  }
+  return sessionId;
 }
 
 export function validateImplementerReceipt(receipt, expected) {
