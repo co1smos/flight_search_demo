@@ -205,14 +205,53 @@ class _ResultsScriptParser(HTMLParser):
         }
     )
     _NON_VISIBLE_ELEMENTS = frozenset({"head", "script", "style", "template"})
+    _TEXT_REGION_ELEMENTS = frozenset(
+        {
+            "article",
+            "aside",
+            "body",
+            "button",
+            "dd",
+            "div",
+            "dl",
+            "dt",
+            "fieldset",
+            "figcaption",
+            "figure",
+            "footer",
+            "form",
+            "h1",
+            "h2",
+            "h3",
+            "h4",
+            "h5",
+            "h6",
+            "header",
+            "li",
+            "main",
+            "nav",
+            "ol",
+            "p",
+            "section",
+            "table",
+            "tbody",
+            "td",
+            "tfoot",
+            "th",
+            "thead",
+            "tr",
+            "ul",
+        }
+    )
 
     def __init__(self) -> None:
         super().__init__()
         self.page_kind: str | None = None
         self._in_results_script = False
-        self._element_stack: list[tuple[str, bool]] = []
+        self._element_stack: list[tuple[str, bool, list[str]]] = []
         self.results_json = ""
         self.visible_text: list[str] = []
+        self.visible_regions: list[str] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         attributes = dict(attrs)
@@ -238,13 +277,16 @@ class _ResultsScriptParser(HTMLParser):
             or style_declarations.get("content-visibility") == "hidden"
         )
         if tag not in self._VOID_ELEMENTS:
-            self._element_stack.append((tag, element_hidden))
+            self._element_stack.append((tag, element_hidden, []))
 
     def handle_endtag(self, tag: str) -> None:
         if tag == "script" and self._in_results_script:
             self._in_results_script = False
         for index in range(len(self._element_stack) - 1, -1, -1):
             if self._element_stack[index][0] == tag:
+                _, hidden, text_parts = self._element_stack[index]
+                if tag in self._TEXT_REGION_ELEMENTS and not hidden and text_parts:
+                    self.visible_regions.append(" ".join(text_parts))
                 del self._element_stack[index:]
                 break
 
@@ -254,7 +296,11 @@ class _ResultsScriptParser(HTMLParser):
         elif data.strip() and not (
             self._element_stack and self._element_stack[-1][1]
         ):
-            self.visible_text.append(data.strip())
+            text = data.strip()
+            self.visible_text.append(text)
+            for _, hidden, text_parts in self._element_stack:
+                if not hidden:
+                    text_parts.append(text)
 
 
 def classify_page(page: PageSnapshot) -> PageKind:
@@ -290,7 +336,7 @@ def _parse_results(page: PageSnapshot) -> tuple[list[dict[str, Any]], list[str]]
     itineraries = payload.get("itineraries")
     if not isinstance(itineraries, list):
         raise ValueError("results extraction payload has no itinerary list")
-    return itineraries, parser.visible_text
+    return itineraries, parser.visible_regions
 
 
 def _is_exact_visible_price(
@@ -351,7 +397,12 @@ def _validated_itinerary(
     ):
         return None, "PARSER_FAILED"
     cabins = {segment["cabin"] for segment in segments}
-    warnings = list(raw.get("warnings") or [])
+    warnings_payload = raw.get("warnings", [])
+    if not isinstance(warnings_payload, list) or any(
+        not isinstance(item, str) or not item.strip() for item in warnings_payload
+    ):
+        return None, "PARSER_FAILED"
+    warnings = list(warnings_payload)
     mixed_cabin = len(cabins) != 1 or cabins != {criteria.cabin}
     if mixed_cabin:
         warnings.append("mixed_cabin")

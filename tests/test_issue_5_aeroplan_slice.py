@@ -157,6 +157,78 @@ def test_price_must_be_visible_as_an_exact_value_not_a_numeric_substring(criteri
     assert result["status"] == "UNVERIFIED_PRICE"
 
 
+def test_exact_visible_price_can_span_nested_inline_nodes(criteria, tmp_path):
+    fixture = tmp_path / "nested-price.html"
+    fixture.write_text(
+        """<!doctype html><html><body><main data-page-kind="results">
+        <div><span>60,000</span> <span>pts</span> + <span>$82.40</span> <span>CAD</span></div>
+        <script id="aeroplan-results-data" type="application/json">
+        {"itineraries":[{"visible":true,"complete_itinerary":true,
+        "price_kind":"exact","price_label":"60,000 pts","points_per_passenger":60000,
+        "cash":{"displayed_total":"$82.40","currency":"CAD"},
+        "segments":[{"departure":"2026-11-05T20:30:00-05:00",
+        "arrival":"2026-11-06T08:35:00+01:00","flight_number":"AC 872",
+        "marketing_carrier":"Air Canada","operating_carrier":"Air Canada",
+        "cabin":"Business"}]}]}
+        </script></main></body></html>""",
+        encoding="utf-8",
+    )
+
+    result = AeroplanSearchAdapter(
+        browser=AeroplanFixtureBrowser(fixture)
+    ).execute(criteria, "nested-price")
+
+    assert result["status"] == "MATCH_FOUND"
+
+
+def test_nested_inline_price_with_visible_qualifier_is_rejected(criteria, tmp_path):
+    fixture = tmp_path / "nested-qualified-price.html"
+    fixture.write_text(
+        """<!doctype html><html><body><main data-page-kind="results">
+        <div><span>From:</span> <span>60,000</span> <span>pts</span> + <span>$82.40 CAD</span></div>
+        <script id="aeroplan-results-data" type="application/json">
+        {"itineraries":[{"visible":true,"complete_itinerary":true,
+        "price_kind":"exact","price_label":"60,000 pts","points_per_passenger":60000,
+        "cash":{"displayed_total":"$82.40","currency":"CAD"},
+        "segments":[{"departure":"2026-11-05T20:30:00-05:00",
+        "arrival":"2026-11-06T08:35:00+01:00","flight_number":"AC 872",
+        "marketing_carrier":"Air Canada","operating_carrier":"Air Canada",
+        "cabin":"Business"}]}]}
+        </script></main></body></html>""",
+        encoding="utf-8",
+    )
+
+    result = AeroplanSearchAdapter(
+        browser=AeroplanFixtureBrowser(fixture)
+    ).execute(criteria, "nested-qualified-price")
+
+    assert result["status"] == "UNVERIFIED_PRICE"
+
+
+def test_malformed_scalar_warnings_return_parser_failed(criteria, tmp_path):
+    fixture = tmp_path / "scalar-warnings.html"
+    fixture.write_text(
+        """<!doctype html><html><body><main data-page-kind="results">
+        <div>60,000 pts + $82.40 CAD</div>
+        <script id="aeroplan-results-data" type="application/json">
+        {"itineraries":[{"visible":true,"complete_itinerary":true,
+        "price_kind":"exact","price_label":"60,000 pts","points_per_passenger":60000,
+        "cash":{"displayed_total":"$82.40","currency":"CAD"},"warnings":1,
+        "segments":[{"departure":"2026-11-05T20:30:00-05:00",
+        "arrival":"2026-11-06T08:35:00+01:00","flight_number":"AC 872",
+        "marketing_carrier":"Air Canada","operating_carrier":"Air Canada",
+        "cabin":"Business"}]}]}
+        </script></main></body></html>""",
+        encoding="utf-8",
+    )
+
+    result = AeroplanSearchAdapter(
+        browser=AeroplanFixtureBrowser(fixture)
+    ).execute(criteria, "scalar-warnings")
+
+    assert result["status"] == "PARSER_FAILED"
+
+
 def test_visible_from_price_is_rejected_when_payload_claims_exact(criteria, tmp_path):
     fixture = tmp_path / "inconsistent-from-price.html"
     fixture.write_text(
