@@ -181,6 +181,33 @@ def test_visible_from_price_is_rejected_when_payload_claims_exact(criteria, tmp_
     assert result["status"] == "UNVERIFIED_PRICE"
 
 
+@pytest.mark.parametrize("qualified_label", ["From:", "Starting at:"])
+def test_visible_punctuated_qualified_price_is_rejected_when_payload_claims_exact(
+    criteria, tmp_path, qualified_label
+):
+    fixture = tmp_path / "punctuated-qualified-price.html"
+    fixture.write_text(
+        f"""<!doctype html><html><body><main data-page-kind="results">
+        <div>{qualified_label} 60,000 pts + $82.40 CAD</div>
+        <script id="aeroplan-results-data" type="application/json">
+        {{"itineraries":[{{"visible":true,"complete_itinerary":true,
+        "price_kind":"exact","price_label":"60,000 pts","points_per_passenger":60000,
+        "cash":{{"displayed_total":"$82.40","currency":"CAD"}},
+        "segments":[{{"departure":"2026-11-05T20:30:00-05:00",
+        "arrival":"2026-11-06T08:35:00+01:00","flight_number":"AC 872",
+        "marketing_carrier":"Air Canada","operating_carrier":"Air Canada",
+        "cabin":"Business"}}]}}]}}
+        </script></main></body></html>""",
+        encoding="utf-8",
+    )
+
+    result = AeroplanSearchAdapter(
+        browser=AeroplanFixtureBrowser(fixture)
+    ).execute(criteria, "punctuated-qualified-price")
+
+    assert result["status"] == "UNVERIFIED_PRICE"
+
+
 @pytest.mark.parametrize(
     "action",
     [

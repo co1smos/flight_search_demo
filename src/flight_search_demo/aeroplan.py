@@ -312,7 +312,7 @@ def _is_exact_visible_price(value: str, visible_text: str) -> bool:
     )
     qualifier_pattern = re.compile(
         r"\b(?:from|starting\s+(?:at|from)|as\s+low\s+as|estimated|"
-        r"approximately|about)(?:\s+(?:only|just))?\s*$",
+        r"approximately|about)(?:[^\w]+(?:only|just))?[^\w]*$",
         re.IGNORECASE,
     )
     for match in price_pattern.finditer(normalized_visible):
