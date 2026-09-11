@@ -153,7 +153,10 @@ class SearchPolicy:
         if normalized_keys - self._ALLOWED_ACTION_KEYS[name]:
             raise PolicyViolation("action contains unsupported automation fields")
         if name == "navigate":
-            self.validate_url(str(action.get("url", "")))
+            url = str(action.get("url", ""))
+            self.validate_url(url)
+            if urlparse(url).hostname in REQUIRED_IDENTITY_DOMAINS:
+                raise PolicyViolation("agent navigation to identity domains is not permitted")
             return
         if name in {"fill_search_field", "select_search_option"}:
             field = str(action.get("field", "")).strip().lower().replace("-", "_")

@@ -217,6 +217,18 @@ def test_search_policy_rejects_lookalike_paths_and_non_https_default_ports(url):
         SearchPolicy().validate_url(url)
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://login.aircanada.com/account/delete",
+        "https://aircanada.b2clogin.com/password-reset",
+    ],
+)
+def test_search_policy_rejects_agent_navigation_to_identity_domains(url):
+    with pytest.raises(PolicyViolation):
+        SearchPolicy().validate_action({"action": "navigate", "url": url})
+
+
 def test_agent_outcome_is_rejected_when_step_bound_or_domain_policy_is_broken(criteria):
     for outcome in (
         BrowserAgentOutcome("completed", None, 7, (), (), "too many steps"),
