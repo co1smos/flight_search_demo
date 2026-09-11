@@ -2,6 +2,18 @@
 
 Use this workflow for implementing a ready GitHub issue with Codex.
 
+## Natural-language invocation
+
+When the user asks Hermes to implement a GitHub issue with Codex or Sandcastle, Hermes must load this document, resolve the issue, apply the `AGENTS.md` model-routing rules, run the no-model preflight, and—if it passes—start the reviewed workflow in a sibling Herdr shell pane. The user does not need to type the underlying npm or Herdr commands.
+
+Recommended prompt:
+
+```text
+Implement issue #5 using the repository's Sandcastle + Unsnooze workflow. Apply the AGENTS.md model routing, run preflight first, and stop at a local reviewed candidate branch. Do not push, merge, or mutate the issue.
+```
+
+The concise form `Implement issue #5` is also sufficient when Hermes is running from the repository root, because `AGENTS.md` points issue implementation to this document. The explicit form is preferable when the requested stopping point or publication policy matters.
+
 ## Ownership
 
 - Hermes resolves and dispatches one issue, monitors the visible Herdr panes, and owns any later GitHub/merge decision.

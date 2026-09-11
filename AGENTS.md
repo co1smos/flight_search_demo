@@ -35,8 +35,8 @@ report the fallback.
 
 - Use the official OpenAI Codex CLI as the default coding agent for implementation work in this repository.
 - Apply the same model routing to direct Codex work and bounded Sandcastle/Codex iterations.
-- For issue implementation or review, follow `docs/agents/implementation-workflow.md`. Hermes launches the deterministic Sandcastle controller; Sandcastle owns the no-sandbox issue worktree and test gates; each Codex phase runs visibly through Unsnooze in a fresh Herdr pane.
-- Initial Sandcastle runs are capped at exactly two model calls: one implementer and one independent reviewer. A failed gate stops rather than launching an automatic correction loop.
+- When asked to implement a GitHub issue with Codex or Sandcastle—including a concise request such as `Implement issue #5`—load and follow `docs/agents/implementation-workflow.md`. Hermes launches the deterministic Sandcastle controller; Sandcastle owns the no-sandbox issue worktree and test gates; each Codex phase runs visibly through Unsnooze in a fresh Herdr pane. The user need not provide shell commands.
+- Before Sandcastle preflight, Hermes routes the issue using the model rules above and passes the exact model/effort tuple to the controller. Initial runs are capped at two calls with that tuple: one implementer and one independent reviewer. A failed gate stops rather than launching an automatic correction loop.
 - Keep every delegated worker visible in a separate Herdr pane or tab. Do not use Codex's hidden native subagent spawning for repository work, even though `.codex/agents/*.toml` records the tier definitions.
 - Ask the user before creating a new Herdr tab. A sibling pane in the current tab is the default and does not require another prompt. Keep the current tab focused unless the user requests otherwise, and close panes or tabs created for workers after their work is complete.
 - Give each worker a narrow, self-contained task and launch it with the model and reasoning values recorded in the matching `.codex/agents/*.toml` file. Parallelize independent tasks, but avoid concurrent edits to the same files.
