@@ -162,7 +162,7 @@ def test_exact_visible_price_can_span_nested_inline_nodes(criteria, tmp_path):
     fixture = tmp_path / "nested-price.html"
     fixture.write_text(
         """<!doctype html><html><body><main data-page-kind="results">
-        <div><span>60,000</span> <span>pts</span> + <span>$82.40</span> <span>CAD</span></div>
+        <article><div>AC 872</div><div><span>60,000</span> <span>pts</span> + <span>$82.40</span> <span>CAD</span></div></article>
         <script id="aeroplan-results-data" type="application/json">
         {"itineraries":[{"visible":true,"complete_itinerary":true,
         "price_kind":"exact","price_label":"60,000 pts","points_per_passenger":60000,
@@ -327,11 +327,62 @@ def test_payload_price_is_verified_against_its_own_itinerary_card(criteria, tmp_
     assert result["status"] == "UNVERIFIED_PRICE"
 
 
+@pytest.mark.parametrize("unrelated_flight", ["UAL 111", "AC 111A"])
+def test_payload_price_rejects_other_complete_flight_number_grammars(
+    criteria, tmp_path, unrelated_flight
+):
+    fixture = tmp_path / "other-flight-number-price.html"
+    fixture.write_text(
+        f"""<!doctype html><html><body><main data-page-kind="results">
+        <article><div>{unrelated_flight}</div><div>60,000 pts + $82.40 CAD</div></article>
+        <script id="aeroplan-results-data" type="application/json">
+        {{"itineraries":[{{"visible":true,"complete_itinerary":true,
+        "price_kind":"exact","price_label":"60,000 pts","points_per_passenger":60000,
+        "cash":{{"displayed_total":"$82.40","currency":"CAD"}},
+        "segments":[{{"departure":"2026-11-05T20:30:00-05:00",
+        "arrival":"2026-11-06T08:35:00+01:00","flight_number":"AC 872",
+        "marketing_carrier":"Air Canada","operating_carrier":"Air Canada",
+        "cabin":"Business"}}]}}]}}
+        </script></main></body></html>""",
+        encoding="utf-8",
+    )
+
+    result = AeroplanSearchAdapter(
+        browser=AeroplanFixtureBrowser(fixture)
+    ).execute(criteria, "other-flight-number-price")
+
+    assert result["status"] == "UNVERIFIED_PRICE"
+
+
+def test_exact_price_requires_visible_association_with_payload_itinerary(criteria, tmp_path):
+    fixture = tmp_path / "unassociated-price.html"
+    fixture.write_text(
+        """<!doctype html><html><body><main data-page-kind="results">
+        <article><div>60,000 pts + $82.40 CAD</div></article>
+        <script id="aeroplan-results-data" type="application/json">
+        {"itineraries":[{"visible":true,"complete_itinerary":true,
+        "price_kind":"exact","price_label":"60,000 pts","points_per_passenger":60000,
+        "cash":{"displayed_total":"$82.40","currency":"CAD"},
+        "segments":[{"departure":"2026-11-05T20:30:00-05:00",
+        "arrival":"2026-11-06T08:35:00+01:00","flight_number":"AC 872",
+        "marketing_carrier":"Air Canada","operating_carrier":"Air Canada",
+        "cabin":"Business"}]}]}
+        </script></main></body></html>""",
+        encoding="utf-8",
+    )
+
+    result = AeroplanSearchAdapter(
+        browser=AeroplanFixtureBrowser(fixture)
+    ).execute(criteria, "unassociated-price")
+
+    assert result["status"] == "UNVERIFIED_PRICE"
+
+
 def test_malformed_scalar_warnings_return_parser_failed(criteria, tmp_path):
     fixture = tmp_path / "scalar-warnings.html"
     fixture.write_text(
         """<!doctype html><html><body><main data-page-kind="results">
-        <div>60,000 pts + $82.40 CAD</div>
+        <article><div>AC 872</div><div>60,000 pts + $82.40 CAD</div></article>
         <script id="aeroplan-results-data" type="application/json">
         {"itineraries":[{"visible":true,"complete_itinerary":true,
         "price_kind":"exact","price_label":"60,000 pts","points_per_passenger":60000,
@@ -657,6 +708,29 @@ def test_search_policy_rejects_non_authentication_identity_paths(url):
 )
 def test_search_policy_allows_required_identity_authentication_paths(url):
     SearchPolicy().validate_url(url)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://aircanada.b2clogin.com/evil.example/B2C_1A_signin/oauth2/v2.0/authorize",
+        "https://aircanada.b2clogin.com/aircanada.onmicrosoft.com/B2C_1A_passwordreset/oauth2/v2.0/authorize",
+        "https://aircanada.b2clogin.com/aircanada.onmicrosoft.com/B2C_1A_signin/oauth2/v2.0/authorize?p=B2C_1A_passwordreset",
+        "https://aircanada.b2clogin.com/aircanada.onmicrosoft.com/B2C_1A_signin/oauth2/v2.0/authorize?redirect_uri=https%3A%2F%2Fevil.example%2Fcallback",
+    ],
+)
+def test_search_policy_rejects_non_signin_b2c_authorization_flows(url):
+    with pytest.raises(PolicyViolation):
+        SearchPolicy().validate_url(url)
+
+
+def test_search_policy_allows_safe_b2c_authorization_parameters():
+    SearchPolicy().validate_url(
+        "https://aircanada.b2clogin.com/aircanada.onmicrosoft.com/"
+        "B2C_1A_signin/oauth2/v2.0/authorize?client_id=fixture-client&"
+        "redirect_uri=https%3A%2F%2Fwww.aircanada.com%2Faeroplan%2Fredeem%2Favailability&"
+        "response_type=code&scope=openid&state=fixture-state&nonce=fixture-nonce"
+    )
 
 
 def test_agent_outcome_is_rejected_when_step_bound_or_domain_policy_is_broken(criteria):

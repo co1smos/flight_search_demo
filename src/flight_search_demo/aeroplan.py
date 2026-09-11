@@ -7,7 +7,7 @@ from enum import Enum
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol, Sequence
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qsl, unquote, urlparse
 
 from .app import NormalizedCriteria
 
@@ -23,6 +23,12 @@ REQUIRED_IDENTITY_DOMAINS = frozenset({
     "login.aircanada.com",
     "aircanada.b2clogin.com",
 })
+_FLIGHT_NUMBER_PARTS = r"([A-Za-z0-9]{2,3})\s*(\d{1,4}[A-Za-z]?)"
+_COMPLETE_FLIGHT_NUMBER = re.compile(rf"\s*{_FLIGHT_NUMBER_PARTS}\s*")
+_VISIBLE_FLIGHT_NUMBER = re.compile(
+    rf"(?<![A-Za-z0-9]){_FLIGHT_NUMBER_PARTS}(?![A-Za-z0-9])",
+    re.IGNORECASE,
+)
 
 
 class PageKind(str, Enum):
@@ -99,9 +105,22 @@ class SearchPolicy:
             "/oauth2/v2.0/authorize",
         }),
     }
-    _B2C_AUTHORIZE_PATH = re.compile(
-        r"/[A-Za-z0-9.-]+/[A-Za-z0-9._~-]+/oauth2/v2\.0/authorize"
+    _B2C_AUTHORIZE_PATH = (
+        "/aircanada.onmicrosoft.com/B2C_1A_signin/oauth2/v2.0/authorize"
     )
+    _B2C_AUTHORIZE_QUERY_KEYS = frozenset({
+        "client_id",
+        "code_challenge",
+        "code_challenge_method",
+        "nonce",
+        "prompt",
+        "redirect_uri",
+        "response_mode",
+        "response_type",
+        "scope",
+        "state",
+        "ui_locales",
+    })
     _ALLOWED_SEARCH_FIELDS = frozenset({
         "adults",
         "cabin",
@@ -170,14 +189,63 @@ class SearchPolicy:
             raise PolicyViolation("navigation is not an approved search-only Air Canada path")
         if parsed.hostname in REQUIRED_IDENTITY_DOMAINS:
             allowed_paths = self._IDENTITY_PATHS.get(parsed.hostname, frozenset())
-            if (
-                normalized_path not in allowed_paths
-                and not (
-                    parsed.hostname == "aircanada.b2clogin.com"
-                    and self._B2C_AUTHORIZE_PATH.fullmatch(normalized_path)
-                )
-            ):
+            is_b2c_authorize = (
+                parsed.hostname == "aircanada.b2clogin.com"
+                and normalized_path == self._B2C_AUTHORIZE_PATH
+            )
+            if normalized_path not in allowed_paths and not is_b2c_authorize:
                 raise PolicyViolation("navigation is not a required authentication path")
+            if parsed.fragment:
+                raise PolicyViolation("authentication URL fragments are not permitted")
+            if is_b2c_authorize:
+                self._validate_b2c_authorize_query(parsed.query)
+
+    def _validate_b2c_authorize_query(self, query: str) -> None:
+        try:
+            parameters = parse_qsl(
+                query, keep_blank_values=True, strict_parsing=True, max_num_fields=20
+            ) if query else []
+        except ValueError as exc:
+            raise PolicyViolation("authentication query is malformed") from exc
+        keys = [key for key, _ in parameters]
+        if (
+            len(keys) != len(set(keys))
+            or any(key not in self._B2C_AUTHORIZE_QUERY_KEYS for key in keys)
+            or any(not value for _, value in parameters)
+        ):
+            raise PolicyViolation("authentication query contains unsafe parameters")
+        values = dict(parameters)
+        if values.get("response_type") not in {None, "code"}:
+            raise PolicyViolation("authentication response type is not permitted")
+        if values.get("response_mode") not in {None, "query", "form_post"}:
+            raise PolicyViolation("authentication response mode is not permitted")
+        if values.get("code_challenge_method") not in {None, "S256"}:
+            raise PolicyViolation("authentication code challenge is not permitted")
+        if values.get("prompt") not in {None, "login", "none", "select_account"}:
+            raise PolicyViolation("authentication prompt is not permitted")
+        if "scope" in values and not set(values["scope"].split()) <= {
+            "openid",
+            "profile",
+            "offline_access",
+        }:
+            raise PolicyViolation("authentication scope is not permitted")
+        if "redirect_uri" in values:
+            redirect = urlparse(values["redirect_uri"])
+            try:
+                redirect_port = redirect.port
+            except ValueError as exc:
+                raise PolicyViolation("authentication redirect is malformed") from exc
+            redirect_path = unquote(redirect.path).rstrip("/") or "/"
+            if (
+                redirect.scheme != "https"
+                or redirect.hostname not in APPROVED_AIR_CANADA_DOMAINS
+                or redirect.username is not None
+                or redirect.password is not None
+                or redirect_port not in {None, 443}
+                or redirect_path not in self._AIR_CANADA_SEARCH_PATHS
+                or redirect.fragment
+            ):
+                raise PolicyViolation("authentication redirect is not search-only")
 
     def validate_action(self, action: Mapping[str, Any]) -> None:
         keys = list(action)
@@ -528,32 +596,23 @@ def _is_exact_visible_price(
             continue
         candidates.append((normalized_text, " ".join(context.split())))
 
-    flight_patterns = []
+    payload_flights: set[str] = set()
     for number in flight_numbers:
-        match = re.fullmatch(r"\s*([A-Za-z0-9]{2,3})\s*(\d{1,4}[A-Za-z]?)\s*", number)
-        if match is not None:
-            flight_patterns.append(
-                re.compile(
-                    rf"(?<![A-Za-z0-9]){re.escape(match.group(1))}\s*"
-                    rf"{re.escape(match.group(2))}(?![A-Za-z0-9])",
-                    re.IGNORECASE,
-                )
-            )
+        match = _COMPLETE_FLIGHT_NUMBER.fullmatch(number)
+        if match is None:
+            return False
+        payload_flights.add(f"{match.group(1)}{match.group(2)}".casefold())
     related = [
         candidate
         for candidate in candidates
-        if any(pattern.search(candidate[1]) for pattern in flight_patterns)
+        if payload_flights <= {
+            f"{match.group(1)}{match.group(2)}".casefold()
+            for match in _VISIBLE_FLIGHT_NUMBER.finditer(candidate[1])
+        }
     ]
-    if related:
-        candidates = related
-    elif any(
-        re.search(r"\b[A-Z]{2}\s*\d{1,4}\b", context, re.IGNORECASE)
-        for _, context in candidates
-    ):
-        return False
     return any(
         text == expected and qualifier.search(context) is None
-        for text, context in candidates
+        for text, context in related
     )
 
 
