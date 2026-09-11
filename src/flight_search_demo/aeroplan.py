@@ -109,10 +109,19 @@ class SearchPolicy:
     }
 
     def __init__(self, *, allowed_domains: Sequence[str] | None = None) -> None:
-        self.allowed_domains = frozenset(
-            (APPROVED_AIR_CANADA_DOMAINS | REQUIRED_IDENTITY_DOMAINS)
-            if allowed_domains is None else allowed_domains
-        )
+        approved_domains = APPROVED_AIR_CANADA_DOMAINS | REQUIRED_IDENTITY_DOMAINS
+        if allowed_domains is None:
+            self.allowed_domains = approved_domains
+            return
+        if any(
+            not isinstance(domain, str)
+            or not domain.strip()
+            or domain.strip().lower() not in approved_domains
+            for domain in allowed_domains
+        ):
+            raise PolicyViolation("allowed domains must be approved Air Canada domains")
+        configured_domains = frozenset(domain.strip().lower() for domain in allowed_domains)
+        self.allowed_domains = configured_domains
 
     def validate_url(self, url: str) -> None:
         if not isinstance(url, str):

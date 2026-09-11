@@ -199,6 +199,11 @@ def test_search_policy_allows_passenger_count_as_search_criteria():
     )
 
 
+def test_search_policy_custom_allowlist_cannot_expand_beyond_approved_domains():
+    with pytest.raises(PolicyViolation):
+        SearchPolicy(allowed_domains=["www.aircanada.com", "example.com"])
+
+
 @pytest.mark.parametrize(
     "url",
     [
