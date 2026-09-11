@@ -13,9 +13,11 @@ from flight_search_demo.aeroplan import (
     AeroplanSearchAdapter,
     BrowserAgentOutcome,
     OFFICIAL_SEARCH_ENTRY_URL,
+    PageKind,
     PageSnapshot,
     PolicyViolation,
     SearchPolicy,
+    classify_page,
 )
 from flight_search_demo.app import (
     AeroplanFixtureAdapter,
@@ -178,6 +180,31 @@ def test_exact_visible_price_can_span_nested_inline_nodes(criteria, tmp_path):
     result = AeroplanSearchAdapter(
         browser=AeroplanFixtureBrowser(fixture)
     ).execute(criteria, "nested-price")
+
+    assert result["status"] == "MATCH_FOUND"
+
+
+def test_exact_visible_price_allows_benign_surrounding_label(criteria, tmp_path):
+    fixture = tmp_path / "labelled-exact-price.html"
+    fixture.write_text(
+        """<!doctype html><html><body><main data-page-kind="results">
+        <article><div>Flight AC 872</div>
+        <div>Total award price: 60,000 pts + $82.40 CAD</div></article>
+        <script id="aeroplan-results-data" type="application/json">
+        {"itineraries":[{"visible":true,"complete_itinerary":true,
+        "price_kind":"exact","price_label":"60,000 pts","points_per_passenger":60000,
+        "cash":{"displayed_total":"$82.40","currency":"CAD"},
+        "segments":[{"departure":"2026-11-05T20:30:00-05:00",
+        "arrival":"2026-11-06T08:35:00+01:00","flight_number":"AC 872",
+        "marketing_carrier":"Air Canada","operating_carrier":"Air Canada",
+        "cabin":"Business"}]}]}
+        </script></main></body></html>""",
+        encoding="utf-8",
+    )
+
+    result = AeroplanSearchAdapter(
+        browser=AeroplanFixtureBrowser(fixture)
+    ).execute(criteria, "labelled-exact-price")
 
     assert result["status"] == "MATCH_FOUND"
 
@@ -658,6 +685,18 @@ def test_search_policy_rejects_mutation_and_booking_descendants(url):
 @pytest.mark.parametrize(
     "url",
     [
+        "https://www.aircanada.com/search#/checkout",
+        "https://www.aircanada.com/aeroplan/redeem/availability#payment",
+    ],
+)
+def test_search_policy_rejects_fragments_on_approved_search_urls(url):
+    with pytest.raises(PolicyViolation):
+        SearchPolicy().validate_url(url)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
         "https://www.aircanada.com/search/../checkout",
         "https://www.aircanada.com/aeroplan/redeem/availability/../../../checkout",
         "https://www.aircanada.com/search/%2e%2e/checkout",
@@ -708,6 +747,15 @@ def test_search_policy_rejects_non_authentication_identity_paths(url):
 )
 def test_search_policy_allows_required_identity_authentication_paths(url):
     SearchPolicy().validate_url(url)
+
+
+def test_identity_domain_challenge_is_classified_before_authentication():
+    page = PageSnapshot(
+        "https://login.aircanada.com/login",
+        "<html><body><main>Access denied. Verify you are human.</main></body></html>",
+    )
+
+    assert classify_page(page) == PageKind.CHALLENGE
 
 
 @pytest.mark.parametrize(

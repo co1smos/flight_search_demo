@@ -171,6 +171,8 @@ class SearchPolicy:
             or port not in {None, 443}
         ):
             raise PolicyViolation("navigation is outside approved Air Canada domains")
+        if parsed.fragment:
+            raise PolicyViolation("navigation URL fragments are not permitted")
         decoded_path = parsed.path
         while True:
             next_path = unquote(decoded_path)
@@ -195,8 +197,6 @@ class SearchPolicy:
             )
             if normalized_path not in allowed_paths and not is_b2c_authorize:
                 raise PolicyViolation("navigation is not a required authentication path")
-            if parsed.fragment:
-                raise PolicyViolation("authentication URL fragments are not permitted")
             if is_b2c_authorize:
                 self._validate_b2c_authorize_query(parsed.query)
 
@@ -541,12 +541,12 @@ def classify_page(page: PageSnapshot) -> PageKind:
     parser.feed(page.html)
     visible = " ".join(parser.visible_text).lower()
     hostname = (urlparse(page.url).hostname or "").lower()
+    if re.search(r"\b(?:verify you are human|access denied|captcha|bot detection)\b", visible):
+        return PageKind.CHALLENGE
     if hostname in REQUIRED_IDENTITY_DOMAINS or re.search(
         r"\b(?:sign in to aeroplan|log in to aeroplan)\b", visible
     ):
         return PageKind.AUTHENTICATION
-    if re.search(r"\b(?:verify you are human|access denied|captcha|bot detection)\b", visible):
-        return PageKind.CHALLENGE
     if re.search(
         r"\b(?:temporarily unable|technical difficulties|something went wrong)\b", visible
     ):
@@ -592,7 +592,13 @@ def _is_exact_visible_price(
     for text, context in visible_text:
         normalized_text = " ".join(text.split()).casefold()
         start = normalized_text.find(expected)
-        if start < 0 or (start > 0 and normalized_text[start - 1] in "0123456789,"):
+        if start < 0 or (
+            start > 0
+            and (normalized_text[start - 1].isalnum() or normalized_text[start - 1] == ",")
+        ):
+            continue
+        end = start + len(expected)
+        if end < len(normalized_text) and normalized_text[end].isalnum():
             continue
         candidates.append((normalized_text, " ".join(context.split())))
 
@@ -611,8 +617,8 @@ def _is_exact_visible_price(
         }
     ]
     return any(
-        text == expected and qualifier.search(context) is None
-        for text, context in related
+        qualifier.search(context) is None
+        for _, context in related
     )
 
 
