@@ -189,6 +189,8 @@ class SearchPolicy:
             and normalized_path not in self._AIR_CANADA_SEARCH_PATHS
         ):
             raise PolicyViolation("navigation is not an approved search-only Air Canada path")
+        if parsed.hostname in APPROVED_AIR_CANADA_DOMAINS and parsed.query:
+            raise PolicyViolation("search navigation query parameters are not permitted")
         if parsed.hostname in REQUIRED_IDENTITY_DOMAINS:
             allowed_paths = self._IDENTITY_PATHS.get(parsed.hostname, frozenset())
             is_b2c_authorize = (

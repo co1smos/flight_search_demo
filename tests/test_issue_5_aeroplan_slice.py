@@ -686,6 +686,19 @@ def test_search_policy_rejects_mutation_and_booking_descendants(url):
 @pytest.mark.parametrize(
     "url",
     [
+        "https://www.aircanada.com/search?redirect_uri=https%3A%2F%2Fevil.example%2Fcallback",
+        "https://www.aircanada.com/search?action=book",
+        "https://www.aircanada.com/aeroplan/redeem/availability?payment=true",
+    ],
+)
+def test_search_policy_rejects_non_search_query_parameters(url):
+    with pytest.raises(PolicyViolation):
+        SearchPolicy().validate_url(url)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
         "https://www.aircanada.com/search#/checkout",
         "https://www.aircanada.com/aeroplan/redeem/availability#payment",
     ],
