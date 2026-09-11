@@ -312,7 +312,8 @@ def _is_exact_visible_price(value: str, visible_text: str) -> bool:
     )
     prefix_qualifier_pattern = re.compile(
         r"\b(?:from|at\s+least|starting\s+(?:at|from)|as\s+low\s+as|estimated|"
-        r"approximately|about)(?:\s+at)?(?:\s+(?:only|just))?\s*[:\-–—]?\s*$",
+        r"approximately|about|around|roughly|circa)(?:\s+at)?"
+        r"(?:\s+(?:only|just))?\s*[:\-–—]?\s*$",
         re.IGNORECASE,
     )
     suffix_qualifier_pattern = re.compile(
