@@ -88,6 +88,14 @@ herdr pane run <returned-pane-id> "SANDCASTLE_MODEL=gpt-5.6-sol SANDCASTLE_EFFOR
 
 Use the pane ID returned by the split command. This controller pane is not a Codex session and consumes no model quota while it waits.
 
+Hermes must remain the outer orchestrator until the controller exits. After launch, record the controller pane ID and its wrapper PID, monitor that exact PID rather than reusable pane-output sentinels, and inspect the final artifact before replying. Do not end the turn with only a launch acknowledgement. When the controller exits, immediately report one of:
+
+- `reviewed-local-candidate`: include branch, exact head, review verdict, final test result, warnings, and ask whether to merge/push/close;
+- failure: include the failing phase, preserved branch/head, root cause, and the next corrective action already taken when it is local and reversible;
+- quota wait/retry: include the preserved phase and retry state without switching models unless the routing fallback is actually required.
+
+For a raw Herdr pane launch, immediately pair the recorded wrapper PID with a tracked background watcher (`while kill -0 <pid>; do sleep 15; done`) using completion notification. The controller remains visible in Herdr, while the watcher wakes this Hermes conversation when the exact process exits. Then inspect the pane, result artifact, tests, branch, and issue state before reporting. Do not use a reusable pane-output sentinel, and do not use a `deliver: local` cron watchdog as user notification; local cron output is remediation-only and is not injected into this live CLI conversation.
+
 Do not start it through an outer Codex session. The controller launches each model-backed pane itself.
 
 Sequence:
