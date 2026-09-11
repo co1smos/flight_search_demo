@@ -245,7 +245,7 @@ class ParserFailure(RuntimeError):
 class AwardProviderAdapter(Protocol):
     def execute(
         self, criteria: NormalizedCriteria, atomic_task_id: str
-    ) -> Dict[str, str]:
+    ) -> Dict[str, Any]:
         ...
 
 
@@ -403,26 +403,21 @@ class GoogleGenAIRequestParser:
 class AeroplanFixtureAdapter:
     def execute(
         self, criteria: NormalizedCriteria, atomic_task_id: str
-    ) -> Dict[str, str]:
+    ) -> Dict[str, Any]:
+        from .aeroplan import AeroplanFixtureBrowser, AeroplanSearchAdapter
+
+        fixture_name = "no_availability.html"
         if (
             criteria.origin == "JFK"
             and criteria.destination == "CDG"
             and criteria.departure_date == "2026-11-05"
             and criteria.cabin == "Business"
         ):
-            if criteria.maximum_points < 60000:
-                return {
-                    "status": "ABOVE_POINTS_LIMIT",
-                    "detail": f"fixture award costs 60000 points via {atomic_task_id}",
-                }
-            return {
-                "status": "MATCH_FOUND",
-                "detail": f"fixture matched confirmed request via {atomic_task_id}",
-            }
-        return {
-            "status": "NO_AWARD_AVAILABILITY",
-            "detail": f"fixture found no qualifying itinerary via {atomic_task_id}",
-        }
+            fixture_name = "match.html"
+        fixture = Path(__file__).parent / "fixtures" / "aeroplan" / fixture_name
+        return AeroplanSearchAdapter(
+            browser=AeroplanFixtureBrowser(fixture)
+        ).execute(criteria, atomic_task_id)
 
 
 class AnaFixtureAdapter:
@@ -754,7 +749,9 @@ def execute_confirmed_request(
     request_hash = build_request_hash(request_id, original_text, criteria)
     atomic_task_id = f"{criteria.program}-{request_hash[:12]}"
     result = adapter_registry[criteria.program].execute(criteria, atomic_task_id)
-    extra_fields: Dict[str, Any] = {}
+    extra_fields: Dict[str, Any] = {
+        key: value for key, value in result.items() if key not in {"status", "detail"}
+    }
     if diagnostic_id:
         extra_fields["diagnostic_id"] = diagnostic_id
     if gemini_usage is not None:
@@ -1526,10 +1523,14 @@ def render_terminal_report(event: Dict[str, Any]) -> str:
             f" trip_type={criteria['trip_type']} maximum_points={criteria['maximum_points']}"
         )
     task = event["atomic_task_id"] or "none"
+    search_entry = (
+        f" search_entry_url={event['search_entry_url']}"
+        if event.get("search_entry_url") else ""
+    )
     return (
         f"{event['status']} request={event['request_id']}"
         f" original_text={redact_sensitive_text(str(event['original_text']))} task={task}"
-        f"{criteria_report} detail={event['detail']} at {event['timestamp']}"
+        f"{criteria_report}{search_entry} detail={event['detail']} at {event['timestamp']}"
     )
 
 
