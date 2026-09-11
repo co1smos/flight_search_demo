@@ -27,7 +27,7 @@ fails, or the task clearly belongs in the hard category.
 
 Before launching a delegated worker, preflight its exact model and reasoning
 effort. If that tier is unavailable, preflight the configured `gemini-pro-agent` model
-ID and use it with provider-default reasoning. If `gemini-pro-agent` is unavailable or
+ID and use it with high reasoning. If `gemini-pro-agent` is unavailable or
 not configured, use the authenticated Codex account's verified default and
 report the fallback.
 
