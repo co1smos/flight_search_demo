@@ -232,6 +232,11 @@ def test_search_policy_rejects_dot_segment_path_traversal(url):
         SearchPolicy().validate_url(url)
 
 
+def test_search_policy_rejects_browser_normalized_backslash_traversal():
+    with pytest.raises(PolicyViolation):
+        SearchPolicy().validate_url("https://www.aircanada.com/search/..\\checkout")
+
+
 @pytest.mark.parametrize(
     "url",
     [
@@ -285,6 +290,45 @@ def test_agent_outcome_is_rejected_when_step_bound_or_domain_policy_is_broken(cr
         )
         result = AeroplanSearchAdapter(browser=browser, max_agent_steps=2).execute(criteria, "policy")
         assert result["status"] == "BROWSER_AGENT_FAILED"
+
+
+@pytest.mark.parametrize(
+    "blocked_action",
+    [
+        {"action": "navigate", "url": "https://www.aircanada.com/checkout"},
+        {"action": "book_itinerary"},
+    ],
+)
+def test_browser_agent_policy_is_enforced_before_an_action_can_execute(
+    criteria, blocked_action
+):
+    class PolicyAwareBrowser(AeroplanFixtureBrowser):
+        def __init__(self):
+            super().__init__(
+                FIXTURES / "match.html",
+                initial_fixture=FIXTURES / "unknown.html",
+                deterministic_supported=False,
+            )
+            self.executed_actions = []
+
+        def browser_agent_search(
+            self,
+            criteria,
+            *,
+            max_steps,
+            allowed_domains,
+            authorize_action,
+        ):
+            del criteria, max_steps, allowed_domains
+            authorize_action(blocked_action)
+            self.executed_actions.append(blocked_action)
+            raise AssertionError("a rejected action must not execute")
+
+    browser = PolicyAwareBrowser()
+    result = AeroplanSearchAdapter(browser=browser).execute(criteria, "boundary-policy")
+
+    assert result["status"] == "BROWSER_AGENT_FAILED"
+    assert browser.executed_actions == []
 
 
 def test_connections_segments_and_mixed_cabin_warning_are_reported_but_do_not_qualify(criteria):

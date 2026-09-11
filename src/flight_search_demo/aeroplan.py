@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from enum import Enum
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any, Mapping, Protocol, Sequence
+from typing import Any, Callable, Mapping, Protocol, Sequence
 from urllib.parse import unquote, urlparse
 
 from .app import NormalizedCriteria
@@ -74,6 +74,7 @@ class AeroplanBrowser(Protocol):
         *,
         max_steps: int,
         allowed_domains: Sequence[str],
+        authorize_action: Callable[[Mapping[str, Any]], None],
     ) -> BrowserAgentOutcome: ...
 
 
@@ -145,6 +146,8 @@ class SearchPolicy:
             if next_path == decoded_path:
                 break
             decoded_path = next_path
+        if "\\" in decoded_path:
+            raise PolicyViolation("navigation path must not contain backslashes")
         if any(segment in {".", ".."} for segment in decoded_path.split("/")):
             raise PolicyViolation("navigation path must not contain dot segments")
         if parsed.hostname in APPROVED_AIR_CANADA_DOMAINS and not any(
@@ -362,6 +365,7 @@ class AeroplanSearchAdapter:
                     criteria,
                     max_steps=self.max_agent_steps,
                     allowed_domains=sorted(self.policy.allowed_domains),
+                    authorize_action=self.policy.validate_action,
                 )
                 self._validate_agent_outcome(outcome)
             except (PolicyViolation, ValueError) as exc:
@@ -539,18 +543,23 @@ class AeroplanFixtureBrowser:
         *,
         max_steps: int,
         allowed_domains: Sequence[str],
+        authorize_action: Callable[[Mapping[str, Any]], None],
     ) -> BrowserAgentOutcome:
         del criteria, max_steps, allowed_domains
         self.calls.append("browser_agent_search")
         if self.timeout_at == "browser_agent_search":
             raise SearchTimeout
         if self.agent_outcome is not None:
+            for action in self.agent_outcome.actions:
+                authorize_action(action)
             return self.agent_outcome
         page = self._page(self.result_fixture)
+        action = {"action": "read_results"}
+        authorize_action(action)
         return BrowserAgentOutcome(
             status="completed",
             page=page,
             steps=1,
             visited_urls=(page.url,),
-            actions=({"action": "read_results"},),
+            actions=(action,),
         )
