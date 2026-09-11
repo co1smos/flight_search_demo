@@ -197,10 +197,10 @@ class SearchPolicy:
             )
             if normalized_path not in allowed_paths and not is_b2c_authorize:
                 raise PolicyViolation("navigation is not a required authentication path")
-            if is_b2c_authorize:
-                self._validate_b2c_authorize_query(parsed.query)
+            if is_b2c_authorize or parsed.hostname == "login.aircanada.com":
+                self._validate_authentication_query(parsed.query)
 
-    def _validate_b2c_authorize_query(self, query: str) -> None:
+    def _validate_authentication_query(self, query: str) -> None:
         try:
             parameters = parse_qsl(
                 query, keep_blank_values=True, strict_parsing=True, max_num_fields=20
@@ -585,6 +585,7 @@ def _is_exact_visible_price(
     qualifier = re.compile(
         r"(?:\bfrom\b|\bestimat(?:e|ed)\b|\bat\s+least\b|\bas\s+low\s+as\b|"
         r"\bstarting\b|\bminimum\b|\bapprox(?:imately)?\b|\babout\b|"
+        r"\baround\b|\broughly\b|\bcirca\b|"
         r"\band\s+up\b|\bupwards?\b|\*)",
         re.IGNORECASE,
     )

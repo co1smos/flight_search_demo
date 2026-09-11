@@ -536,7 +536,8 @@ def test_visible_ambiguous_price_forms_are_rejected_when_payload_claims_exact(
     fixture = tmp_path / "ambiguous-price.html"
     fixture.write_text(
         f"""<!doctype html><html><body><main data-page-kind="results">
-        <div>{visible_price} + $82.40 CAD</div>
+        <article class="itinerary-card"><span>AC 872</span>
+        <span>{visible_price} + $82.40 CAD</span></article>
         <script id="aeroplan-results-data" type="application/json">
         {{"itineraries":[{{"visible":true,"complete_itinerary":true,
         "price_kind":"exact","price_label":"60,000 pts","points_per_passenger":60000,
@@ -776,6 +777,27 @@ def test_search_policy_allows_safe_b2c_authorization_parameters():
     SearchPolicy().validate_url(
         "https://aircanada.b2clogin.com/aircanada.onmicrosoft.com/"
         "B2C_1A_signin/oauth2/v2.0/authorize?client_id=fixture-client&"
+        "redirect_uri=https%3A%2F%2Fwww.aircanada.com%2Faeroplan%2Fredeem%2Favailability&"
+        "response_type=code&scope=openid&state=fixture-state&nonce=fixture-nonce"
+    )
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://login.aircanada.com/login?p=B2C_1A_passwordreset",
+        "https://login.aircanada.com/authorize?redirect_uri=https%3A%2F%2Fevil.example%2Fcallback",
+        "https://login.aircanada.com/oauth2/v2.0/authorize?response_type=token",
+    ],
+)
+def test_search_policy_rejects_unsafe_login_aircanada_authorization_flows(url):
+    with pytest.raises(PolicyViolation):
+        SearchPolicy().validate_url(url)
+
+
+def test_search_policy_allows_safe_login_aircanada_authorization_parameters():
+    SearchPolicy().validate_url(
+        "https://login.aircanada.com/authorize?client_id=fixture-client&"
         "redirect_uri=https%3A%2F%2Fwww.aircanada.com%2Faeroplan%2Fredeem%2Favailability&"
         "response_type=code&scope=openid&state=fixture-state&nonce=fixture-nonce"
     )
