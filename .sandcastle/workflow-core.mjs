@@ -252,9 +252,13 @@ export function validateReviewerReceipt(receipt, expected) {
 export function validateSessionEvidence(options) {
   validateSessionId(options.receiptSessionId);
   const paneSession = options.paneSession;
-  if (paneSession?.agent !== "codex"
-    || paneSession.kind !== "id"
-    || paneSession.value !== options.receiptSessionId) {
+  const liveCodexMatches = paneSession?.agent === "codex"
+    && paneSession.kind === "id"
+    && paneSession.value === options.receiptSessionId;
+  const completedUnsnoozePane = typeof options.paneUnsnoozeOwner === "string"
+    && options.paneUnsnoozeOwner.length > 0
+    && paneSession == null;
+  if (!liveCodexMatches && !completedUnsnoozePane) {
     throw new Error("pane evidence does not identify the exact receipt session");
   }
   const phaseStarted = Date.parse(options.phaseStartedAt);

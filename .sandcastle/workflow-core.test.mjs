@@ -313,6 +313,44 @@ test("validateSessionEvidence requires exact pane and rollout agreement", () => 
   );
 });
 
+test("validateSessionEvidence accepts an Unsnooze-owned idle shell after Codex exits", () => {
+  const sessionId = "01a0911b-7b0a-70a2-a87d-f58c47d241d1";
+  const evidence = validateSessionEvidence({
+    receiptSessionId: sessionId,
+    paneSession: undefined,
+    paneUnsnoozeOwner: "599fbdfe-911d-4c11-a936-d6e91b603624",
+    rollouts: [
+      {
+        sessionId,
+        cwd: "/tmp/worktree",
+        startedAt: "2026-09-11T15:34:52.434Z",
+        path: "/home/ubuntu/.codex/sessions/rollout.jsonl",
+      },
+    ],
+    worktreePath: "/tmp/worktree",
+    phaseStartedAt: "2026-09-11T15:34:51.000Z",
+  });
+
+  assert.equal(evidence.rolloutPath, "/home/ubuntu/.codex/sessions/rollout.jsonl");
+});
+
+test("validateSessionEvidence still rejects a shell without Unsnooze ownership", () => {
+  const sessionId = "01a0911b-7b0a-70a2-a87d-f58c47d241d1";
+  assert.throws(() => validateSessionEvidence({
+    receiptSessionId: sessionId,
+    paneSession: undefined,
+    paneUnsnoozeOwner: undefined,
+    rollouts: [{
+      sessionId,
+      cwd: "/tmp/worktree",
+      startedAt: "2026-09-11T15:34:52.434Z",
+      path: "/home/ubuntu/.codex/sessions/rollout.jsonl",
+    }],
+    worktreePath: "/tmp/worktree",
+    phaseStartedAt: "2026-09-11T15:34:51.000Z",
+  }), /pane evidence/);
+});
+
 test("validateSessionEvidence accepts Herdr pane identity after long output evicts the session header", () => {
   const sessionId = "01a08ef7-dc47-7341-9bd0-ba1569b4a2f7";
   const evidence = validateSessionEvidence({

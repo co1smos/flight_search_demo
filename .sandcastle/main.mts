@@ -201,6 +201,7 @@ async function runPhase({
     validateSessionEvidence({
       receiptSessionId: receipt.session_id,
       paneSession: paneInfo?.agent_session,
+      paneUnsnoozeOwner: paneInfo?.tokens?.unsnooze_owner,
       rollouts: await readRollouts(worktreePath, phaseStartedAt),
       worktreePath,
       phaseStartedAt,
