@@ -834,8 +834,8 @@ class AeroplanSearchAdapter:
                 browser_agent_used=used_agent,
             )
         return self._result(
-            "NO_AWARD_AVAILABILITY",
-            "No qualifying Aeroplan award itinerary was extracted",
+            "PARSER_FAILED",
+            "Results extraction was empty without an explicit no-availability page",
             browser_agent_used=used_agent,
         )
 
