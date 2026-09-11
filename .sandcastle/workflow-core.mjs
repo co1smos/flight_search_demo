@@ -335,3 +335,51 @@ function validateTimestamp(value, label) {
     throw new Error(`invalid ${label}`);
   }
 }
+
+// Only the final diagnostic from this attempt is authoritative. A bare 429,
+// retry exhaustion without a status, or an earlier recovered error is not enough.
+export function isQuotaExit(exitCode, output) {
+  if (!Number.isInteger(exitCode) || exitCode === 0) return false;
+  const diagnostics = output.replace(/\x1b\[[0-9;]*m/g, "").split(/\r?\n/)
+    .filter((line) => /^ERROR:/i.test(line));
+  return /^ERROR:\s*(?:stream disconnected before completion:\s*)?(?:exceeded retry limit,\s*last status:|unexpected status|HTTP(?: status)?)[ :]+429\b/i
+    .test(diagnostics.at(-1) || "");
+}
+
+// Each fresh phase attempt also probes availability through the existing
+// Unsnooze/Codex path. No alternate model or separate paid probe is needed.
+export async function runPhaseWithRetry({ timeoutMs, now, sleep, start, inspect, validate, close }) {
+  const deadline = now() + timeoutMs;
+  const checkDeadline = () => {
+    if (now() >= deadline) throw new Error("timed out waiting for phase receipt");
+  };
+  let backoffMs = 1000;
+  for (let attempt = 1; ; attempt += 1) {
+    checkDeadline();
+    const worker = await start(attempt);
+    try {
+      while (true) {
+        checkDeadline();
+        const state = await inspect(worker);
+        checkDeadline();
+        if (state.receipt !== undefined) {
+          await validate(worker, state.receipt);
+          checkDeadline();
+          return { receipt: state.receipt, attempt };
+        }
+        if (state.exitCode !== undefined) {
+          if (!isQuotaExit(state.exitCode, state.output || "")) {
+            throw new Error(`phase worker exited with code ${state.exitCode} before receipt`);
+          }
+          break;
+        }
+        await sleep(Math.min(500, deadline - now()));
+      }
+    } finally {
+      await close(worker);
+    }
+    checkDeadline();
+    await sleep(Math.min(backoffMs, deadline - now()));
+    backoffMs = Math.min(backoffMs * 2, 30_000);
+  }
+}

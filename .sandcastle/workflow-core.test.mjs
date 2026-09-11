@@ -385,3 +385,78 @@ test("lingering Unsnooze resuming state is warning evidence", () => {
   );
   assert.equal(hasLingeringUnsnoozeState("no tracked sessions", sessionId), false);
 });
+
+// Mock the production phase boundary: no provider requests or real panes.
+import { isQuotaExit, runPhaseWithRetry } from "./workflow-core.mjs";
+
+test("quota classification requires a terminal Codex 429 error, not incidental text", () => {
+  assert.equal(isQuotaExit(1, 'ERROR: exceeded retry limit, last status: 429 Too Many Requests'), true);
+  for (const output of [
+    'ERROR: exceeded retry limit, last status: 503 Service Unavailable',
+    'ERROR: authentication failed (401)',
+    'ERROR: could not read fixture for HTTP 429',
+    '429 Too Many Requests',
+    'test fixture: ERROR: exceeded retry limit, last status: 429',
+    'ERROR: exceeded retry limit, last status: 429\nERROR: invalid configuration',
+  ]) assert.equal(isQuotaExit(1, output), false, output);
+  assert.equal(isQuotaExit(0, 'ERROR: HTTP 429 Too Many Requests'), false);
+});
+
+function mockPhase(outputs, timeoutMs = 100_000) {
+  let time = 0;
+  const events = [];
+  const candidate = { head: 'candidate', dirty: 'preserved' };
+  const dependencies = {
+    now: () => time,
+    sleep: async (ms) => { events.push(['sleep', ms]); time += ms; },
+    start: async (attempt) => { events.push(['start', attempt]); return attempt; },
+    inspect: async (attempt) => outputs[attempt - 1],
+    validate: async (attempt, receipt) => { events.push(['validate', attempt, receipt.session_id]); },
+    close: async (attempt) => { events.push(['close', attempt]); },
+  };
+  return { events, candidate, run: () => runPhaseWithRetry({ timeoutMs, ...dependencies }) };
+}
+
+test("mock phase: 429 exit retries in a fresh attempt and later receipt succeeds", async () => {
+  const receipt = { session_id: 'fresh-session' };
+  const mock = mockPhase([
+    { exitCode: 1, output: 'ERROR: exceeded retry limit, last status: 429 Too Many Requests' },
+    { receipt },
+  ]);
+  assert.deepEqual(await mock.run(), { receipt, attempt: 2 });
+  assert.deepEqual(mock.events, [
+    ['start', 1], ['close', 1], ['sleep', 1000], ['start', 2],
+    ['validate', 2, 'fresh-session'], ['close', 2],
+  ]);
+  assert.deepEqual(mock.candidate, { head: 'candidate', dirty: 'preserved' });
+});
+
+test("mock phase: non-429 exit fails immediately and closes the pane", async () => {
+  const mock = mockPhase([{ exitCode: 1, output: 'ERROR: exceeded retry limit, last status: 503' }]);
+  await assert.rejects(mock.run(), /worker exited.*1/);
+  assert.deepEqual(mock.events, [['start', 1], ['close', 1]]);
+});
+
+test("quota retries share a total deadline with capped backoff", async () => {
+  const mock = mockPhase(Array(20).fill({ exitCode: 1, output: 'ERROR: HTTP 429 Too Many Requests' }), 70_000);
+  await assert.rejects(mock.run(), /timed out/);
+  assert.deepEqual(mock.events.filter(([kind]) => kind === 'sleep').map(([, ms]) => ms),
+    [1000, 2000, 4000, 8000, 16000, 30000, 9000]);
+  assert.equal(mock.events.filter(([kind]) => kind === 'start').length, 7);
+});
+
+test("receipt validation errors are terminal even with quota text", async () => {
+  await assert.rejects(runPhaseWithRetry({
+    timeoutMs: 1000, now: () => 0, sleep: async () => {},
+    start: async () => 1,
+    inspect: async () => ({ receipt: {}, exitCode: 1, output: 'ERROR: HTTP 429' }),
+    validate: async () => { throw new Error('wrong session'); },
+    close: async () => {},
+  }), /wrong session/);
+});
+
+test("a live worker without a receipt polls only to the phase deadline and closes", async () => {
+  const mock = mockPhase([{}], 750);
+  await assert.rejects(mock.run(), /timed out/);
+  assert.deepEqual(mock.events, [['start', 1], ['sleep', 500], ['sleep', 250], ['close', 1]]);
+});

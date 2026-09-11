@@ -14,6 +14,7 @@ import {
   parseCliOptions,
   parseProviderEnvName,
   roundArtifactPaths,
+  runPhaseWithRetry,
   selectReadyIssue,
   shellQuote,
   validateFreshSessionId,
@@ -152,17 +153,13 @@ async function readRollouts(worktreePath: string, phaseStartedAt: string) {
   return found.filter((item) => item.cwd === worktreePath);
 }
 
-async function waitForJson(path: string, timeoutMs: number) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    try {
-      return JSON.parse(await readFile(path, "utf8"));
-    } catch (error: any) {
-      if (error.code !== "ENOENT" && !(error instanceof SyntaxError)) throw error;
-    }
-    await new Promise((resolveTimeout) => setTimeout(resolveTimeout, 500));
+async function readOptionalJson(path: string) {
+  try {
+    return JSON.parse(await readFile(path, "utf8"));
+  } catch (error: any) {
+    if (error.code === "ENOENT" || error instanceof SyntaxError) return undefined;
+    throw error;
   }
-  throw new Error(`timed out waiting for ${path}`);
 }
 
 async function runPhase({
@@ -184,35 +181,70 @@ async function runPhase({
 }) {
   const credential = process.env[providerEnvName];
   if (!credential) throw new Error(`required provider variable ${providerEnvName} is absent`);
-  const phaseStartedAt = new Date().toISOString();
-  const paneId = await createPane(worktreePath, { [providerEnvName]: credential });
-  const command = buildCodexPhaseCommand({
-    model: options.model,
-    effort: options.effort,
-    worktreePath,
-    schemaPath,
-    receiptPath,
-    promptPath,
+  const result = await runPhaseWithRetry({
+    timeoutMs: options.timeoutMs,
+    now: Date.now,
+    sleep: (ms: number) => new Promise((resolve) => setTimeout(resolve, ms)),
+    start: async (attempt: number) => {
+      const phaseStartedAt = new Date().toISOString();
+      // Isolate receipts and exit markers so a failed attempt cannot satisfy a retry.
+      const attemptReceiptPath = `${receiptPath}.attempt-${attempt}`;
+      const exitPath = `${attemptReceiptPath}.exit`;
+      const paneId = await createPane(worktreePath, { [providerEnvName]: credential });
+      const command = buildCodexPhaseCommand({
+        model: options.model,
+        effort: options.effort,
+        worktreePath,
+        schemaPath,
+        receiptPath: attemptReceiptPath,
+        promptPath,
+      });
+      try {
+        // A dedicated shell writes the status only after Unsnooze has exited.
+        // Do not infer exit from an idle/missing agent_session during startup.
+        const trackedCommand = `${command}\nsandcastle_exit=$?\nprintf '%s\\n' "$sandcastle_exit" > ${shellQuote(exitPath)}`;
+        await requireOk("herdr", ["pane", "run", paneId,
+          `/bin/sh -c ${shellQuote(trackedCommand)}`]);
+        return { paneId, phaseStartedAt, attemptReceiptPath, exitPath, attempt };
+      } catch (error) {
+        await closePane(paneId);
+        throw error;
+      }
+    },
+    inspect: async (worker: any) => {
+      // Read exit first, then receipt: an exit marker guarantees receipt writes ended.
+      const exitCode = await readOptionalJson(worker.exitPath);
+      const receipt = await readOptionalJson(worker.attemptReceiptPath);
+      return {
+        receipt,
+        exitCode,
+        output: exitCode === undefined ? "" : await readPane(worker.paneId),
+      };
+    },
+    validate: async (worker: any, receipt: any) => {
+      const paneInfo = await readPaneInfo(worker.paneId);
+      validateSessionEvidence({
+        receiptSessionId: receipt.session_id,
+        paneSession: paneInfo?.agent_session,
+        paneUnsnoozeOwner: paneInfo?.tokens?.unsnooze_owner,
+        rollouts: await readRollouts(worktreePath, worker.phaseStartedAt),
+        worktreePath,
+        phaseStartedAt: worker.phaseStartedAt,
+      });
+      validateFreshSessionId(receipt.session_id, usedSessionIds);
+    },
+    close: async (worker: any) => {
+      try {
+        const evidence = await readPaneEvidence(worker.paneId);
+        await writeFile(`${paneEvidencePath}.attempt-${worker.attempt}`, evidence);
+        await writeFile(paneEvidencePath, evidence);
+      } finally {
+        await closePane(worker.paneId);
+      }
+    },
   });
-  try {
-    await requireOk("herdr", ["pane", "run", paneId, command]);
-    const receipt = await waitForJson(receiptPath, options.timeoutMs);
-    const paneInfo = await readPaneInfo(paneId);
-    validateSessionEvidence({
-      receiptSessionId: receipt.session_id,
-      paneSession: paneInfo?.agent_session,
-      paneUnsnoozeOwner: paneInfo?.tokens?.unsnooze_owner,
-      rollouts: await readRollouts(worktreePath, phaseStartedAt),
-      worktreePath,
-      phaseStartedAt,
-    });
-    return { receipt, paneId };
-  } catch (error) {
-    await writeFile(paneEvidencePath, await readPaneEvidence(paneId));
-    throw error;
-  } finally {
-    await closePane(paneId);
-  }
+  await writeFile(receiptPath, `${JSON.stringify(result.receipt, null, 2)}\n`);
+  return { receipt: result.receipt };
 }
 
 const issues = await resolveIssues();
