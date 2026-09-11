@@ -316,7 +316,8 @@ def _is_exact_visible_price(value: str, visible_text: str) -> bool:
         re.IGNORECASE,
     )
     suffix_qualifier_pattern = re.compile(
-        r"^(?:\+|\s*(?:and\s+up\b|or\s+(?:more|higher)\b))",
+        r"^(?:\+|\s*(?:and\s+up|or\s+(?:more|higher)|estimated|approximately|"
+        r"about|minimum)\b)",
         re.IGNORECASE,
     )
     for match in price_pattern.finditer(normalized_visible):
