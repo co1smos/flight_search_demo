@@ -86,10 +86,10 @@ class SearchPolicy:
         "submit_search",
         "read_results",
     })
-    _AIR_CANADA_SEARCH_PATHS = (
+    _AIR_CANADA_SEARCH_PATHS = frozenset({
         "/aeroplan/redeem/availability",
         "/search",
-    )
+    })
     _ALLOWED_SEARCH_FIELDS = frozenset({
         "adults",
         "cabin",
@@ -150,9 +150,10 @@ class SearchPolicy:
             raise PolicyViolation("navigation path must not contain backslashes")
         if any(segment in {".", ".."} for segment in decoded_path.split("/")):
             raise PolicyViolation("navigation path must not contain dot segments")
-        if parsed.hostname in APPROVED_AIR_CANADA_DOMAINS and not any(
-            parsed.path == prefix or parsed.path.startswith(f"{prefix}/")
-            for prefix in self._AIR_CANADA_SEARCH_PATHS
+        normalized_path = decoded_path.rstrip("/") or "/"
+        if (
+            parsed.hostname in APPROVED_AIR_CANADA_DOMAINS
+            and normalized_path not in self._AIR_CANADA_SEARCH_PATHS
         ):
             raise PolicyViolation("navigation is not an approved search-only Air Canada path")
 
@@ -244,6 +245,25 @@ class _ResultsScriptParser(HTMLParser):
         }
     )
     _INLINE_TEXT_ELEMENTS = frozenset({"b", "em", "i", "small", "span", "strong"})
+    _CARD_CONTEXT_ELEMENTS = frozenset(
+        {
+            "article",
+            "aside",
+            "button",
+            "dd",
+            "div",
+            "dt",
+            "fieldset",
+            "figcaption",
+            "figure",
+            "li",
+            "p",
+            "section",
+            "td",
+            "th",
+            "tr",
+        }
+    )
 
     def __init__(self) -> None:
         super().__init__()
@@ -387,7 +407,14 @@ class _ResultsScriptParser(HTMLParser):
                 _, hidden, text_parts, _, _ = self._element_stack[index]
                 if not hidden and text_parts:
                     if tag in self._TEXT_REGION_ELEMENTS:
-                        self._visible_region_parts.append((" ".join(text_parts), text_parts))
+                        context_parts = text_parts
+                        for ancestor in reversed(self._element_stack[:index]):
+                            if ancestor[0] in self._CARD_CONTEXT_ELEMENTS:
+                                context_parts = ancestor[2]
+                                break
+                        self._visible_region_parts.append(
+                            (" ".join(text_parts), context_parts)
+                        )
                     elif tag in self._INLINE_TEXT_ELEMENTS:
                         context_parts = text_parts
                         for ancestor in reversed(self._element_stack[:index]):

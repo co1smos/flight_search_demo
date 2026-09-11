@@ -253,6 +253,30 @@ def test_nested_inline_price_with_visible_qualifier_is_rejected(criteria, tmp_pa
     assert result["status"] == "UNVERIFIED_PRICE"
 
 
+def test_split_sibling_from_qualifier_is_rejected(criteria, tmp_path):
+    fixture = tmp_path / "split-sibling-from-price.html"
+    fixture.write_text(
+        """<!doctype html><html><body><main data-page-kind="results">
+        <article><div>From</div><div>60,000 pts + $82.40 CAD</div></article>
+        <script id="aeroplan-results-data" type="application/json">
+        {"itineraries":[{"visible":true,"complete_itinerary":true,
+        "price_kind":"exact","price_label":"60,000 pts","points_per_passenger":60000,
+        "cash":{"displayed_total":"$82.40","currency":"CAD"},
+        "segments":[{"departure":"2026-11-05T20:30:00-05:00",
+        "arrival":"2026-11-06T08:35:00+01:00","flight_number":"AC 872",
+        "marketing_carrier":"Air Canada","operating_carrier":"Air Canada",
+        "cabin":"Business"}]}]}
+        </script></main></body></html>""",
+        encoding="utf-8",
+    )
+
+    result = AeroplanSearchAdapter(
+        browser=AeroplanFixtureBrowser(fixture)
+    ).execute(criteria, "split-sibling-from-price")
+
+    assert result["status"] == "UNVERIFIED_PRICE"
+
+
 def test_malformed_scalar_warnings_return_parser_failed(criteria, tmp_path):
     fixture = tmp_path / "scalar-warnings.html"
     fixture.write_text(
@@ -513,6 +537,19 @@ def test_search_policy_custom_allowlist_cannot_expand_beyond_approved_domains():
     ],
 )
 def test_search_policy_rejects_lookalike_paths_and_non_https_default_ports(url):
+    with pytest.raises(PolicyViolation):
+        SearchPolicy().validate_url(url)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://www.aircanada.com/search/checkout",
+        "https://www.aircanada.com/search/book",
+        "https://www.aircanada.com/aeroplan/redeem/availability/payment",
+    ],
+)
+def test_search_policy_rejects_mutation_and_booking_descendants(url):
     with pytest.raises(PolicyViolation):
         SearchPolicy().validate_url(url)
 
