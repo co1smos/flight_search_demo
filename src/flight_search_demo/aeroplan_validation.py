@@ -58,6 +58,7 @@ def validate_controlled_search(
     criteria = None
     task_id = None
     request_hash = None
+    request_confirmed = False
     status = "MANUAL_SEARCH_ONLY"
     detail = ("Controlled live validation is blocked: no validated persistent-profile Aeroplan "
               "browser driver is available. No live navigation, model call, or submission occurred.")
@@ -68,6 +69,7 @@ def validate_controlled_search(
         request_hash = build_request_hash(request_id, original_text, criteria)
         task_id = f"aeroplan-{request_hash[:12]}"
         error = validate_confirmation(confirmation, request_id, request_hash)
+        request_confirmed = error is None
         if error:
             status, detail = "CONFIRMATION_REQUIRED", error
         elif risk_acknowledged is not True:
@@ -81,6 +83,11 @@ def validate_controlled_search(
         atomic_task_id=task_id, normalized_criteria=asdict(criteria) if criteria else None,
         status=status, detail=detail, extra_fields={
             "request_hash": request_hash,
+            "risk_acknowledged": risk_acknowledged is True,
+            "request_confirmed": request_confirmed,
+            "blocking_reason": (
+                "LIVE_DRIVER_UNAVAILABLE" if status == "MANUAL_SEARCH_ONLY" else status
+            ),
             "adapter_status": "UNVERIFIED",
             "continuous_live_execution_enabled": False,
             "live_search_submitted": False,

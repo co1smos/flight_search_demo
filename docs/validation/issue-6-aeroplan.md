@@ -1,9 +1,25 @@
 # Controlled Aeroplan validation: UNVERIFIED
 
 No live search was performed for issue #6. Continuous live execution remains
-disabled. The issue prompt supplied neither an explicit account/terms risk
-acknowledgement nor a confirmed search request. No credentials or persistent
-Aeroplan profile were accessed. No remote acceptance evidence is claimed.
+disabled. The operator explicitly acknowledged account/terms risk and authorized
+one search: Aeroplan, SFO to TPE, 2026-09-14, Business, 1 adult, one-way,
+maximum 105000 points. No credentials or persistent Aeroplan profile were
+accessed. No remote acceptance evidence is claimed.
+
+The authorized validation entry point was executed on 2026-09-11. It exited 1
+as designed, reporting `MANUAL_SEARCH_ONLY` with `LIVE_DRIVER_UNAVAILABLE`.
+Both operator gates passed; the missing live driver is the blocker. The recorded
+allowance is 10 because no search was submitted. This is local blocked evidence,
+not evidence of navigation, authentication, availability, or profile reuse.
+
+Committed evidence:
+
+- [Original structured request](issue-6-request.json)
+- [Confirmation bound to the request hash](issue-6-confirmation.json)
+- [Actual correlated blocked report](issue-6-report.jsonl)
+
+The confirmation records the authorization supplied in this issue's worker
+prompt. It does not authorize alternate criteria, retries, or continuous runs.
 
 The existing Aeroplan implementation is fixture-backed. The Steel/browser-use
 integration validates a controlled test page, not the official award flow.
@@ -20,7 +36,7 @@ confirmation format. Acknowledgement is a separate explicit operator action:
 
 ```sh
 uv run python -m flight_search_demo.aeroplan_validation \
-  --request request.json --confirmation confirmation.json \
+  --request docs/validation/issue-6-request.json --confirmation docs/validation/issue-6-confirmation.json \
   --event-log .artifacts/aeroplan-validation.jsonl \
   --acknowledge-account-and-terms-risk
 ```
@@ -39,8 +55,8 @@ ledger path across future runs; deleting or replacing it loses accounting.
 
 ## Remaining live validation gates
 
-A future implementation needs an operator-confirmed request and risk acceptance,
-a reusable persistent Aeroplan profile, and a verified browser driver that:
+The operator gates are satisfied for the recorded request. Live validation still
+requires a reusable persistent Aeroplan profile and a verified browser driver that:
 
 - Covers setup, navigation, model calls, submission, visible extraction and
   cancellation with one 60-second deadline. The current report's 60-second field

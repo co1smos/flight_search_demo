@@ -77,3 +77,24 @@ def test_changed_criteria_cannot_reuse_confirmation(tmp_path):
         current_date=date(2026, 9, 11))
     assert event["status"] == "CONFIRMATION_REQUIRED"
     assert event["allowance_remaining"] == 10
+
+
+def test_authorized_blocked_report_distinguishes_driver_from_operator_gate(tmp_path):
+    request, confirmation = request_and_confirmation()
+    event = validate_controlled_search(request=request, confirmation=confirmation,
+        risk_acknowledged=True, event_log_path=tmp_path / "events.jsonl",
+        allowance_db_path=tmp_path / "usage.sqlite3", current_date=date(2026, 9, 11))
+    assert event["risk_acknowledged"] is True
+    assert event["request_confirmed"] is True
+    assert event["blocking_reason"] == "LIVE_DRIVER_UNAVAILABLE"
+    assert event["live_validation_performed"] is False
+
+
+def test_unconfirmed_report_does_not_claim_operator_gate_passed(tmp_path):
+    request, confirmation = request_and_confirmation()
+    event = validate_controlled_search(request={**request, "destination": "LHR"},
+        confirmation=confirmation, risk_acknowledged=True,
+        event_log_path=tmp_path / "events.jsonl", allowance_db_path=tmp_path / "usage.sqlite3",
+        current_date=date(2026, 9, 11))
+    assert event["request_confirmed"] is False
+    assert event["blocking_reason"] == "CONFIRMATION_REQUIRED"
