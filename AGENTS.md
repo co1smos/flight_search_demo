@@ -26,8 +26,8 @@ remains unresolved, important assumptions cannot be established, verification
 fails, or the task clearly belongs in the hard category.
 
 Before launching a delegated worker, preflight its exact model and reasoning
-effort. If that tier is unavailable, preflight the configured Gemini 3.8 model
-ID and use it with provider-default reasoning. If Gemini 3.8 is unavailable or
+effort. If that tier is unavailable, preflight the configured `gemini-pro-agent` model
+ID and use it with provider-default reasoning. If `gemini-pro-agent` is unavailable or
 not configured, use the authenticated Codex account's verified default and
 report the fallback.
 
