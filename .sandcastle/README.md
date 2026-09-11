@@ -1,29 +1,72 @@
-# Sandcastle workflow
+# Sandcastle + Unsnooze workflow
 
-This repository uses Sandcastle's `simple-loop` template with Codex and
-`noSandbox()`. Each invocation selects one open `ready-for-agent` issue whose
-blockers are closed and works on the explicit `sandcastle/worker` branch.
+This repository uses a deterministic Sandcastle controller with `noSandbox()`.
+Hermes launches the controller in Herdr; the controller launches one fresh
+Unsnooze-managed Codex implementer and one fresh reviewer in visible sibling
+panes.
 
-## Before the first run
+The initial workflow is deliberately capped at two model calls. It stops at a
+local reviewed candidate branch and never pushes, merges, or mutates GitHub
+issues.
 
-1. Authenticate Codex on the host with `codex login`.
-2. Export a GitHub token for the agent process, for example:
-   `export GH_TOKEN="$(gh auth token)"`.
-3. Approve and publish the tracer-bullet tickets. Do not start the worker while
-   parent PRD #1 is the only `ready-for-agent` issue.
+Full policy and options:
 
-## Run one ticket
-
-```sh
-npm run sandcastle
+```text
+docs/agents/implementation-workflow.md
 ```
 
-The run is intentionally limited to one iteration. Inspect the resulting
-`sandcastle/worker` branch and `.sandcastle/logs/` before merging or starting
-the next ticket.
+## Preflight: no model call
 
-## Safety
+```sh
+SANDCASTLE_MODEL=gpt-5.6-sol SANDCASTLE_EFFORT=medium npm run sandcastle:preflight
+SANDCASTLE_MODEL=gpt-5.6-sol SANDCASTLE_EFFORT=medium npm run sandcastle:preflight -- --issue 5
+```
 
-`noSandbox()` provides no container boundary. Codex runs with this user's host
-permissions. Keep the one-ticket limit, review every branch, and do not put
-secrets in the repository or prompts.
+Preflight resolves the issue/frontier and validates tools, branch/base, test
+commands, provider credential presence, timeout, and the two-call budget. It
+prints the credential variable name but never its value.
+
+## Run one local reviewed candidate
+
+Run from an ordinary Herdr shell pane:
+
+```sh
+SANDCASTLE_MODEL=gpt-5.6-sol SANDCASTLE_EFFORT=medium npm run sandcastle:reviewed -- --issue 5
+```
+
+From Hermes, use a normal sibling command pane—not another Codex agent:
+
+```sh
+herdr pane split --current --direction right --cwd "$PWD" --no-focus
+herdr pane run <returned-pane-id> "SANDCASTLE_MODEL=gpt-5.6-sol SANDCASTLE_EFFORT=medium npm run sandcastle:reviewed -- --issue 5"
+```
+
+The controller then creates and closes the implementer/reviewer panes itself.
+
+Defaults:
+
+```text
+model and effort: required; Hermes selects them from AGENTS.md
+model calls: exactly 2
+timeout: 3600 seconds per phase
+focused test: uv run --with pytest pytest -q
+final test: uv run --with pytest pytest -q
+branch: sandcastle/issue-<number>
+```
+
+Override through documented `SANDCASTLE_*` environment variables or CLI options.
+Do not run the controller through an outer Codex session.
+
+## Unsnooze
+
+Unsnooze is installed user-globally. The Sandcastle controller calls:
+
+```text
+unsnooze _run codex ...
+```
+
+explicitly, so shell wrappers and the GUI daemon are not required for this
+workflow. Natural real-quota recovery remains a passive observation; do not burn
+quota just to trigger it.
+
+Inspect `.sandcastle/runs/<run-id>/` and the candidate branch after every run.

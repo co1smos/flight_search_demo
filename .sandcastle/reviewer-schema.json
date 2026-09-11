@@ -1,0 +1,15 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["phase", "status", "verdict", "session_id", "reviewed_head", "completed_at", "findings"],
+  "properties": {
+    "phase": { "type": "string", "enum": ["reviewer"] },
+    "status": { "type": "string", "enum": ["completed"] },
+    "verdict": { "type": "string", "enum": ["approved", "changes_requested", "blocked"] },
+    "session_id": { "type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$" },
+    "reviewed_head": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "completed_at": { "type": "string", "minLength": 1 },
+    "findings": { "type": "array", "items": { "type": "string" } }
+  }
+}

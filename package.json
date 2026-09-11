@@ -7,7 +7,11 @@
     "doc": "docs"
   },
   "scripts": {
-    "sandcastle": "npx tsx .sandcastle/main.mts"
+    "sandcastle": "npm run sandcastle:reviewed",
+    "sandcastle:preflight": "tsx .sandcastle/main.mts --preflight",
+    "sandcastle:reviewed": "tsx .sandcastle/main.mts",
+    "test:sandcastle-workflow": "node --test .sandcastle/workflow-core.test.mjs",
+    "typecheck:sandcastle-workflow": "tsc --noEmit --allowJs --checkJs false --module nodenext --moduleResolution nodenext --target es2022 --lib esnext --types node --skipLibCheck .sandcastle/main.mts"
   },
   "repository": {
     "type": "git",
