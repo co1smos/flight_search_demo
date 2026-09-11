@@ -209,6 +209,20 @@ def test_visible_punctuated_qualified_price_is_rejected_when_payload_claims_exac
 
 
 @pytest.mark.parametrize(
+    "fixture_name",
+    ["unverified_estimated_price.html", "unverified_suffix_price.html"],
+)
+def test_visible_inferred_price_forms_are_rejected_when_payload_claims_exact(
+    criteria, fixture_name
+):
+    result = AeroplanSearchAdapter(
+        browser=AeroplanFixtureBrowser(FIXTURES / fixture_name)
+    ).execute(criteria, "inferred-price")
+
+    assert result["status"] == "UNVERIFIED_PRICE"
+
+
+@pytest.mark.parametrize(
     "action",
     [
         {"action": "enter_credentials"},

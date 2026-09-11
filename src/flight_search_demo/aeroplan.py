@@ -310,13 +310,20 @@ def _is_exact_visible_price(value: str, visible_text: str) -> bool:
         rf"(?<![\w,.]){re.escape(normalized_value)}(?![\w,.])",
         re.IGNORECASE,
     )
-    qualifier_pattern = re.compile(
+    prefix_qualifier_pattern = re.compile(
         r"\b(?:from|starting\s+(?:at|from)|as\s+low\s+as|estimated|"
-        r"approximately|about)(?:[^\w]+(?:only|just))?[^\w]*$",
+        r"approximately|about)(?:\s+at)?(?:\s+(?:only|just))?\s*[:\-–—]?\s*$",
+        re.IGNORECASE,
+    )
+    suffix_qualifier_pattern = re.compile(
+        r"^\s*(?:and\s+up\b|or\s+(?:more|higher)\b)",
         re.IGNORECASE,
     )
     for match in price_pattern.finditer(normalized_visible):
-        if qualifier_pattern.search(normalized_visible[: match.start()]) is None:
+        if (
+            prefix_qualifier_pattern.search(normalized_visible[: match.start()]) is None
+            and suffix_qualifier_pattern.search(normalized_visible[match.end() :]) is None
+        ):
             return True
     return False
 
