@@ -19,7 +19,7 @@ Rules:
 - Do not launch hidden subagents or another Sandcastle workflow.
 - The controller, not this session, owns final acceptance.
 
-At the end, determine `CODEX_THREAD_ID`, `git rev-parse HEAD`, and UTC time. Return only JSON matching the supplied schema:
+At the end, you MUST execute `echo $CODEX_THREAD_ID`, `git rev-parse HEAD`, and `date -u` in the terminal to get the real values before writing your response. Do not hallucinate or invent the session_id; you must read the environment variable. Return only JSON matching the supplied schema:
 
 - phase: `implementer`
 - status: `completed`

@@ -21,7 +21,7 @@ Review rules:
 - `approved` means no actionable finding and an unchanged Git head.
 - Use `changes_requested` for concrete correctable findings and `blocked` only for an external prerequisite.
 
-Determine `CODEX_THREAD_ID`, current `git rev-parse HEAD`, and UTC time. Return only JSON matching the supplied schema:
+Determine `CODEX_THREAD_ID` (by running `echo $CODEX_THREAD_ID` in the shell), current `git rev-parse HEAD`, and UTC time. Do not hallucinate the session_id. Return only JSON matching the supplied schema:
 
 - phase: `reviewer`
 - status: `completed`
