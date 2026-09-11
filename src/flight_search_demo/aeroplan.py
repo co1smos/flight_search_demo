@@ -303,6 +303,24 @@ def _is_exact_visible_text(value: str, visible_text: str) -> bool:
     ) is not None
 
 
+def _is_exact_visible_price(value: str, visible_text: str) -> bool:
+    normalized_value = " ".join(value.split())
+    normalized_visible = " ".join(visible_text.split())
+    price_pattern = re.compile(
+        rf"(?<![\w,.]){re.escape(normalized_value)}(?![\w,.])",
+        re.IGNORECASE,
+    )
+    qualifier_pattern = re.compile(
+        r"\b(?:from|starting\s+(?:at|from)|as\s+low\s+as|estimated|"
+        r"approximately|about)(?:\s+(?:only|just))?\s*$",
+        re.IGNORECASE,
+    )
+    for match in price_pattern.finditer(normalized_visible):
+        if qualifier_pattern.search(normalized_visible[: match.start()]) is None:
+            return True
+    return False
+
+
 def _validated_itinerary(
     raw: Mapping[str, Any], criteria: NormalizedCriteria, visible_text: str
 ) -> tuple[dict[str, Any] | None, str | None]:
@@ -324,7 +342,7 @@ def _validated_itinerary(
         or raw.get("price_kind") != "exact"
         or re.fullmatch(r"\s*\d[\d,]*\s+(?:pts|points)\s*", label, re.IGNORECASE) is None
         or int(re.sub(r"\D", "", label)) != points
-        or not _is_exact_visible_text(label, visible_text)
+        or not _is_exact_visible_price(label, visible_text)
     ):
         return None, "UNVERIFIED_PRICE"
 
