@@ -133,6 +133,30 @@ def test_agent_outcome_cannot_bypass_deterministic_extraction_validation(criteri
     assert result["status"] == "UNVERIFIED_PRICE"
 
 
+def test_price_must_be_visible_as_an_exact_value_not_a_numeric_substring(criteria, tmp_path):
+    fixture = tmp_path / "substring-price.html"
+    fixture.write_text(
+        """<!doctype html><html><body><main data-page-kind="results">
+        <div>160,000 pts + $82.40 CAD</div>
+        <script id="aeroplan-results-data" type="application/json">
+        {"itineraries":[{"visible":true,"complete_itinerary":true,
+        "price_kind":"exact","price_label":"60,000 pts","points_per_passenger":60000,
+        "cash":{"displayed_total":"$82.40","currency":"CAD"},
+        "segments":[{"departure":"2026-11-05T20:30:00-05:00",
+        "arrival":"2026-11-06T08:35:00+01:00","flight_number":"AC 872",
+        "marketing_carrier":"Air Canada","operating_carrier":"Air Canada",
+        "cabin":"Business"}]}]}
+        </script></main></body></html>""",
+        encoding="utf-8",
+    )
+
+    result = AeroplanSearchAdapter(
+        browser=AeroplanFixtureBrowser(fixture)
+    ).execute(criteria, "substring-price")
+
+    assert result["status"] == "UNVERIFIED_PRICE"
+
+
 @pytest.mark.parametrize(
     "action",
     [
@@ -152,9 +176,67 @@ def test_search_policy_rejects_non_search_and_unsupported_actions(action):
         SearchPolicy().validate_action(action)
 
 
+@pytest.mark.parametrize(
+    "action",
+    [
+        {"action": "fill_search_field", "field": "password", "value": "redacted"},
+        {"action": "fill_search_field", "field": "passenger_name", "value": "Jane Doe"},
+        {"action": "fill_search_field", "field": "first_name", "value": "Jane"},
+        {"action": "fill_search_field", "field": "credit_card", "value": "redacted"},
+        {"action": "select_search_option", "field": "transfer_points", "value": "yes"},
+        {"action": "submit_search", "selector": "button[data-action='book']"},
+        {"action": "read_results", "script": "document.body.innerText"},
+    ],
+)
+def test_search_policy_rejects_forbidden_intent_hidden_in_allowed_actions(action):
+    with pytest.raises(PolicyViolation):
+        SearchPolicy().validate_action(action)
+
+
+def test_search_policy_allows_passenger_count_as_search_criteria():
+    SearchPolicy().validate_action(
+        {"action": "select_search_option", "field": "passenger_count", "value": 2}
+    )
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://www.aircanada.com/aeroplan/redeem/availability-evil",
+        "https://www.aircanada.com/search-and-book",
+        "https://www.aircanada.com:444/aeroplan/redeem/availability",
+    ],
+)
+def test_search_policy_rejects_lookalike_paths_and_non_https_default_ports(url):
+    with pytest.raises(PolicyViolation):
+        SearchPolicy().validate_url(url)
+
+
 def test_agent_outcome_is_rejected_when_step_bound_or_domain_policy_is_broken(criteria):
     for outcome in (
         BrowserAgentOutcome("completed", None, 7, (), (), "too many steps"),
+        BrowserAgentOutcome(
+            "completed",
+            PageSnapshot(
+                OFFICIAL_SEARCH_ENTRY_URL,
+                (FIXTURES / "match.html").read_text(encoding="utf-8"),
+            ),
+            1,
+            (OFFICIAL_SEARCH_ENTRY_URL,),
+            ({"action": "read_results"}, {"action": "read_results"}),
+            "more actions than bounded steps",
+        ),
+        BrowserAgentOutcome(
+            "completed",
+            PageSnapshot(
+                OFFICIAL_SEARCH_ENTRY_URL,
+                (FIXTURES / "match.html").read_text(encoding="utf-8"),
+            ),
+            1,
+            (),
+            ({"action": "read_results"},),
+            "final page missing from navigation trace",
+        ),
         BrowserAgentOutcome(
             "completed",
             None,

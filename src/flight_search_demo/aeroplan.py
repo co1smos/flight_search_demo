@@ -85,6 +85,28 @@ class SearchPolicy:
         "submit_search",
         "read_results",
     })
+    _AIR_CANADA_SEARCH_PATHS = (
+        "/aeroplan/redeem/availability",
+        "/search",
+    )
+    _ALLOWED_SEARCH_FIELDS = frozenset({
+        "adults",
+        "cabin",
+        "date",
+        "departure_date",
+        "destination",
+        "origin",
+        "passenger_count",
+        "passengers",
+        "trip_type",
+    })
+    _ALLOWED_ACTION_KEYS = {
+        "navigate": frozenset({"action", "url"}),
+        "fill_search_field": frozenset({"action", "field", "value"}),
+        "select_search_option": frozenset({"action", "field", "value"}),
+        "submit_search": frozenset({"action"}),
+        "read_results": frozenset({"action"}),
+    }
 
     def __init__(self, *, allowed_domains: Sequence[str] | None = None) -> None:
         self.allowed_domains = frozenset(
@@ -95,17 +117,22 @@ class SearchPolicy:
     def validate_url(self, url: str) -> None:
         if not isinstance(url, str):
             raise PolicyViolation("navigation URL must be a string")
-        parsed = urlparse(url)
+        try:
+            parsed = urlparse(url)
+            port = parsed.port
+        except ValueError as exc:
+            raise PolicyViolation("navigation URL is malformed") from exc
         if (
             parsed.scheme != "https"
             or parsed.hostname not in self.allowed_domains
             or parsed.username is not None
             or parsed.password is not None
+            or port not in {None, 443}
         ):
             raise PolicyViolation("navigation is outside approved Air Canada domains")
-        if parsed.hostname in APPROVED_AIR_CANADA_DOMAINS and not (
-            parsed.path.startswith("/aeroplan/redeem/availability")
-            or parsed.path.startswith("/search")
+        if parsed.hostname in APPROVED_AIR_CANADA_DOMAINS and not any(
+            parsed.path == prefix or parsed.path.startswith(f"{prefix}/")
+            for prefix in self._AIR_CANADA_SEARCH_PATHS
         ):
             raise PolicyViolation("navigation is not an approved search-only Air Canada path")
 
@@ -113,8 +140,18 @@ class SearchPolicy:
         name = str(action.get("action", "")).strip().lower()
         if name not in self._ALLOWED_ACTIONS:
             raise PolicyViolation(f"action is not permitted for search-only automation: {name}")
+        normalized_keys = {str(key).strip().lower() for key in action}
+        if normalized_keys - self._ALLOWED_ACTION_KEYS[name]:
+            raise PolicyViolation("action contains unsupported automation fields")
         if name == "navigate":
             self.validate_url(str(action.get("url", "")))
+            return
+        if name in {"fill_search_field", "select_search_option"}:
+            field = str(action.get("field", "")).strip().lower().replace("-", "_")
+            if field not in self._ALLOWED_SEARCH_FIELDS or "value" not in action:
+                raise PolicyViolation("action does not target an approved award-search field")
+            if not isinstance(action["value"], (str, int)) or isinstance(action["value"], bool):
+                raise PolicyViolation("search field value must be scalar structured data")
 
 
 class _ResultsScriptParser(HTMLParser):
@@ -179,6 +216,16 @@ def _parse_results(page: PageSnapshot) -> tuple[list[dict[str, Any]], str]:
     return itineraries, " ".join(parser.visible_text)
 
 
+def _is_exact_visible_text(value: str, visible_text: str) -> bool:
+    normalized_value = " ".join(value.split())
+    normalized_visible = " ".join(visible_text.split())
+    return re.search(
+        rf"(?<![\w,.]){re.escape(normalized_value)}(?![\w,.])",
+        normalized_visible,
+        re.IGNORECASE,
+    ) is not None
+
+
 def _validated_itinerary(
     raw: Mapping[str, Any], criteria: NormalizedCriteria, visible_text: str
 ) -> tuple[dict[str, Any] | None, str | None]:
@@ -200,7 +247,7 @@ def _validated_itinerary(
         or raw.get("price_kind") != "exact"
         or re.fullmatch(r"\s*\d[\d,]*\s+(?:pts|points)\s*", label, re.IGNORECASE) is None
         or int(re.sub(r"\D", "", label)) != points
-        or label.strip().lower() not in visible_text.lower()
+        or not _is_exact_visible_text(label, visible_text)
     ):
         return None, "UNVERIFIED_PRICE"
 
@@ -210,7 +257,7 @@ def _validated_itinerary(
         for field in ("displayed_total", "currency")
     ):
         return None, "PARSER_FAILED"
-    if not all(str(cash[field]).lower() in visible_text.lower()
+    if not all(_is_exact_visible_text(str(cash[field]), visible_text)
                for field in ("displayed_total", "currency")):
         return None, "UNVERIFIED_PRICE"
     segments = raw.get("segments")
@@ -404,6 +451,8 @@ class AeroplanSearchAdapter:
             raise PolicyViolation("browser fallback exceeded its step bound")
         if not isinstance(outcome.visited_urls, tuple) or not isinstance(outcome.actions, tuple):
             raise ValueError("browser fallback trace must be immutable structured data")
+        if len(outcome.actions) > outcome.steps:
+            raise PolicyViolation("browser fallback action trace exceeds its reported step count")
         for url in outcome.visited_urls:
             self.policy.validate_url(url)
         for action in outcome.actions:
@@ -414,6 +463,8 @@ class AeroplanSearchAdapter:
             raise ValueError("browser fallback page must be a structured snapshot")
         if outcome.page is not None:
             self.policy.validate_url(outcome.page.url)
+            if outcome.page.url not in outcome.visited_urls:
+                raise ValueError("browser fallback final page is missing from its navigation trace")
 
     @staticmethod
     def _result(status: str, detail: str, **fields: Any) -> dict[str, Any]:
