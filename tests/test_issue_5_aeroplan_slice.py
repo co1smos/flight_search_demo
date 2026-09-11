@@ -220,6 +220,21 @@ def test_search_policy_rejects_lookalike_paths_and_non_https_default_ports(url):
 @pytest.mark.parametrize(
     "url",
     [
+        "https://www.aircanada.com/search/../checkout",
+        "https://www.aircanada.com/aeroplan/redeem/availability/../../../checkout",
+        "https://www.aircanada.com/search/%2e%2e/checkout",
+        "https://www.aircanada.com/aeroplan/redeem/availability/%2E%2E/%2e%2e/checkout",
+        "https://www.aircanada.com/search/%252e%252e/checkout",
+    ],
+)
+def test_search_policy_rejects_dot_segment_path_traversal(url):
+    with pytest.raises(PolicyViolation):
+        SearchPolicy().validate_url(url)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
         "https://login.aircanada.com/account/delete",
         "https://aircanada.b2clogin.com/password-reset",
     ],

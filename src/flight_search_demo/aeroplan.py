@@ -7,7 +7,7 @@ from enum import Enum
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from .app import NormalizedCriteria
 
@@ -139,6 +139,14 @@ class SearchPolicy:
             or port not in {None, 443}
         ):
             raise PolicyViolation("navigation is outside approved Air Canada domains")
+        decoded_path = parsed.path
+        while True:
+            next_path = unquote(decoded_path)
+            if next_path == decoded_path:
+                break
+            decoded_path = next_path
+        if any(segment in {".", ".."} for segment in decoded_path.split("/")):
+            raise PolicyViolation("navigation path must not contain dot segments")
         if parsed.hostname in APPROVED_AIR_CANADA_DOMAINS and not any(
             parsed.path == prefix or parsed.path.startswith(f"{prefix}/")
             for prefix in self._AIR_CANADA_SEARCH_PATHS
