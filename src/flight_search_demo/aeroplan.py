@@ -311,12 +311,12 @@ def _is_exact_visible_price(value: str, visible_text: str) -> bool:
         re.IGNORECASE,
     )
     prefix_qualifier_pattern = re.compile(
-        r"\b(?:from|starting\s+(?:at|from)|as\s+low\s+as|estimated|"
+        r"\b(?:from|at\s+least|starting\s+(?:at|from)|as\s+low\s+as|estimated|"
         r"approximately|about)(?:\s+at)?(?:\s+(?:only|just))?\s*[:\-–—]?\s*$",
         re.IGNORECASE,
     )
     suffix_qualifier_pattern = re.compile(
-        r"^\s*(?:and\s+up\b|or\s+(?:more|higher)\b)",
+        r"^(?:\+|\s*(?:and\s+up\b|or\s+(?:more|higher)\b))",
         re.IGNORECASE,
     )
     for match in price_pattern.finditer(normalized_visible):

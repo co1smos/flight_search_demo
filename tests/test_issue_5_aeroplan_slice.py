@@ -222,6 +222,33 @@ def test_visible_inferred_price_forms_are_rejected_when_payload_claims_exact(
     assert result["status"] == "UNVERIFIED_PRICE"
 
 
+@pytest.mark.parametrize("visible_price", ["At least 60,000 pts", "60,000 pts+"])
+def test_visible_minimum_price_forms_are_rejected_when_payload_claims_exact(
+    criteria, tmp_path, visible_price
+):
+    fixture = tmp_path / "minimum-price.html"
+    fixture.write_text(
+        f"""<!doctype html><html><body><main data-page-kind="results">
+        <div>{visible_price} + $82.40 CAD</div>
+        <script id="aeroplan-results-data" type="application/json">
+        {{"itineraries":[{{"visible":true,"complete_itinerary":true,
+        "price_kind":"exact","price_label":"60,000 pts","points_per_passenger":60000,
+        "cash":{{"displayed_total":"$82.40","currency":"CAD"}},
+        "segments":[{{"departure":"2026-11-05T20:30:00-05:00",
+        "arrival":"2026-11-06T08:35:00+01:00","flight_number":"AC 872",
+        "marketing_carrier":"Air Canada","operating_carrier":"Air Canada",
+        "cabin":"Business"}}]}}]}}
+        </script></main></body></html>""",
+        encoding="utf-8",
+    )
+
+    result = AeroplanSearchAdapter(
+        browser=AeroplanFixtureBrowser(fixture)
+    ).execute(criteria, "minimum-price")
+
+    assert result["status"] == "UNVERIFIED_PRICE"
+
+
 @pytest.mark.parametrize(
     "action",
     [
