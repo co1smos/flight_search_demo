@@ -240,6 +240,10 @@ class AnaSearchPolicy:
                     raise PolicyViolation("ANA award-flow transition may be used at most once")
                 self._award_transition_seen = True
         elif name in {"fill_search_field", "select_search_option"}:
+            if not self._award_transition_seen:
+                raise PolicyViolation(
+                    "ANA award-flow transition must precede search interaction"
+                )
             field = str(action.get("field", "")).strip().lower().replace("-", "_")
             if field not in self._FIELDS or "value" not in action:
                 raise PolicyViolation("action does not target an approved ANA search field")
@@ -252,7 +256,13 @@ class AnaSearchPolicy:
             ):
                 raise PolicyViolation("search field value differs from confirmed criteria")
             self._entered_fields.add(field)
-        elif name == "submit_search" and record_submission:
+        elif name == "submit_search":
+            if not self._award_transition_seen:
+                raise PolicyViolation(
+                    "ANA award-flow transition must precede search interaction"
+                )
+            if not record_submission:
+                return
             if self._entered_fields != self._FIELDS:
                 raise PolicyViolation("all confirmed criteria must be entered before ANA search submission")
             if self._submission_seen:

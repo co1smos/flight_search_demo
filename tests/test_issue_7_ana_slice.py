@@ -212,16 +212,23 @@ def test_search_policy_allows_only_one_cta_transition_before_search_interaction(
         policy.validate_action({
             "action": "navigate", "url": OFFICIAL_ANA_AWARD_FLOW_TRANSITION_URL,
         })
-    policy.validate_action({"action": "fill_search_field", "field": "origin", "value": "SFO"})
-    with pytest.raises(PolicyViolation, match="must precede"):
-        policy.validate_action(transition)
+    with pytest.raises(PolicyViolation, match="award-flow transition"):
+        policy.validate_action({"action": "fill_search_field", "field": "origin", "value": "SFO"})
+    with pytest.raises(PolicyViolation, match="award-flow transition"):
+        policy.validate_action({"action": "submit_search"})
 
 
 def test_search_policy_binds_actions_to_confirmed_values_and_one_submission(criteria):
-    from flight_search_demo.ana import AnaSearchPolicy, PolicyViolation
+    from flight_search_demo.ana import (
+        AnaSearchPolicy, OFFICIAL_ANA_AWARD_FLOW_TRANSITION_URL, PolicyViolation,
+    )
 
     policy = AnaSearchPolicy()
     policy.validate_criteria(criteria)
+    policy.validate_action({
+        "action": "enter_award_flow",
+        "url": OFFICIAL_ANA_AWARD_FLOW_TRANSITION_URL,
+    })
     policy.validate_action({"action": "fill_search_field", "field": "origin", "value": "SFO"})
     with pytest.raises(PolicyViolation, match="confirmed criteria"):
         policy.validate_action(
@@ -304,6 +311,11 @@ def test_persistent_browser_runs_bounded_agent_and_reserves_at_single_submit(cri
     class Session:
         async def get_element_by_index(self, index):
             return {
+                0: Node(
+                    tag_name="a",
+                    href="/other/int/meta/0771.html?CONNECTION_KIND=us&LANG=e",
+                    text="Reserve/(Purchase) Apply",
+                ),
                 1: Node(name="origin"),
                 2: Node(name="destination"),
                 3: Node(name="departure_date"),
@@ -342,6 +354,9 @@ def test_persistent_browser_runs_bounded_agent_and_reserves_at_single_submit(cri
 
         async def run(self, max_steps):
             captured["max_steps"] = max_steps
+            await self.multi_act([SimpleNamespace(model_dump=lambda **kwargs: {
+                "click": {"index": 0}
+            })])
             actions = (
                 ("input", {"index": 1, "text": "SFO"}),
                 ("input", {"index": 2, "text": "NRT"}),
