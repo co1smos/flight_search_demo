@@ -284,7 +284,7 @@ class PersistentAnaBrowser:
         submitted = False
         extraction: dict[str, Any] | None = None
 
-        async def authorize_actions(model_actions: Any) -> None:
+        async def authorize_actions(model_actions: Any, phase: str) -> None:
             nonlocal submitted
             if not isinstance(model_actions, list) or len(model_actions) > max_actions_per_step:
                 raise ValueError("browser agent emitted an invalid action batch")
@@ -324,6 +324,10 @@ class PersistentAnaBrowser:
                         "url": OFFICIAL_ANA_AWARD_FLOW_TRANSITION_URL,
                     }
                 elif name == "click" and await self._is_submit_index(int(params["index"])):
+                    if phase != "submission":
+                        raise ValueError(
+                            f"ANA browser agent attempted submit_search during {phase} state"
+                        )
                     if submitted:
                         raise ValueError("ANA search may be submitted at most once")
                     action = {"action": "submit_search"}
@@ -335,83 +339,140 @@ class PersistentAnaBrowser:
                     continue
                 else:
                     raise ValueError("browser agent attempted an unsupported ANA interaction")
+                allowed_actions = {
+                    "award_flow": {"enter_award_flow"},
+                    "search_form": {"fill_search_field", "select_search_option"},
+                    "submission": {"submit_search"},
+                    "results": {"read_results"},
+                }[phase]
+                if action["action"] not in allowed_actions:
+                    raise ValueError(
+                        f"ANA browser agent attempted {action['action']} during {phase} state"
+                    )
                 authorize_action(action)
                 trace.append(action)
 
-        tools = Controller()
-        permitted_tools = {"navigate", "input", "select_dropdown", "extract", "click", "done"}
-        for name in tuple(tools.registry.registry.actions):
-            if name not in permitted_tools:
-                tools.exclude_action(name)
         primary, fallback = build_agent_llms(
             primary_model=os.environ.get("ANA_GEMINI_MODEL", "gemini-2.5-flash"),
             fallback_model=os.environ.get("ANA_FALLBACK_GEMINI_MODEL", "gemini-3.6-flash"),
             api_key=os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY") or "",
         )
-        task = (
-            f"{goal} Exact immutable criteria: origin {criteria.origin}; destination "
-            f"{criteria.destination}; departure {criteria.departure_date}; cabin {criteria.cabin}; "
-            f"adults {criteria.adults}; trip type {criteria.trip_type}. "
-            "On the public entry page, use only the Reserve/(Purchase) Apply CTA to enter the "
-            "official award flow before interacting with search fields. Submit exactly once, then "
-            "stop after the official ANA availability page is visible. Do not log in, retry, "
-            "change dates, open alternate routes, or perform any booking action. Use extract on "
-            "the final page and return only JSON with page_kind and visible_text; for results also "
-            "include itineraries containing visible, complete_itinerary, price_kind, price_label, "
-            "points_per_passenger, cash (displayed_total and currency), and complete segments "
-            "(origin, destination, departure, arrival, flight_number, marketing_carrier, "
-            "operating_carrier, cabin)."
+        criteria_text = (
+            f"Exact immutable criteria: origin {criteria.origin}; destination {criteria.destination}; "
+            f"departure {criteria.departure_date}; cabin {criteria.cabin}; adults {criteria.adults}; "
+            f"trip type {criteria.trip_type}."
         )
-        agent = Agent(
-            task=task, llm=primary, fallback_llm=fallback, browser_session=self._session,
-            tools=tools, use_vision=False, use_judge=False,
-            max_actions_per_step=max_actions_per_step, max_failures=max_failures,
-            llm_timeout=max(1, int(self.deadline_at - time.monotonic())),
-            step_timeout=max(1, int(self.deadline_at - time.monotonic())),
+        phases = (
+            (
+                "award_flow", {"click", "done"},
+                f"{goal} From the current public ANA page, enter the official award flow using "
+                "only the Reserve/(Purchase) Apply CTA, then stop. Do not interact with search "
+                f"fields in this state. {criteria_text}",
+            ),
+            (
+                "search_form", {"input", "select_dropdown", "done"},
+                "On the current official ANA award-search form, fill only the confirmed search "
+                "criteria, then stop without submitting. Do not retry, change dates, log in, or "
+                "perform booking actions. " + criteria_text,
+            ),
+            (
+                "submission", {"click", "done"},
+                "On the current completed ANA award-search form, submit the confirmed criteria "
+                "exactly once, then stop when the availability page appears. Do not alter any "
+                "field, retry, navigate elsewhere, log in, or perform booking actions. "
+                + criteria_text,
+            ),
+            (
+                "results", {"extract", "done"},
+                "On the current page, read the visible final ANA availability state and stop; do "
+                "not click, navigate, retry, or change the submitted search. Use extract and return "
+                "only JSON with page_kind and visible_text; for results also include itineraries "
+                "containing visible, complete_itinerary, price_kind, price_label, "
+                "points_per_passenger, cash (displayed_total and currency), and complete segments "
+                "(origin, destination, departure, arrival, flight_number, marketing_carrier, "
+                "operating_carrier, cabin). " + criteria_text,
+            ),
         )
-        execute_actions = agent.multi_act
-
-        async def authorized_multi_act(actions: Any):
-            nonlocal extraction
-            await authorize_actions(actions)
-            results = await execute_actions(actions)
-            for action, result in zip(actions, results or []):
-                payload = action.model_dump(exclude_none=True)
-                if "extract" not in payload:
-                    continue
-                content = getattr(result, "extracted_content", None)
-                if not isinstance(content, str):
-                    raise ValueError("ANA browser-agent extraction returned no text")
-                try:
-                    decoded = json.loads(content)
-                except json.JSONDecodeError as exc:
-                    raise ValueError("ANA browser-agent extraction returned invalid JSON") from exc
-                if not isinstance(decoded, dict):
-                    raise ValueError("ANA browser-agent extraction returned non-object JSON")
-                extraction = decoded
-            return results
-
-        agent.multi_act = authorized_multi_act
-        history = self._run(agent.run(max_steps=max_steps))
-        steps = int(self._history_value(history, "number_of_steps", 0))
-        errors = self._history_value(history, "errors", []) or []
-        failures = min(len([error for error in errors if error]), max_failures)
-        urls = tuple(str(url) for url in (self._history_value(history, "urls", []) or []))
-        done = bool(self._history_value(history, "is_done", False))
-        successful = bool(self._history_value(history, "is_successful", False))
-        if not done:
-            if failures >= max_failures:
+        steps = 0
+        failures = 0
+        visited_urls: list[str] = []
+        for phase, permitted_tools, task in phases:
+            remaining_steps = max_steps - steps
+            remaining_failures = max_failures - failures
+            if remaining_steps <= 0:
                 return AnaAgentOutcome(
-                    "failure_exhausted", None, steps, failures, urls, tuple(trace)
+                    "step_exhausted", None, steps, failures,
+                    tuple(visited_urls), tuple(trace),
                 )
-            return AnaAgentOutcome("step_exhausted", None, steps, failures, urls, tuple(trace))
-        if not successful:
-            return AnaAgentOutcome("failed", None, steps, failures, urls, tuple(trace))
+            if remaining_failures <= 0:
+                return AnaAgentOutcome(
+                    "failure_exhausted", None, steps, failures,
+                    tuple(visited_urls), tuple(trace),
+                )
+            tools = Controller()
+            for name in tuple(tools.registry.registry.actions):
+                if name not in permitted_tools:
+                    tools.exclude_action(name)
+            agent = Agent(
+                task=task, llm=primary, fallback_llm=fallback, browser_session=self._session,
+                tools=tools, use_vision=False, use_judge=False,
+                max_actions_per_step=max_actions_per_step, max_failures=remaining_failures,
+                llm_timeout=max(1, int(self.deadline_at - time.monotonic())),
+                step_timeout=max(1, int(self.deadline_at - time.monotonic())),
+            )
+            execute_actions = agent.multi_act
+
+            async def authorized_multi_act(actions: Any, *, _phase=phase, _execute=execute_actions):
+                nonlocal extraction
+                await authorize_actions(actions, _phase)
+                results = await _execute(actions)
+                for action, result in zip(actions, results or []):
+                    payload = action.model_dump(exclude_none=True)
+                    if "extract" not in payload:
+                        continue
+                    content = getattr(result, "extracted_content", None)
+                    if not isinstance(content, str):
+                        raise ValueError("ANA browser-agent extraction returned no text")
+                    try:
+                        decoded = json.loads(content)
+                    except json.JSONDecodeError as exc:
+                        raise ValueError(
+                            "ANA browser-agent extraction returned invalid JSON"
+                        ) from exc
+                    if not isinstance(decoded, dict):
+                        raise ValueError("ANA browser-agent extraction returned non-object JSON")
+                    extraction = decoded
+                return results
+
+            agent.multi_act = authorized_multi_act
+            history = self._run(agent.run(max_steps=remaining_steps))
+            phase_steps = int(self._history_value(history, "number_of_steps", 0))
+            if not 0 <= phase_steps <= remaining_steps:
+                raise ValueError("ANA browser-agent phase exceeded its step allocation")
+            steps += phase_steps
+            errors = self._history_value(history, "errors", []) or []
+            failures += min(len([error for error in errors if error]), remaining_failures)
+            for url in self._history_value(history, "urls", []) or []:
+                normalized_url = str(url)
+                if normalized_url not in visited_urls:
+                    visited_urls.append(normalized_url)
+            done = bool(self._history_value(history, "is_done", False))
+            successful = bool(self._history_value(history, "is_successful", False))
+            if not done:
+                status = "failure_exhausted" if failures >= max_failures else "step_exhausted"
+                return AnaAgentOutcome(
+                    status, None, steps, failures, tuple(visited_urls), tuple(trace)
+                )
+            if not successful:
+                return AnaAgentOutcome(
+                    "failed", None, steps, failures, tuple(visited_urls), tuple(trace)
+                )
         page = self._snapshot()
-        if page.url not in urls:
-            urls += (page.url,)
+        if page.url not in visited_urls:
+            visited_urls.append(page.url)
         return AnaAgentOutcome(
-            "completed", page, steps, failures, urls, tuple(trace), extraction=extraction,
+            "completed", page, steps, failures, tuple(visited_urls), tuple(trace),
+            extraction=extraction,
         )
 
 

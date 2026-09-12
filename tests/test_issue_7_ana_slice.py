@@ -454,11 +454,12 @@ def test_persistent_browser_runs_bounded_agent_and_reserves_at_single_submit(cri
 
     reservations = []
     executions = []
-    captured = {}
+    captured = []
 
     class Agent:
         def __init__(self, **kwargs):
-            captured.update(kwargs)
+            self.task = kwargs["task"]
+            captured.append(kwargs)
             self.multi_act = self._multi_act
 
         async def _multi_act(self, actions):
@@ -469,28 +470,37 @@ def test_persistent_browser_runs_bounded_agent_and_reserves_at_single_submit(cri
             return []
 
         async def run(self, max_steps):
-            captured["max_steps"] = max_steps
-            await self.multi_act([SimpleNamespace(model_dump=lambda **kwargs: {
-                "click": {"index": 0}
-            })])
-            actions = (
-                ("input", {"index": 1, "text": "SFO"}),
-                ("input", {"index": 2, "text": "NRT"}),
-                ("input", {"index": 3, "text": "2026-09-17"}),
-                ("select_dropdown", {"index": 4, "text": "Business"}),
-                ("select_dropdown", {"index": 5, "text": "1"}),
-                ("select_dropdown", {"index": 6, "text": "one-way"}),
-            )
-            for name, params in actions:
-                await self.multi_act([SimpleNamespace(
-                    model_dump=lambda name=name, params=params, **kwargs: {name: params}
-                )])
-            await self.multi_act([SimpleNamespace(model_dump=lambda **kwargs: {
-                "click": {"index": 7}
-            })])
+            if "enter the official award flow" in self.task:
+                await self.multi_act([SimpleNamespace(model_dump=lambda **kwargs: {
+                    "click": {"index": 0}
+                })])
+                steps = 1
+            elif "fill only the confirmed search criteria" in self.task:
+                actions = (
+                    ("input", {"index": 1, "text": "SFO"}),
+                    ("input", {"index": 2, "text": "NRT"}),
+                    ("input", {"index": 3, "text": "2026-09-17"}),
+                    ("select_dropdown", {"index": 4, "text": "Business"}),
+                    ("select_dropdown", {"index": 5, "text": "1"}),
+                    ("select_dropdown", {"index": 6, "text": "one-way"}),
+                )
+                for offset in range(0, len(actions), 2):
+                    batch = [SimpleNamespace(
+                        model_dump=lambda name=name, params=params, **kwargs: {name: params}
+                    ) for name, params in actions[offset:offset + 2]]
+                    await self.multi_act(batch)
+                steps = 3
+            elif "submit the confirmed criteria" in self.task:
+                await self.multi_act([SimpleNamespace(model_dump=lambda **kwargs: {
+                    "click": {"index": 7}
+                })])
+                steps = 1
+            else:
+                steps = 1
             return SimpleNamespace(
                 is_done=lambda: True, is_successful=lambda: True,
-                number_of_steps=lambda: 7, errors=lambda: [], urls=lambda: [OFFICIAL_ANA_SEARCH_ENTRY_URL],
+                number_of_steps=lambda: steps, errors=lambda: [],
+                urls=lambda: [OFFICIAL_ANA_SEARCH_ENTRY_URL],
             )
 
     browser = PersistentAnaBrowser(
@@ -518,10 +528,71 @@ def test_persistent_browser_runs_bounded_agent_and_reserves_at_single_submit(cri
     assert outcome.status == "completed"
     assert reservations == ["reserved"]
     assert executions[-1] == ("click", ["reserved"])
-    assert captured["max_steps"] == 8
-    assert captured["max_actions_per_step"] == 2
-    assert captured["max_failures"] == 2
-    assert "SFO" in captured["task"] and "NRT" in captured["task"]
+    assert len(captured) == 4
+    assert all(item["max_actions_per_step"] == 2 for item in captured)
+    assert all(item["max_failures"] == 2 for item in captured)
+    assert all("SFO" in item["task"] and "NRT" in item["task"] for item in captured)
+
+
+def test_persistent_browser_uses_separate_state_specific_agent_goals(criteria):
+    from types import SimpleNamespace
+    from flight_search_demo.ana import AnaSearchPolicy, OFFICIAL_ANA_SEARCH_ENTRY_URL
+    from flight_search_demo.ana_validation import PersistentAnaBrowser
+
+    tasks = []
+
+    class Agent:
+        def __init__(self, **kwargs):
+            tasks.append(kwargs["task"])
+            self.multi_act = self._multi_act
+
+        async def _multi_act(self, actions):
+            del actions
+            return []
+
+        async def run(self, max_steps):
+            del max_steps
+            return SimpleNamespace(
+                is_done=lambda: True, is_successful=lambda: True,
+                number_of_steps=lambda: 1, errors=lambda: [],
+                urls=lambda: [OFFICIAL_ANA_SEARCH_ENTRY_URL],
+            )
+
+    browser = PersistentAnaBrowser(
+        cdp_url="ws://127.0.0.1/devtools/browser/test",
+        profile_path=Path("unused.json"), deadline_seconds=30,
+        reserve_submission=lambda: True,
+    )
+    browser._loop = __import__("asyncio").new_event_loop()
+    browser._session = SimpleNamespace()
+    browser._snapshot = lambda: __import__(
+        "flight_search_demo.aeroplan", fromlist=["PageSnapshot"]
+    ).PageSnapshot(OFFICIAL_ANA_SEARCH_ENTRY_URL, "<html><body>ANA</body></html>")
+    policy = AnaSearchPolicy()
+    policy.validate_criteria(criteria)
+    try:
+        with patch("flight_search_demo.ana_validation.Agent", Agent), patch(
+            "flight_search_demo.ana_validation.Controller"
+        ) as controller, patch(
+            "flight_search_demo.ana_validation.build_agent_llms",
+            return_value=(object(), object()),
+        ):
+            controller.return_value.registry.registry.actions = {}
+            outcome = browser.browser_agent_search(
+                criteria, goal="confirmed criteria only", max_steps=8,
+                max_actions_per_step=2, max_failures=2,
+                allowed_domains=sorted(policy.allowed_domains),
+                authorize_action=policy.validate_action,
+            )
+    finally:
+        browser._loop.close()
+
+    assert outcome.status == "completed"
+    assert len(tasks) == 4
+    assert "enter the official award flow" in tasks[0]
+    assert "fill only the confirmed search criteria" in tasks[1]
+    assert "submit the confirmed criteria exactly once" in tasks[2]
+    assert "read the visible final ANA availability state" in tasks[3]
 
 
 def test_persistent_browser_authorizes_real_entry_page_award_flow_transition_before_form_input(
@@ -565,6 +636,7 @@ def test_persistent_browser_authorizes_real_entry_page_award_flow_transition_bef
 
     class Agent:
         def __init__(self, **kwargs):
+            self.task = kwargs["task"]
             self.multi_act = self._multi_act
 
         async def _multi_act(self, actions):
@@ -572,15 +644,17 @@ def test_persistent_browser_authorizes_real_entry_page_award_flow_transition_bef
 
         async def run(self, max_steps):
             del max_steps
-            await self.multi_act([SimpleNamespace(model_dump=lambda **kwargs: {
-                "click": {"index": 1}
-            })])
-            await self.multi_act([SimpleNamespace(model_dump=lambda **kwargs: {
-                "input": {"index": 2, "text": "SFO"}
-            })])
+            if "enter the official award flow" in self.task:
+                await self.multi_act([SimpleNamespace(model_dump=lambda **kwargs: {
+                    "click": {"index": 1}
+                })])
+            elif "fill only the confirmed search criteria" in self.task:
+                await self.multi_act([SimpleNamespace(model_dump=lambda **kwargs: {
+                    "input": {"index": 2, "text": "SFO"}
+                })])
             return SimpleNamespace(
                 is_done=lambda: True, is_successful=lambda: True,
-                number_of_steps=lambda: 2, errors=lambda: [],
+                number_of_steps=lambda: 1, errors=lambda: [],
                 urls=lambda: [
                     "https://www.ana.co.jp/en/us/amc/international-flight-awards/",
                     "https://www.ana.co.jp/other/int/meta/0771.html?CONNECTION_KIND=us&LANG=e",
@@ -651,6 +725,7 @@ def test_production_agent_extraction_validates_results_without_fixture_markers(c
 
     class Agent:
         def __init__(self, **kwargs):
+            self.task = kwargs["task"]
             self.multi_act = self._multi_act
 
         async def _multi_act(self, actions):
@@ -661,9 +736,10 @@ def test_production_agent_extraction_validates_results_without_fixture_markers(c
 
         async def run(self, max_steps):
             del max_steps
-            await self.multi_act([SimpleNamespace(model_dump=lambda **kwargs: {
-                "extract": {"query": "ANA award results as JSON", "extract_links": False}
-            })])
+            if "read the visible final ANA availability state" in self.task:
+                await self.multi_act([SimpleNamespace(model_dump=lambda **kwargs: {
+                    "extract": {"query": "ANA award results as JSON", "extract_links": False}
+                })])
             return SimpleNamespace(
                 is_done=lambda: True, is_successful=lambda: True,
                 number_of_steps=lambda: 1, errors=lambda: [],
