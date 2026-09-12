@@ -1,4 +1,5 @@
 import json
+import time
 from datetime import date
 
 from flight_search_demo.aeroplan_validation import validate_controlled_search
@@ -103,7 +104,7 @@ def test_live_driver_reserves_once_at_submission_and_preserves_non_availability_
     assert event["continuous_live_execution_enabled"] is False
 
 
-def test_missing_persistent_profile_is_the_exact_external_blocker(tmp_path):
+def test_unavailable_configured_browser_is_the_exact_external_blocker(tmp_path):
     from flight_search_demo.aeroplan_validation import PersistentAeroplanDriver
 
     request, confirmation = request_and_confirmation()
@@ -114,13 +115,63 @@ def test_missing_persistent_profile_is_the_exact_external_blocker(tmp_path):
         event_log_path=tmp_path / "events.jsonl",
         allowance_db_path=tmp_path / "usage.sqlite3",
         current_date=date(2026, 9, 11),
-        live_driver=PersistentAeroplanDriver(tmp_path / "missing-profile"),
+        live_driver=PersistentAeroplanDriver("http://127.0.0.2:3000"),
     )
 
     assert event["status"] == "MANUAL_SEARCH_ONLY"
-    assert event["blocking_reason"] == "PERSISTENT_PROFILE_UNAVAILABLE"
+    assert event["blocking_reason"] == "CONTROLLED_BROWSER_UNAVAILABLE"
     assert event["live_search_submitted"] is False
     assert event["allowance_remaining"] == 10
+
+
+def test_persistent_driver_uses_configured_controlled_browser_and_detects_authentication(monkeypatch):
+    import flight_search_demo.aeroplan_validation as validation
+    from flight_search_demo.aeroplan import PageSnapshot
+
+    request, _ = request_and_confirmation()
+    criteria = normalize_request(request, current_date=date(2026, 9, 11))
+    calls = []
+
+    class Browser:
+        def __init__(self, *, cdp_url, deadline_seconds, reserve_submission):
+            self.navigation_performed = False
+            calls.append((cdp_url, deadline_seconds, reserve_submission))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            calls.append("closed")
+
+        def open(self, url):
+            self.navigation_performed = True
+            calls.append(url)
+            return PageSnapshot(
+                url,
+                '<html><body><a>Sign in</a><footer>Air Canada</footer></body></html>',
+            )
+
+        def deterministic_search(self, criteria):
+            raise AssertionError("authentication must be detected before submission")
+
+        def browser_agent_search(self, *args, **kwargs):
+            raise AssertionError("authentication must not invoke a model")
+
+    monkeypatch.setattr(validation, "PersistentAeroplanBrowser", Browser)
+    monkeypatch.setattr(
+        validation,
+        "discover_debugger_cdp_url",
+        lambda base_url, api_key, timeout: "ws://127.0.0.1:9223/devtools/browser/test",
+    )
+
+    driver = validation.PersistentAeroplanDriver("http://127.0.0.1:3000")
+    result = driver.execute(criteria, deadline_seconds=60, reserve_submission=lambda: True)
+
+    assert result["status"] == "AUTHENTICATION_REQUIRED"
+    assert result["live_validation_performed"] is True
+    assert result["visible_results_validated"] is False
+    assert result["profile_reusable"] is True
+    assert calls[-1] == "closed"
 
 
 def test_live_driver_cannot_report_no_availability_without_visible_validation(tmp_path):
@@ -203,3 +254,32 @@ def test_malformed_request_fails_closed_without_consuming_allowance(tmp_path):
     assert event["request_confirmed"] is False
     assert event["live_search_submitted"] is False
     assert event["allowance_remaining"] == 10
+
+
+def test_controller_enforces_one_deadline_and_emits_correlated_timeout(tmp_path, monkeypatch):
+    import flight_search_demo.aeroplan_validation as validation
+
+    request, confirmation = request_and_confirmation()
+
+    class BlockingDriver:
+        def execute(self, criteria, *, deadline_seconds, reserve_submission):
+            time.sleep(1)
+            raise AssertionError("controller failed to interrupt the blocked driver")
+
+    monkeypatch.setattr(validation, "OPERATION_DEADLINE_SECONDS", 0.05)
+    started = time.monotonic()
+    event = validate_controlled_search(
+        request=request,
+        confirmation=confirmation,
+        risk_acknowledged=True,
+        event_log_path=tmp_path / "events.jsonl",
+        allowance_db_path=tmp_path / "usage.sqlite3",
+        current_date=date(2026, 9, 11),
+        live_driver=BlockingDriver(),
+    )
+
+    assert time.monotonic() - started < 0.5
+    assert event["status"] == "SEARCH_TIMEOUT"
+    assert event["blocking_reason"] == "SEARCH_TIMEOUT"
+    assert event["request_id"] == request["request_id"]
+    assert json.loads((tmp_path / "events.jsonl").read_text()) == event

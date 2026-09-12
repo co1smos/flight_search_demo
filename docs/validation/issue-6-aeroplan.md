@@ -1,18 +1,19 @@
 # Controlled Aeroplan validation: UNVERIFIED
 
-No live search was performed for issue #6. Continuous live execution remains
-disabled. The operator explicitly acknowledged account/terms risk and authorized
-one search: Aeroplan, SFO to TPE, 2026-09-14, Business, 1 adult, one-way,
-maximum 105000 points. No credentials were accessed. No remote acceptance
-evidence is claimed.
+One controlled live attempt was performed for issue #6. Continuous live execution
+remains disabled. The operator explicitly acknowledged account/terms risk and
+authorized one search: Aeroplan, SFO to TPE, 2026-09-14, Business, 1 adult,
+one-way, maximum 105000 points. No credentials were accessed. No remote
+acceptance evidence is claimed.
 
-The authorized validation entry point was executed again on 2026-09-12 after
-the requested history audit. It exited 1 as designed, reporting
-`MANUAL_SEARCH_ONLY` with `PERSISTENT_PROFILE_UNAVAILABLE`. Both operator gates
-passed. The dedicated `.artifacts/aeroplan-profile` directory was absent, so the
-driver stopped before browser acquisition. The recorded allowance is 10 because
-no search was submitted. This is local blocked evidence, not evidence of
-navigation, authentication, availability, or profile reuse.
+The authorized validation entry point was executed on 2026-09-12 against the
+configured loopback Steel service and its persistent Chromium profile. It reached
+the official Air Canada entry page and exited 1 as designed, reporting
+`CHALLENGE_BLOCKED`. Both operator gates passed. No form was filled and no search
+was submitted. The recorded allowance remains 10. The browser session was closed
+without terminating the persistent profile, but no result was extracted or
+validated. This is exact local evidence of the controlled attempt, not evidence
+of availability.
 
 Committed evidence:
 
@@ -26,13 +27,11 @@ prompt. It does not authorize alternate criteria, retries, or continuous runs.
 Repository history and every related `sandcastle/issue-5-*` branch were audited,
 including `b4f0bdf`, `5690b7f`, `d83f087`, and the latest `2731bc0` history.
 That implementation contains useful search-only policy, visible-result
-validation, Playwright lifecycle handling, and browser-use evidence collection,
-but its executable browser is deliberately fixture-confined: request routing
-aborts every URL outside the loopback fixture origin and its form selectors and
-result payload belong to the generated fixture page. Repointing it at Air Canada
-would remove its proven safety boundary without validating the current live DOM.
-The current adapter reuses the policy/result contracts but does not misrepresent
-fixture execution as a live driver.
+validation, Playwright lifecycle handling, and browser-use evidence collection.
+The controlled driver now reuses the repository's browser-session acquisition,
+search-only policy, and result validator against the persistent Steel browser.
+It fails closed before submission when the live page is blocked or its form is
+not deterministically recognized.
 
 ## Reviewable blocked report
 
@@ -43,12 +42,12 @@ confirmation format. Acknowledgement is a separate explicit operator action:
 uv run python -m flight_search_demo.aeroplan_validation \
   --request docs/validation/issue-6-request.json --confirmation docs/validation/issue-6-confirmation.json \
   --event-log .artifacts/aeroplan-validation.jsonl \
-  --profile-dir .artifacts/aeroplan-profile \
+  --steel-base-url http://127.0.0.1:3000 \
   --acknowledge-account-and-terms-risk
 ```
 
-This exits 1 when the dedicated profile is unavailable, appends a correlated
-report, and prints the blocked outcome.
+This exits 1 while continuous live execution remains disabled, appends a
+correlated report, and prints the controlled outcome.
 Omitting acknowledgement reports `RISK_ACKNOWLEDGEMENT_REQUIRED`; stale or
 missing confirmation reports `CONFIRMATION_REQUIRED`. The report records that
 no submission occurred. It includes the original request, normalized criteria,
@@ -60,21 +59,26 @@ cannot go negative and are never refunded on timeout. This blocked entry point
 only reads the allowance; login and recovery do not consume it. Keep the same
 ledger path across future runs; deleting or replacing it loses accounting.
 
-## Remaining live validation gates
+## Controlled validation result
 
-The operator gates are satisfied for the recorded request. Live validation still
-requires a reusable persistent Aeroplan profile and a verified browser driver that:
+The operator gates are satisfied for the recorded request. The controlled browser
+reached an Air Canada challenge/blocking page, so the adapter remains
+`UNVERIFIED`. It did not attempt stealth, CAPTCHA solving, proxy changes, alternate
+dates, or any other circumvention. A future operator-authorized attempt may proceed
+only after the external challenge condition is resolved normally.
 
-- Covers setup, navigation, model calls, submission, visible extraction and
-  cancellation with one 60-second deadline. The current report's 60-second field
-  is the required limit, not evidence of a tested live timeout implementation.
+The implementation now:
+
+- Covers setup, navigation, any model call, submission, visible extraction,
+  cleanup, and cancellation with one controller-enforced 60-second deadline.
 - Enforces approved navigation/actions before execution, binds submitted values
   to confirmed criteria, and reserves one allowance immediately before dispatch.
   Never retries an ambiguous submission; timeout still consumes its reservation.
 - Validates visible results against the submitted route/date/cabin/passengers,
   classifies login/challenge/blocking/site errors and incomplete extraction
   separately, and preserves the profile without exposing credentials.
-- Emits actual correlated live evidence before any verified status can be used.
+- Emits correlated live evidence and requires submission plus visible validation
+  before any availability status can mark the adapter verified.
 
 No stealth, CAPTCHA bypass, proxy rotation, private endpoint replay, or other
 circumvention is implemented or authorized by this entry point. An operator

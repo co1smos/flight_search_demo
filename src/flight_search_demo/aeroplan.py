@@ -12,7 +12,7 @@ from urllib.parse import parse_qsl, unquote, urlparse
 from .app import NormalizedCriteria
 
 
-OFFICIAL_SEARCH_ENTRY_URL = "https://www.aircanada.com/aeroplan/redeem/availability"
+OFFICIAL_SEARCH_ENTRY_URL = "https://www.aircanada.com/ca/en/aco/home.html"
 APPROVED_AIR_CANADA_DOMAINS = frozenset({
     "aircanada.com",
     "www.aircanada.com",
@@ -94,6 +94,7 @@ class SearchPolicy:
     })
     _AIR_CANADA_SEARCH_PATHS = frozenset({
         "/aeroplan/redeem/availability",
+        "/ca/en/aco/home.html",
         "/search",
     })
     _IDENTITY_PATHS = {
@@ -536,7 +537,7 @@ def classify_page(page: PageSnapshot) -> PageKind:
     if re.search(r"\b(?:verify you are human|access denied|captcha|bot detection)\b", visible):
         return PageKind.CHALLENGE
     if hostname in REQUIRED_IDENTITY_DOMAINS or re.search(
-        r"\b(?:sign in to aeroplan|log in to aeroplan)\b", visible
+        r"\b(?:sign in(?: to aeroplan)?|log in(?: to aeroplan)?)\b", visible
     ):
         return PageKind.AUTHENTICATION
     if re.search(

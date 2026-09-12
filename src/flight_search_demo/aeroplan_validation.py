@@ -2,14 +2,59 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
+from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import date
+import json
+import os
 from pathlib import Path
+import signal
 import sqlite3
+import threading
+import time
 from typing import Any, Protocol
 
-from .aeroplan import OFFICIAL_SEARCH_ENTRY_URL
+from browser_use import BrowserSession
+
+from .aeroplan import (
+    APPROVED_AIR_CANADA_DOMAINS,
+    REQUIRED_IDENTITY_DOMAINS,
+    AeroplanSearchAdapter,
+    BrowserAgentOutcome,
+    OFFICIAL_SEARCH_ENTRY_URL,
+    PageSnapshot,
+    PolicyViolation,
+    UnsupportedDeterministicLayout,
+)
 from .app import build_request_hash, emit_event, load_json, normalize_request, validate_confirmation
+from .spike import discover_debugger_cdp_url
+
+
+OPERATION_DEADLINE_SECONDS = 60.0
+
+
+@contextmanager
+def _controller_deadline(seconds: float):
+    """Interrupt the complete synchronous driver call at the controller seam."""
+    if threading.current_thread() is not threading.main_thread():
+        raise RuntimeError("controlled live execution requires the main thread deadline guard")
+    if seconds <= 0:
+        raise TimeoutError("controlled Aeroplan operation exceeded its 60-second deadline")
+
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    previous_timer = signal.getitimer(signal.ITIMER_REAL)
+
+    def expire(_signum, _frame):
+        raise TimeoutError("controlled Aeroplan operation exceeded its 60-second deadline")
+
+    signal.signal(signal.SIGALRM, expire)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, *previous_timer)
+        signal.signal(signal.SIGALRM, previous_handler)
 
 
 class ControlledAeroplanDriver(Protocol):
@@ -20,44 +65,245 @@ class ControlledAeroplanDriver(Protocol):
     ) -> dict[str, Any]: ...
 
 
+class PersistentAeroplanBrowser:
+    """Browser adapter over the repository's persistent loopback Steel session."""
+
+    def __init__(self, *, cdp_url: str, deadline_seconds: float, reserve_submission: Any):
+        self.cdp_url = cdp_url
+        self.deadline_seconds = deadline_seconds
+        self._deadline_at = time.monotonic() + deadline_seconds
+        self.reserve_submission = reserve_submission
+        self.navigation_performed = False
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._session: BrowserSession | None = None
+
+    def _run(self, awaitable):
+        if self._loop is None:
+            raise RuntimeError("controlled browser is not open")
+        remaining = self._deadline_at - time.monotonic()
+        return self._loop.run_until_complete(
+            asyncio.wait_for(awaitable, timeout=max(remaining, 0.001))
+        )
+
+    def __enter__(self) -> "PersistentAeroplanBrowser":
+        self._loop = asyncio.new_event_loop()
+        allowed = sorted(APPROVED_AIR_CANADA_DOMAINS | REQUIRED_IDENTITY_DOMAINS)
+        self._session = BrowserSession(
+            cdp_url=self.cdp_url,
+            is_local=False,
+            keep_alive=True,
+            allowed_domains=allowed,
+        )
+        self._run(self._session.start())
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        try:
+            if self._session is not None:
+                self._run(self._session.stop())
+        finally:
+            if self._loop is not None:
+                self._loop.close()
+            self._loop = None
+            self._session = None
+
+    def _page(self):
+        if self._session is None:
+            raise RuntimeError("controlled browser is not open")
+        page = self._run(self._session.get_current_page())
+        if page is None:
+            raise RuntimeError("persistent browser has no controllable page")
+        return page
+
+    @staticmethod
+    def _decode(value: Any) -> Any:
+        if isinstance(value, str):
+            try:
+                return json.loads(value)
+            except json.JSONDecodeError:
+                return value
+        return value
+
+    def _snapshot(self) -> PageSnapshot:
+        page = self._page()
+        url = self._decode(self._run(page.evaluate("() => window.location.href")))
+        html = self._decode(
+            self._run(page.evaluate("() => document.documentElement.outerHTML"))
+        )
+        if not isinstance(url, str) or not isinstance(html, str):
+            raise RuntimeError("controlled browser returned non-text page content")
+        return PageSnapshot(url=url, html=html)
+
+    def open(self, url: str) -> PageSnapshot:
+        page = self._page()
+        self._run(page.goto(url))
+        self.navigation_performed = True
+        self._run(asyncio.sleep(min(3.0, self.deadline_seconds)))
+        return self._snapshot()
+
+    def deterministic_search(self, criteria: Any) -> PageSnapshot:
+        """Use only explicitly named search controls and submit at most once."""
+        page = self._page()
+        fields = {
+            "origin": (
+                'input[name*="origin" i]', 'input[id*="origin" i]',
+                'input[aria-label*="from" i]', 'input[placeholder*="from" i]',
+            ),
+            "destination": (
+                'input[name*="destination" i]', 'input[id*="destination" i]',
+                'input[aria-label*="to" i]', 'input[placeholder*="to" i]',
+            ),
+            "departure_date": (
+                'input[type="date"]', 'input[name*="depart" i]', 'input[id*="depart" i]',
+            ),
+        }
+        values = {
+            "origin": criteria.origin,
+            "destination": criteria.destination,
+            "departure_date": criteria.departure_date,
+        }
+        for field, selectors in fields.items():
+            element = None
+            for selector in selectors:
+                matches = self._run(page.get_elements_by_css_selector(selector))
+                if matches:
+                    element = matches[0]
+                    break
+            if element is None:
+                raise UnsupportedDeterministicLayout(
+                    f"official award form has no deterministic {field} control"
+                )
+            self._run(element.fill(str(values[field])))
+
+        selections = {
+            "cabin": (
+                ('select[name*="cabin" i]', 'select[id*="cabin" i]'),
+                criteria.cabin,
+            ),
+            "adults": (
+                ('select[name*="adult" i]', 'select[id*="adult" i]'),
+                str(criteria.adults),
+            ),
+            "trip_type": (
+                ('select[name*="trip" i]', 'select[id*="trip" i]'),
+                criteria.trip_type,
+            ),
+        }
+        for field, (selectors, value) in selections.items():
+            element = None
+            for selector in selectors:
+                matches = self._run(page.get_elements_by_css_selector(selector))
+                if matches:
+                    element = matches[0]
+                    break
+            if element is None:
+                raise UnsupportedDeterministicLayout(
+                    f"official award form has no deterministic {field} control"
+                )
+            self._run(element.select_option(str(value)))
+
+        reward_toggle = None
+        for selector in (
+            'input[type="checkbox"][name*="redeem" i]',
+            'input[type="checkbox"][id*="redeem" i]',
+            'input[type="checkbox"][aria-label*="points" i]',
+        ):
+            matches = self._run(page.get_elements_by_css_selector(selector))
+            if matches:
+                reward_toggle = matches[0]
+                break
+        if reward_toggle is None:
+            raise UnsupportedDeterministicLayout(
+                "official form has no deterministic Aeroplan-reward control"
+            )
+        self._run(reward_toggle.check())
+
+        submit = None
+        for selector in (
+            'button[aria-label*="search" i]', 'button[id*="search" i]',
+        ):
+            matches = self._run(page.get_elements_by_css_selector(selector))
+            if matches:
+                submit = matches[0]
+                break
+        if submit is None:
+            raise UnsupportedDeterministicLayout(
+                "official award form has no deterministic search submission control"
+            )
+        if not self.reserve_submission():
+            raise PolicyViolation("Aeroplan submitted-search allowance is exhausted")
+        self._run(submit.click())
+        self._run(asyncio.sleep(min(3.0, self.deadline_seconds)))
+        return self._snapshot()
+
+    def browser_agent_search(
+        self, criteria: Any, *, max_steps: int, allowed_domains: Any,
+        authorize_action: Any,
+    ) -> BrowserAgentOutcome:
+        del criteria, max_steps, allowed_domains, authorize_action
+        return BrowserAgentOutcome(
+            status="refused",
+            page=None,
+            steps=0,
+            visited_urls=(),
+            actions=(),
+            detail=(
+                "official award layout is not deterministically recognized; "
+                "no unbounded or policy-bypassing browser fallback was attempted"
+            ),
+        )
+
+
 class PersistentAeroplanDriver:
-    """Fail-closed live-driver preflight for the dedicated Aeroplan profile.
+    """Run the existing search policy/validator against persistent Steel Chromium."""
 
-    Historical issue-5 browser code is fixture-confined: it aborts every request
-    outside its loopback fixture origin.  Reusing its policy and result validation
-    does not make that fixture page a safe driver for the current Air Canada DOM.
-    """
-
-    def __init__(self, profile_path: Path):
-        self.profile_path = Path(profile_path)
+    def __init__(self, steel_base_url: str = "http://127.0.0.1:3000"):
+        self.steel_base_url = str(steel_base_url)
 
     def execute(
         self, criteria: Any, *, deadline_seconds: int, reserve_submission: Any,
     ) -> dict[str, Any]:
-        del criteria, deadline_seconds, reserve_submission
-        if not self.profile_path.is_dir():
+        browser: PersistentAeroplanBrowser | None = None
+        try:
+            cdp_url = discover_debugger_cdp_url(
+                self.steel_base_url,
+                os.environ.get("STEEL_API_KEY"),
+                timeout=max(float(deadline_seconds), 0.001),
+            )
+            browser = PersistentAeroplanBrowser(
+                cdp_url=cdp_url,
+                deadline_seconds=float(deadline_seconds),
+                reserve_submission=reserve_submission,
+            )
+            with browser:
+                result = AeroplanSearchAdapter(browser=browser).execute(
+                    criteria, "controlled-live-aeroplan"
+                )
+        except TimeoutError:
+            raise
+        except Exception as exc:
             return {
                 "status": "MANUAL_SEARCH_ONLY",
                 "detail": (
-                    "Controlled live validation is blocked: the dedicated persistent "
-                    "Aeroplan browser profile is unavailable. No navigation, model call, "
-                    "or submission occurred."
+                    "Controlled live validation could not acquire or safely operate the "
+                    f"configured persistent browser: {type(exc).__name__}."
                 ),
-                "blocking_reason": "PERSISTENT_PROFILE_UNAVAILABLE",
-                "live_validation_performed": False,
+                "blocking_reason": "CONTROLLED_BROWSER_UNAVAILABLE",
+                "live_validation_performed": bool(
+                    browser is not None and browser.navigation_performed
+                ),
                 "visible_results_validated": False,
                 "profile_reusable": False,
             }
+        status = str(result.get("status", "PARSER_FAILED"))
+        availability_statuses = {
+            "MATCH_FOUND", "NO_AWARD_AVAILABILITY", "ABOVE_POINTS_LIMIT",
+        }
         return {
-            "status": "MANUAL_SEARCH_ONLY",
-            "detail": (
-                "Controlled live validation is blocked: the historical controlled-browser "
-                "implementation is fixture-confined and the official Air Canada layout has "
-                "not been safely validated. No submission occurred."
-            ),
-            "blocking_reason": "OFFICIAL_LIVE_LAYOUT_UNVERIFIED",
-            "live_validation_performed": False,
-            "visible_results_validated": False,
+            **result,
+            "blocking_reason": status,
+            "live_validation_performed": browser.navigation_performed,
+            "visible_results_validated": status in availability_statuses,
             "profile_reusable": True,
         }
 
@@ -100,6 +346,7 @@ def validate_controlled_search(
     current_date: date | None = None,
     live_driver: ControlledAeroplanDriver | None = None,
 ) -> dict[str, Any]:
+    operation_started = time.monotonic()
     request_id = str(request.get("request_id", "")).strip() if isinstance(request, dict) else ""
     original_text = str(request.get("original_text", "")).strip() if isinstance(request, dict) else ""
     criteria = None
@@ -149,9 +396,13 @@ def validate_controlled_search(
             return True
 
         try:
-            result = live_driver.execute(
-                criteria, deadline_seconds=60, reserve_submission=reserve_submission,
-            )
+            remaining = OPERATION_DEADLINE_SECONDS - (time.monotonic() - operation_started)
+            with _controller_deadline(remaining):
+                result = live_driver.execute(
+                    criteria,
+                    deadline_seconds=OPERATION_DEADLINE_SECONDS,
+                    reserve_submission=reserve_submission,
+                )
             if not isinstance(result, dict):
                 raise ValueError("live driver returned an unstructured result")
             status = str(result.get("status", "PARSER_FAILED"))
@@ -199,7 +450,7 @@ def validate_controlled_search(
             "visible_results_validated": visible_results_validated,
             "profile_reusable": profile_reusable,
             "allowance_remaining": allowance.remaining,
-            "operation_deadline_seconds": 60,
+            "operation_deadline_seconds": OPERATION_DEADLINE_SECONDS,
             "search_entry_url": OFFICIAL_SEARCH_ENTRY_URL,
         },
     )
@@ -212,18 +463,19 @@ def main() -> int:
     parser.add_argument("--event-log", required=True, type=Path)
     parser.add_argument("--allowance-db", type=Path, default=Path(".artifacts/aeroplan-usage.sqlite3"))
     parser.add_argument(
-        "--profile-dir", type=Path, default=Path(".artifacts/aeroplan-profile"),
-        help="Dedicated persistent Aeroplan Chromium profile (never a personal browser profile).",
+        "--steel-base-url",
+        default=os.environ.get("STEEL_BASE_URL", "http://127.0.0.1:3000"),
+        help="Loopback Steel service holding the dedicated persistent Chromium profile.",
     )
     parser.add_argument("--acknowledge-account-and-terms-risk", action="store_true")
     args = parser.parse_args()
-    validate_controlled_search(
+    event = validate_controlled_search(
         request=load_json(args.request), confirmation=load_json(args.confirmation),
         risk_acknowledged=args.acknowledge_account_and_terms_risk,
         event_log_path=args.event_log, allowance_db_path=args.allowance_db,
-        live_driver=PersistentAeroplanDriver(args.profile_dir),
+        live_driver=PersistentAeroplanDriver(args.steel_base_url),
     )
-    return 1  # Blocked validation must never signal live success.
+    return 0 if event["adapter_status"] == "VERIFIED" else 1
 
 
 if __name__ == "__main__":
