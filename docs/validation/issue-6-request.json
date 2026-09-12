@@ -1,0 +1,12 @@
+{
+  "request_id": "issue-6-operator-authorized-2026-09-11",
+  "original_text": "Aeroplan; SFO to TPE; departure date 2026-09-14; Business; 1 adult; one-way; maximum 105000 points.",
+  "program": "aeroplan",
+  "origin": "SFO",
+  "destination": "TPE",
+  "departure_date": "2026-09-14",
+  "cabin": "Business",
+  "adults": 1,
+  "trip_type": "one_way",
+  "maximum_points": 105000
+}
