@@ -69,6 +69,89 @@ def test_allowance_persists_without_refunds_or_reset(tmp_path):
     assert AeroplanAllowance(path).remaining == 0
 
 
+def test_live_driver_reserves_once_at_submission_and_preserves_non_availability_failures(tmp_path):
+    request, confirmation = request_and_confirmation()
+
+    class Driver:
+        def execute(self, criteria, *, deadline_seconds, reserve_submission):
+            assert deadline_seconds == 60
+            assert criteria.origin == "JFK"
+            assert reserve_submission() is True
+            return {
+                "status": "AUTHENTICATION_REQUIRED",
+                "detail": "Aeroplan authentication is required",
+                "live_validation_performed": True,
+                "visible_results_validated": False,
+                "profile_reusable": True,
+            }
+
+    event = validate_controlled_search(
+        request=request,
+        confirmation=confirmation,
+        risk_acknowledged=True,
+        event_log_path=tmp_path / "events.jsonl",
+        allowance_db_path=tmp_path / "usage.sqlite3",
+        current_date=date(2026, 9, 11),
+        live_driver=Driver(),
+    )
+
+    assert event["status"] == "AUTHENTICATION_REQUIRED"
+    assert event["status"] != "NO_AWARD_AVAILABILITY"
+    assert event["live_search_submitted"] is True
+    assert event["allowance_remaining"] == 9
+    assert event["adapter_status"] == "UNVERIFIED"
+    assert event["continuous_live_execution_enabled"] is False
+
+
+def test_missing_persistent_profile_is_the_exact_external_blocker(tmp_path):
+    from flight_search_demo.aeroplan_validation import PersistentAeroplanDriver
+
+    request, confirmation = request_and_confirmation()
+    event = validate_controlled_search(
+        request=request,
+        confirmation=confirmation,
+        risk_acknowledged=True,
+        event_log_path=tmp_path / "events.jsonl",
+        allowance_db_path=tmp_path / "usage.sqlite3",
+        current_date=date(2026, 9, 11),
+        live_driver=PersistentAeroplanDriver(tmp_path / "missing-profile"),
+    )
+
+    assert event["status"] == "MANUAL_SEARCH_ONLY"
+    assert event["blocking_reason"] == "PERSISTENT_PROFILE_UNAVAILABLE"
+    assert event["live_search_submitted"] is False
+    assert event["allowance_remaining"] == 10
+
+
+def test_live_driver_cannot_report_no_availability_without_visible_validation(tmp_path):
+    request, confirmation = request_and_confirmation()
+
+    class Driver:
+        def execute(self, criteria, *, deadline_seconds, reserve_submission):
+            assert reserve_submission() is True
+            return {
+                "status": "NO_AWARD_AVAILABILITY",
+                "detail": "empty extraction",
+                "live_validation_performed": True,
+                "visible_results_validated": False,
+                "profile_reusable": True,
+            }
+
+    event = validate_controlled_search(
+        request=request,
+        confirmation=confirmation,
+        risk_acknowledged=True,
+        event_log_path=tmp_path / "events.jsonl",
+        allowance_db_path=tmp_path / "usage.sqlite3",
+        current_date=date(2026, 9, 11),
+        live_driver=Driver(),
+    )
+
+    assert event["status"] == "PARSER_FAILED"
+    assert event["adapter_status"] == "UNVERIFIED"
+    assert event["allowance_remaining"] == 9
+
+
 def test_changed_criteria_cannot_reuse_confirmation(tmp_path):
     request, confirmation = request_and_confirmation()
     event = validate_controlled_search(request={**request, "destination": "LHR"},

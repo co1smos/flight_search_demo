@@ -3,14 +3,16 @@
 No live search was performed for issue #6. Continuous live execution remains
 disabled. The operator explicitly acknowledged account/terms risk and authorized
 one search: Aeroplan, SFO to TPE, 2026-09-14, Business, 1 adult, one-way,
-maximum 105000 points. No credentials or persistent Aeroplan profile were
-accessed. No remote acceptance evidence is claimed.
+maximum 105000 points. No credentials were accessed. No remote acceptance
+evidence is claimed.
 
-The authorized validation entry point was executed on 2026-09-11. It exited 1
-as designed, reporting `MANUAL_SEARCH_ONLY` with `LIVE_DRIVER_UNAVAILABLE`.
-Both operator gates passed; the missing live driver is the blocker. The recorded
-allowance is 10 because no search was submitted. This is local blocked evidence,
-not evidence of navigation, authentication, availability, or profile reuse.
+The authorized validation entry point was executed again on 2026-09-12 after
+the requested history audit. It exited 1 as designed, reporting
+`MANUAL_SEARCH_ONLY` with `PERSISTENT_PROFILE_UNAVAILABLE`. Both operator gates
+passed. The dedicated `.artifacts/aeroplan-profile` directory was absent, so the
+driver stopped before browser acquisition. The recorded allowance is 10 because
+no search was submitted. This is local blocked evidence, not evidence of
+navigation, authentication, availability, or profile reuse.
 
 Committed evidence:
 
@@ -21,13 +23,16 @@ Committed evidence:
 The confirmation records the authorization supplied in this issue's worker
 prompt. It does not authorize alternate criteria, retries, or continuous runs.
 
-The existing Aeroplan implementation is fixture-backed. The Steel/browser-use
-integration validates a controlled test page, not the official award flow.
-The fixture extraction payload and page-kind markers are not evidence that the
-current Air Canada DOM can be searched or parsed. Therefore the controlled
-validation entry point always stops with `MANUAL_SEARCH_ONLY` / `UNVERIFIED`
-after checking confirmation and risk acknowledgement. It never falls back to
-fixture success or calls a browser/model. The normal demo remains offline.
+Repository history and every related `sandcastle/issue-5-*` branch were audited,
+including `b4f0bdf`, `5690b7f`, `d83f087`, and the latest `2731bc0` history.
+That implementation contains useful search-only policy, visible-result
+validation, Playwright lifecycle handling, and browser-use evidence collection,
+but its executable browser is deliberately fixture-confined: request routing
+aborts every URL outside the loopback fixture origin and its form selectors and
+result payload belong to the generated fixture page. Repointing it at Air Canada
+would remove its proven safety boundary without validating the current live DOM.
+The current adapter reuses the policy/result contracts but does not misrepresent
+fixture execution as a live driver.
 
 ## Reviewable blocked report
 
@@ -38,10 +43,12 @@ confirmation format. Acknowledgement is a separate explicit operator action:
 uv run python -m flight_search_demo.aeroplan_validation \
   --request docs/validation/issue-6-request.json --confirmation docs/validation/issue-6-confirmation.json \
   --event-log .artifacts/aeroplan-validation.jsonl \
+  --profile-dir .artifacts/aeroplan-profile \
   --acknowledge-account-and-terms-risk
 ```
 
-This exits 1, appends a correlated report, and prints the blocked outcome.
+This exits 1 when the dedicated profile is unavailable, appends a correlated
+report, and prints the blocked outcome.
 Omitting acknowledgement reports `RISK_ACKNOWLEDGEMENT_REQUIRED`; stale or
 missing confirmation reports `CONFIRMATION_REQUIRED`. The report records that
 no submission occurred. It includes the original request, normalized criteria,
