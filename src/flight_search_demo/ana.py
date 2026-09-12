@@ -97,7 +97,21 @@ class AnaSearchPolicy:
             raise PolicyViolation("allowed domains must be approved ANA domains")
         self.allowed_domains = frozenset(configured)
         self._confirmed_values: dict[str, str | int] | None = None
+        self._entered_fields: set[str] = set()
         self._submission_seen = False
+
+    @staticmethod
+    def _normalized_field_value(field: str, value: str | int) -> str:
+        normalized = str(value).strip()
+        if field in {"origin", "destination"}:
+            return normalized.upper()
+        if field == "cabin":
+            return " ".join(normalized.split()).casefold()
+        if field == "trip_type":
+            return normalized.casefold().replace("-", "_").replace(" ", "_")
+        if field == "adults" and normalized.isdecimal():
+            return str(int(normalized))
+        return normalized
 
     def validate_url(self, url: str) -> None:
         if not isinstance(url, str):
@@ -155,9 +169,14 @@ class AnaSearchPolicy:
                 raise PolicyViolation("search field value must be scalar structured data")
             if self._confirmed_values is None:
                 raise PolicyViolation("ANA search criteria must be confirmed before interaction")
-            if action["value"] != self._confirmed_values[field]:
+            if self._normalized_field_value(field, action["value"]) != self._normalized_field_value(
+                field, self._confirmed_values[field]
+            ):
                 raise PolicyViolation("search field value differs from confirmed criteria")
+            self._entered_fields.add(field)
         elif name == "submit_search" and record_submission:
+            if self._entered_fields != self._FIELDS:
+                raise PolicyViolation("all confirmed criteria must be entered before ANA search submission")
             if self._submission_seen:
                 raise PolicyViolation("ANA search may be submitted at most once")
             self._submission_seen = True
@@ -177,6 +196,7 @@ class AnaSearchPolicy:
             "adults": criteria.adults,
             "trip_type": criteria.trip_type,
         }
+        self._entered_fields = set()
         self._submission_seen = False
 
 

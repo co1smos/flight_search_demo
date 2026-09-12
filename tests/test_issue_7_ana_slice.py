@@ -160,6 +160,18 @@ def test_search_policy_binds_actions_to_confirmed_values_and_one_submission(crit
         policy.validate_action(
             {"action": "fill_search_field", "field": "departure_date", "value": "2026-09-18"}
         )
+    with pytest.raises(PolicyViolation, match="all confirmed criteria"):
+        policy.validate_action({"action": "submit_search"})
+    for field, value in (
+        ("destination", "NRT"),
+        ("departure_date", "2026-09-17"),
+        ("cabin", "Business"),
+        ("adults", "1"),
+        ("trip_type", "one-way"),
+    ):
+        policy.validate_action(
+            {"action": "select_search_option", "field": field, "value": value}
+        )
     policy.validate_action({"action": "submit_search"})
     with pytest.raises(PolicyViolation, match="at most once"):
         policy.validate_action({"action": "submit_search"})
@@ -226,7 +238,12 @@ def test_persistent_browser_runs_bounded_agent_and_reserves_at_single_submit(cri
         async def get_element_by_index(self, index):
             return {
                 1: Node(name="origin"),
-                2: Node(tag_name="button", id="award-search", text="Search"),
+                2: Node(name="destination"),
+                3: Node(name="departure_date"),
+                4: Node(name="cabin"),
+                5: Node(name="adults"),
+                6: Node(name="trip-type"),
+                7: Node(tag_name="button", id="award-search", text="Search"),
             }[index]
 
         async def get_current_page(self):
@@ -250,15 +267,24 @@ def test_persistent_browser_runs_bounded_agent_and_reserves_at_single_submit(cri
         async def run(self, max_steps):
             captured["max_steps"] = max_steps
             callback = captured["register_new_step_callback"]
+            actions = (
+                ("input", {"index": 1, "text": "SFO"}),
+                ("input", {"index": 2, "text": "NRT"}),
+                ("input", {"index": 3, "text": "2026-09-17"}),
+                ("select_dropdown", {"index": 4, "text": "Business"}),
+                ("select_dropdown", {"index": 5, "text": "1"}),
+                ("select_dropdown", {"index": 6, "text": "one-way"}),
+            )
+            for step, (name, params) in enumerate(actions, 1):
+                await callback(None, SimpleNamespace(action=[SimpleNamespace(
+                    model_dump=lambda name=name, params=params, **kwargs: {name: params}
+                )]), step)
             await callback(None, SimpleNamespace(action=[SimpleNamespace(model_dump=lambda **kwargs: {
-                "input": {"index": 1, "text": "SFO"}
-            })]), 1)
-            await callback(None, SimpleNamespace(action=[SimpleNamespace(model_dump=lambda **kwargs: {
-                "click": {"index": 2}
-            })]), 2)
+                "click": {"index": 7}
+            })]), 7)
             return SimpleNamespace(
                 is_done=lambda: True, is_successful=lambda: True,
-                number_of_steps=lambda: 2, errors=lambda: [], urls=lambda: [OFFICIAL_ANA_SEARCH_ENTRY_URL],
+                number_of_steps=lambda: 7, errors=lambda: [], urls=lambda: [OFFICIAL_ANA_SEARCH_ENTRY_URL],
             )
 
     browser = PersistentAnaBrowser(
