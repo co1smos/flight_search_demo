@@ -222,7 +222,20 @@ def classify_ana_page(page: PageSnapshot) -> AnaPageKind:
         return AnaPageKind.SESSION_ERROR
     if "heavy traffic" in text or "temporarily congested" in text or "access denied" in text:
         return AnaPageKind.HEAVY_TRAFFIC
+    if (
+        "no award availability" in text
+        or "no award seats" in text
+        or "no seats available" in text
+        or "no flights available" in text
+    ):
+        return AnaPageKind.NO_AVAILABILITY
     return AnaPageKind.UNKNOWN
+
+
+def _visible_regions(page: PageSnapshot) -> list[tuple[str, str]]:
+    parser = _ResultsScriptParser()
+    parser.feed(page.html)
+    return parser.visible_regions
 
 
 def _validated_ana_itinerary(
@@ -390,11 +403,28 @@ class AnaSearchAdapter:
             agent_extraction = outcome.extraction
             if agent_extraction is not None:
                 try:
-                    kind, _, _ = _parse_agent_extraction(agent_extraction)
+                    extracted_kind, _, _ = _parse_agent_extraction(agent_extraction)
                 except ValueError as exc:
                     return self._result(
                         "VALIDATION_REJECTED", str(exc), browser_agent_used=True,
                     )
+                final_page_kind = classify_ana_page(page)
+                if extracted_kind == AnaPageKind.RESULTS:
+                    kind = (
+                        AnaPageKind.RESULTS
+                        if final_page_kind in {AnaPageKind.RESULTS, AnaPageKind.UNKNOWN}
+                        else final_page_kind
+                    )
+                elif extracted_kind == AnaPageKind.NO_AVAILABILITY:
+                    if final_page_kind != AnaPageKind.NO_AVAILABILITY:
+                        return self._result(
+                            "VALIDATION_REJECTED",
+                            "ANA no-availability extraction is not visible on the final page",
+                            browser_agent_used=True,
+                        )
+                    kind = final_page_kind
+                else:
+                    kind = final_page_kind
             else:
                 kind = classify_ana_page(page)
             used_agent = True
@@ -414,7 +444,8 @@ class AnaSearchAdapter:
 
         try:
             if agent_extraction is not None:
-                _, raw_itineraries, visible_text = _parse_agent_extraction(agent_extraction)
+                _, raw_itineraries, _ = _parse_agent_extraction(agent_extraction)
+                visible_text = _visible_regions(page)
             else:
                 raw_itineraries, visible_text = _parse_results(page)
         except ValueError as exc:

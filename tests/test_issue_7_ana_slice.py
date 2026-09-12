@@ -386,7 +386,8 @@ def test_production_agent_extraction_validates_results_without_fixture_markers(c
     browser._session = SimpleNamespace()
     browser._snapshot = lambda: PageSnapshot(
         OFFICIAL_ANA_SEARCH_ENTRY_URL,
-        "<html><body><article>ANA award availability</article></body></html>",
+        ("<html><body><article>NH 107 SFO to NRT Business "
+         "75,000 miles + $43.10 USD</article></body></html>"),
     )
     policy = AnaSearchPolicy()
     policy.validate_criteria(criteria)
@@ -424,6 +425,84 @@ def test_production_agent_extraction_validates_results_without_fixture_markers(c
     assert outcome.extraction == extraction
     assert result["status"] == "MATCH_FOUND"
     assert result["itineraries"][0]["segments"][0]["flight_number"] == "NH 107"
+
+
+def test_browser_agent_result_evidence_must_be_visible_in_final_dom(criteria):
+    from flight_search_demo.aeroplan import PageSnapshot, UnsupportedDeterministicLayout
+    from flight_search_demo.ana import (
+        AnaAgentOutcome, AnaSearchAdapter, OFFICIAL_ANA_SEARCH_ENTRY_URL,
+    )
+
+    extraction = {
+        "page_kind": "results",
+        "visible_text": ["NH 107 Business 75,000 miles + $43.10 USD"],
+        "itineraries": [{
+            "visible": True,
+            "complete_itinerary": True,
+            "price_kind": "exact",
+            "price_label": "75,000 miles",
+            "points_per_passenger": 75000,
+            "cash": {"displayed_total": "$43.10", "currency": "USD"},
+            "segments": [{
+                "origin": "SFO", "destination": "NRT",
+                "departure": "2026-09-17T01:20:00-07:00",
+                "arrival": "2026-09-18T04:30:00+09:00",
+                "flight_number": "NH 107", "marketing_carrier": "ANA",
+                "operating_carrier": "ANA", "cabin": "Business",
+            }],
+        }],
+    }
+    final_page = PageSnapshot(
+        OFFICIAL_ANA_SEARCH_ENTRY_URL,
+        "<html><body><main>ANA Mileage Club</main></body></html>",
+    )
+
+    class Browser:
+        def open(self, url):
+            return PageSnapshot(url, "<html><body>ANA award search</body></html>")
+
+        def deterministic_search(self, criteria):
+            raise UnsupportedDeterministicLayout
+
+        def browser_agent_search(self, criteria, **kwargs):
+            return AnaAgentOutcome(
+                status="completed", page=final_page, steps=1, failures=0,
+                visited_urls=(final_page.url,), actions=(), extraction=extraction,
+            )
+
+    result = AnaSearchAdapter(browser=Browser()).execute(criteria, "dom-evidence")
+
+    assert result["status"] == "UNVERIFIED_PRICE"
+
+
+def test_browser_agent_no_availability_must_be_visible_in_final_dom(criteria):
+    from flight_search_demo.aeroplan import PageSnapshot, UnsupportedDeterministicLayout
+    from flight_search_demo.ana import (
+        AnaAgentOutcome, AnaSearchAdapter, OFFICIAL_ANA_SEARCH_ENTRY_URL,
+    )
+
+    final_page = PageSnapshot(
+        OFFICIAL_ANA_SEARCH_ENTRY_URL,
+        "<html><body><main>ANA Mileage Club</main></body></html>",
+    )
+
+    class Browser:
+        def open(self, url):
+            return PageSnapshot(url, "<html><body>ANA award search</body></html>")
+
+        def deterministic_search(self, criteria):
+            raise UnsupportedDeterministicLayout
+
+        def browser_agent_search(self, criteria, **kwargs):
+            return AnaAgentOutcome(
+                status="completed", page=final_page, steps=1, failures=0,
+                visited_urls=(final_page.url,), actions=(),
+                extraction={"page_kind": "no_availability"},
+            )
+
+    result = AnaSearchAdapter(browser=Browser()).execute(criteria, "dom-no-availability")
+
+    assert result["status"] == "VALIDATION_REJECTED"
 
 
 def test_persistent_browser_rejects_actions_before_agent_dispatch(criteria):
