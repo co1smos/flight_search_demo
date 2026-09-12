@@ -3,6 +3,7 @@ from datetime import date
 from pathlib import Path
 
 import pytest
+from unittest.mock import patch
 
 from flight_search_demo.app import build_request_hash, normalize_request
 
@@ -41,6 +42,32 @@ def test_browser_agent_completion_is_schema_validated(criteria):
     assert result["browser_agent_used"] is True
     assert result["itineraries"][0]["points_per_passenger"] == 75000
     assert result["itineraries"][0]["segments"][0]["flight_number"] == "NH 107"
+
+
+@pytest.mark.parametrize(
+    ("field", "wrong_value"),
+    [("origin", "LAX"), ("destination", "HND"), ("departure", "2026-09-18T01:20:00-07:00")],
+)
+def test_itinerary_route_and_date_must_match_confirmed_criteria(
+    criteria, tmp_path, field, wrong_value
+):
+    from flight_search_demo.ana import AnaFixtureBrowser, AnaSearchAdapter
+
+    html = (FIXTURES / "match.html").read_text()
+    replacements = {
+        "origin": ('"origin":"SFO"', f'"origin":"{wrong_value}"'),
+        "destination": ('"destination":"NRT"', f'"destination":"{wrong_value}"'),
+        "departure": (
+            '"departure":"2026-09-17T01:20:00-07:00"',
+            f'"departure":"{wrong_value}"',
+        ),
+    }
+    old, new = replacements[field]
+    fixture = tmp_path / "wrong-itinerary.html"
+    fixture.write_text(html.replace(old, new))
+
+    result = AnaSearchAdapter(browser=AnaFixtureBrowser(fixture)).execute(criteria, "route-date")
+    assert result["status"] == "VALIDATION_REJECTED"
 
 
 @pytest.mark.parametrize(
@@ -123,6 +150,21 @@ def test_search_policy_confines_domains_paths_actions_and_criteria(criteria):
         policy.validate_criteria(criteria.__class__(**{**criteria.__dict__, "trip_type": "round_trip"}))
 
 
+def test_search_policy_binds_actions_to_confirmed_values_and_one_submission(criteria):
+    from flight_search_demo.ana import AnaSearchPolicy, PolicyViolation
+
+    policy = AnaSearchPolicy()
+    policy.validate_criteria(criteria)
+    policy.validate_action({"action": "fill_search_field", "field": "origin", "value": "SFO"})
+    with pytest.raises(PolicyViolation, match="confirmed criteria"):
+        policy.validate_action(
+            {"action": "fill_search_field", "field": "departure_date", "value": "2026-09-18"}
+        )
+    policy.validate_action({"action": "submit_search"})
+    with pytest.raises(PolicyViolation, match="at most once"):
+        policy.validate_action({"action": "submit_search"})
+
+
 def _request_and_confirmation():
     request = {
         "request_id": "controlled-ana-7",
@@ -165,6 +207,88 @@ def test_default_live_driver_uses_an_ana_only_browser_endpoint_and_profile():
     assert driver.steel_base_url == "http://127.0.0.1:3001"
     assert driver.profile_path == DEFAULT_ANA_PROFILE
     assert "ana-browser-profile" in str(driver.profile_path)
+
+
+def test_persistent_browser_runs_bounded_agent_and_reserves_at_single_submit(criteria):
+    from types import SimpleNamespace
+    from flight_search_demo.ana import AnaSearchPolicy, OFFICIAL_ANA_SEARCH_ENTRY_URL
+    from flight_search_demo.ana_validation import PersistentAnaBrowser
+
+    class Node:
+        def __init__(self, **attributes):
+            self.attributes = attributes
+            self.tag_name = attributes.pop("tag_name", "input")
+
+        def get_all_children_text(self):
+            return self.attributes.get("text", "")
+
+    class Session:
+        async def get_element_by_index(self, index):
+            return {
+                1: Node(name="origin"),
+                2: Node(tag_name="button", id="award-search", text="Search"),
+            }[index]
+
+        async def get_current_page(self):
+            return SimpleNamespace(
+                evaluate=lambda script: _async_value(
+                    OFFICIAL_ANA_SEARCH_ENTRY_URL if "location.href" in script
+                    else '<main data-page-kind="no_availability">No seats</main>'
+                )
+            )
+
+    async def _async_value(value):
+        return value
+
+    reservations = []
+    captured = {}
+
+    class Agent:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        async def run(self, max_steps):
+            captured["max_steps"] = max_steps
+            callback = captured["register_new_step_callback"]
+            await callback(None, SimpleNamespace(action=[SimpleNamespace(model_dump=lambda **kwargs: {
+                "input": {"index": 1, "text": "SFO"}
+            })]), 1)
+            await callback(None, SimpleNamespace(action=[SimpleNamespace(model_dump=lambda **kwargs: {
+                "click": {"index": 2}
+            })]), 2)
+            return SimpleNamespace(
+                is_done=lambda: True, is_successful=lambda: True,
+                number_of_steps=lambda: 2, errors=lambda: [], urls=lambda: [OFFICIAL_ANA_SEARCH_ENTRY_URL],
+            )
+
+    browser = PersistentAnaBrowser(
+        cdp_url="ws://127.0.0.1/devtools/browser/test",
+        profile_path=Path("unused.json"), deadline_seconds=30,
+        reserve_submission=lambda: reservations.append("reserved") or True,
+    )
+    browser._loop = __import__("asyncio").new_event_loop()
+    browser._session = Session()
+    policy = AnaSearchPolicy()
+    policy.validate_criteria(criteria)
+    try:
+        with patch("flight_search_demo.ana_validation.Agent", Agent), patch(
+            "flight_search_demo.ana_validation.build_agent_llms", return_value=(object(), object())
+        ):
+            outcome = browser.browser_agent_search(
+                criteria, goal="confirmed criteria only", max_steps=8,
+                max_actions_per_step=2, max_failures=2,
+                allowed_domains=sorted(policy.allowed_domains),
+                authorize_action=policy.validate_action,
+            )
+    finally:
+        browser._loop.close()
+
+    assert outcome.status == "completed"
+    assert reservations == ["reserved"]
+    assert captured["max_steps"] == 8
+    assert captured["max_actions_per_step"] == 2
+    assert captured["max_failures"] == 2
+    assert "SFO" in captured["task"] and "NRT" in captured["task"]
 
 
 def test_controlled_validation_is_correlated_and_fail_closed(tmp_path):

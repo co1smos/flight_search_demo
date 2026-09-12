@@ -15,7 +15,7 @@ import threading
 import time
 from typing import Any, Protocol
 
-from browser_use import BrowserSession
+from browser_use import Agent, BrowserSession, Controller
 
 from .ana import (
     APPROVED_ANA_DOMAINS,
@@ -26,6 +26,7 @@ from .ana import (
 )
 from .aeroplan import PageSnapshot, UnsupportedDeterministicLayout
 from .app import build_request_hash, emit_event, load_json, normalize_request, validate_confirmation
+from .live_run import build_agent_llms
 from .spike import discover_debugger_cdp_url
 
 
@@ -141,16 +142,159 @@ class PersistentAnaBrowser:
         del criteria
         raise UnsupportedDeterministicLayout("ANA award flow requires bounded browser-agent interaction")
 
-    def browser_agent_search(self, criteria: Any, **kwargs: Any) -> AnaAgentOutcome:
-        del criteria, kwargs
-        # Live model execution is deliberately disabled until a policy-owned Gemini
-        # operation is configured for this persistent profile. Navigation above still
-        # permits deterministic classification of login, session, and traffic blocks.
-        return AnaAgentOutcome(
-            status="refused", page=None, steps=0, failures=0,
-            visited_urls=(), actions=(),
-            detail="ANA live browser agent is not configured; manual search is required",
+    @staticmethod
+    def _history_value(history: Any, name: str, default: Any) -> Any:
+        value = getattr(history, name, default)
+        return value() if callable(value) else value
+
+    async def _field_for_index(self, index: int) -> str:
+        if self._session is None:
+            raise RuntimeError("controlled ANA browser is not open")
+        node = await self._session.get_element_by_index(index)
+        if node is None:
+            raise ValueError("browser agent targeted an unavailable element")
+        attributes = getattr(node, "attributes", {})
+        if not isinstance(attributes, dict):
+            attributes = {}
+        descriptor = " ".join(
+            str(attributes.get(key, ""))
+            for key in ("name", "id", "aria-label", "placeholder", "data-testid")
+        ).lower()
+        aliases = {
+            "origin": ("origin", "departure airport", "from"),
+            "destination": ("destination", "arrival airport", "to"),
+            "departure_date": ("departure date", "depart-date", "departure_date", "outbound"),
+            "cabin": ("cabin", "class"),
+            "adults": ("adult",),
+            "trip_type": ("trip type", "trip-type", "journey type"),
+        }
+        matches = [field for field, markers in aliases.items() if any(marker in descriptor for marker in markers)]
+        if len(matches) != 1:
+            raise ValueError("browser agent targeted an unrecognized ANA search control")
+        return matches[0]
+
+    async def _is_submit_index(self, index: int) -> bool:
+        if self._session is None:
+            raise RuntimeError("controlled ANA browser is not open")
+        node = await self._session.get_element_by_index(index)
+        if node is None:
+            return False
+        attributes = getattr(node, "attributes", {})
+        if not isinstance(attributes, dict):
+            attributes = {}
+        text_getter = getattr(node, "get_all_children_text", None)
+        text = text_getter() if callable(text_getter) else ""
+        descriptor = " ".join(
+            [str(getattr(node, "tag_name", "")), str(text)]
+            + [str(attributes.get(key, "")) for key in ("id", "name", "aria-label", "type", "data-testid")]
+        ).lower()
+        return ("button" in descriptor or "submit" in descriptor) and "search" in descriptor
+
+    def browser_agent_search(
+        self, criteria: Any, *, goal: str, max_steps: int, max_actions_per_step: int,
+        max_failures: int, allowed_domains: Any, authorize_action: Any,
+    ) -> AnaAgentOutcome:
+        if self._session is None:
+            raise RuntimeError("controlled ANA browser is not open")
+        expected_domains = sorted(APPROVED_ANA_DOMAINS | REQUIRED_ANA_IDENTITY_DOMAINS)
+        if sorted(allowed_domains) != expected_domains:
+            raise ValueError("browser agent domain confinement differs from ANA policy")
+
+        trace: list[dict[str, Any]] = []
+        submitted = False
+
+        async def authorize_step(_state: Any, output: Any, _step: int) -> None:
+            nonlocal submitted
+            model_actions = getattr(output, "action", None)
+            if not isinstance(model_actions, list) or len(model_actions) > max_actions_per_step:
+                raise ValueError("browser agent emitted an invalid action batch")
+            decoded: list[tuple[str, dict[str, Any]]] = []
+            for model_action in model_actions:
+                payload = model_action.model_dump(exclude_none=True)
+                populated = [(name, params) for name, params in payload.items() if params]
+                if len(populated) != 1 or not isinstance(populated[0][1], dict):
+                    raise ValueError("browser agent emitted an ambiguous action")
+                decoded.append(populated[0])
+            if any(name == "click" for name, _ in decoded) and len(decoded) != 1:
+                raise ValueError("ANA search submission must be the only action in its step")
+            for name, params in decoded:
+                if name == "input":
+                    if params.get("clear", True) is not True:
+                        raise ValueError("ANA search fields must replace, not append to, values")
+                    field = await self._field_for_index(int(params["index"]))
+                    action = {"action": "fill_search_field", "field": field, "value": params["text"]}
+                elif name == "select_dropdown":
+                    field = await self._field_for_index(int(params["index"]))
+                    action = {"action": "select_search_option", "field": field, "value": params["text"]}
+                elif name == "navigate":
+                    if params.get("new_tab", False) is not False:
+                        raise ValueError("ANA search navigation may not open another tab")
+                    action = {"action": "navigate", "url": params["url"]}
+                elif name == "extract":
+                    if params.get("extract_links", False) is not False:
+                        raise ValueError("ANA result reading may not extract links")
+                    action = {"action": "read_results"}
+                elif name == "done":
+                    continue
+                elif name == "click" and await self._is_submit_index(int(params["index"])):
+                    if submitted:
+                        raise ValueError("ANA search may be submitted at most once")
+                    action = {"action": "submit_search"}
+                    authorize_action(action)
+                    if not self.reserve_submission():
+                        raise ValueError("ANA submitted-search allowance is exhausted")
+                    submitted = True
+                    trace.append(action)
+                    continue
+                else:
+                    raise ValueError("browser agent attempted an unsupported ANA interaction")
+                authorize_action(action)
+                trace.append(action)
+
+        tools = Controller()
+        permitted_tools = {"navigate", "input", "select_dropdown", "extract", "click", "done"}
+        for name in tuple(tools.registry.registry.actions):
+            if name not in permitted_tools:
+                tools.exclude_action(name)
+        primary, fallback = build_agent_llms(
+            primary_model=os.environ.get("ANA_GEMINI_MODEL", "gemini-2.5-flash"),
+            fallback_model=os.environ.get("ANA_FALLBACK_GEMINI_MODEL", "gemini-3.6-flash"),
+            api_key=os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY") or "",
         )
+        task = (
+            f"{goal} Exact immutable criteria: origin {criteria.origin}; destination "
+            f"{criteria.destination}; departure {criteria.departure_date}; cabin {criteria.cabin}; "
+            f"adults {criteria.adults}; trip type {criteria.trip_type}. Submit exactly once, then "
+            "stop after the official ANA availability page is visible. Do not log in, retry, "
+            "change dates, open alternate routes, or perform any booking action."
+        )
+        agent = Agent(
+            task=task, llm=primary, fallback_llm=fallback, browser_session=self._session,
+            tools=tools, use_vision=False, use_judge=False,
+            register_new_step_callback=authorize_step,
+            max_actions_per_step=max_actions_per_step, max_failures=max_failures,
+            llm_timeout=max(1, int(self.deadline_at - time.monotonic())),
+            step_timeout=max(1, int(self.deadline_at - time.monotonic())),
+        )
+        history = self._run(agent.run(max_steps=max_steps))
+        steps = int(self._history_value(history, "number_of_steps", 0))
+        errors = self._history_value(history, "errors", []) or []
+        failures = min(len([error for error in errors if error]), max_failures)
+        urls = tuple(str(url) for url in (self._history_value(history, "urls", []) or []))
+        done = bool(self._history_value(history, "is_done", False))
+        successful = bool(self._history_value(history, "is_successful", False))
+        if not done:
+            if failures >= max_failures:
+                return AnaAgentOutcome(
+                    "failure_exhausted", None, steps, failures, urls, tuple(trace)
+                )
+            return AnaAgentOutcome("step_exhausted", None, steps, failures, urls, tuple(trace))
+        if not successful:
+            return AnaAgentOutcome("failed", None, steps, failures, urls, tuple(trace))
+        page = self._snapshot()
+        if page.url not in urls:
+            urls += (page.url,)
+        return AnaAgentOutcome("completed", page, steps, failures, urls, tuple(trace))
 
 
 class PersistentAnaDriver:

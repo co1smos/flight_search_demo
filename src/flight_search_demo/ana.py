@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol, Sequence
@@ -95,6 +96,8 @@ class AnaSearchPolicy:
         if not configured or not configured <= approved:
             raise PolicyViolation("allowed domains must be approved ANA domains")
         self.allowed_domains = frozenset(configured)
+        self._confirmed_values: dict[str, str | int] | None = None
+        self._submission_seen = False
 
     def validate_url(self, url: str) -> None:
         if not isinstance(url, str):
@@ -122,6 +125,15 @@ class AnaSearchPolicy:
             raise PolicyViolation("navigation is not a required ANA authentication path")
 
     def validate_action(self, action: Mapping[str, Any]) -> None:
+        self._validate_action(action, record_submission=True)
+
+    def validate_recorded_action(self, action: Mapping[str, Any]) -> None:
+        """Revalidate an authorized trace without consuming submission state again."""
+        self._validate_action(action, record_submission=False)
+
+    def _validate_action(
+        self, action: Mapping[str, Any], *, record_submission: bool,
+    ) -> None:
         if not isinstance(action, Mapping):
             raise PolicyViolation("browser action must be structured data")
         if any(not isinstance(key, str) or key != key.strip().lower() for key in action):
@@ -141,6 +153,14 @@ class AnaSearchPolicy:
                 raise PolicyViolation("action does not target an approved ANA search field")
             if not isinstance(action["value"], (str, int)) or isinstance(action["value"], bool):
                 raise PolicyViolation("search field value must be scalar structured data")
+            if self._confirmed_values is None:
+                raise PolicyViolation("ANA search criteria must be confirmed before interaction")
+            if action["value"] != self._confirmed_values[field]:
+                raise PolicyViolation("search field value differs from confirmed criteria")
+        elif name == "submit_search" and record_submission:
+            if self._submission_seen:
+                raise PolicyViolation("ANA search may be submitted at most once")
+            self._submission_seen = True
 
     def validate_criteria(self, criteria: NormalizedCriteria) -> None:
         if criteria.program != "ana":
@@ -149,6 +169,15 @@ class AnaSearchPolicy:
             raise PolicyViolation("controlled ANA search supports one-way travel for one adult")
         if criteria.cabin not in {"Economy", "Premium Economy", "Business", "First"}:
             raise PolicyViolation("unsupported ANA cabin")
+        self._confirmed_values = {
+            "origin": criteria.origin,
+            "destination": criteria.destination,
+            "departure_date": criteria.departure_date,
+            "cabin": criteria.cabin,
+            "adults": criteria.adults,
+            "trip_type": criteria.trip_type,
+        }
+        self._submission_seen = False
 
 
 def classify_ana_page(page: PageSnapshot) -> AnaPageKind:
@@ -193,12 +222,25 @@ def _validated_ana_itinerary(
         return None, "UNVERIFIED_PRICE"
     cash = raw.get("cash")
     segments = raw.get("segments")
-    required = ("departure", "arrival", "flight_number", "marketing_carrier", "operating_carrier", "cabin")
+    required = (
+        "origin", "destination", "departure", "arrival", "flight_number",
+        "marketing_carrier", "operating_carrier", "cabin",
+    )
     if (
         not isinstance(cash, Mapping)
         or any(not isinstance(cash.get(field), str) or not cash.get(field) for field in ("displayed_total", "currency"))
         or not isinstance(segments, list) or not segments
         or any(not isinstance(segment, Mapping) or any(not isinstance(segment.get(field), str) or not segment.get(field) for field in required) for segment in segments)
+    ):
+        return None, "PARSER_FAILED"
+    try:
+        departure_date = datetime.fromisoformat(segments[0]["departure"]).date().isoformat()
+    except ValueError:
+        return None, "PARSER_FAILED"
+    if (
+        segments[0]["origin"].upper() != criteria.origin
+        or segments[-1]["destination"].upper() != criteria.destination
+        or departure_date != criteria.departure_date
     ):
         return None, "PARSER_FAILED"
     if not _is_exact_visible_price(
@@ -356,7 +398,7 @@ class AnaSearchAdapter:
         if len(outcome.actions) > outcome.steps * self.max_actions_per_step:
             raise PolicyViolation("ANA browser agent exceeded its action bound")
         for action in outcome.actions:
-            self.policy.validate_action(action)
+            self.policy.validate_recorded_action(action)
         for url in outcome.visited_urls:
             self.policy.validate_url(url)
         if outcome.page is not None:
