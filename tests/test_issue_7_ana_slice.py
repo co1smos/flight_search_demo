@@ -1,4 +1,5 @@
 import json
+import os
 from datetime import date
 from pathlib import Path
 
@@ -293,6 +294,121 @@ def test_default_live_driver_uses_an_ana_only_browser_endpoint_and_profile():
     assert driver.steel_base_url == "http://127.0.0.1:3001"
     assert driver.profile_path == DEFAULT_ANA_PROFILE
     assert "ana-browser-profile" in str(driver.profile_path)
+
+
+def test_live_cli_fails_closed_in_ci_before_constructing_driver(tmp_path, monkeypatch):
+    from flight_search_demo import ana_validation
+
+    monkeypatch.setenv("CI", "true")
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "ana-validation",
+            "--request", "request.json",
+            "--confirmation", "confirmation.json",
+            "--event-log", str(tmp_path / "events.jsonl"),
+            "--acknowledge-account-and-terms-risk",
+        ],
+    )
+
+    with patch.object(ana_validation, "PersistentAnaDriver") as driver:
+        with pytest.raises(SystemExit):
+            ana_validation.main()
+
+    driver.assert_not_called()
+
+
+def test_persistent_ana_profile_rejects_non_ana_state_before_browser_start(tmp_path):
+    from flight_search_demo.ana_validation import PersistentAnaBrowser
+
+    profile = tmp_path / "ana-profile" / "storage-state.json"
+    profile.parent.mkdir()
+    profile.write_text(json.dumps({
+        "cookies": [
+            {"name": "ana", "value": "ok", "domain": ".ana.co.jp", "path": "/"},
+            {"name": "air-canada", "value": "mixed", "domain": ".aircanada.com", "path": "/"},
+        ],
+        "origins": [],
+    }))
+    browser = PersistentAnaBrowser(
+        cdp_url="ws://127.0.0.1/devtools/browser/test",
+        profile_path=profile,
+        deadline_seconds=30,
+        reserve_submission=lambda: True,
+    )
+
+    with patch("flight_search_demo.ana_validation.BrowserSession") as session:
+        with pytest.raises(ValueError, match="non-ANA"):
+            browser.__enter__()
+
+    session.assert_not_called()
+
+
+def test_persistent_ana_profile_artifacts_are_owner_only(tmp_path):
+    from flight_search_demo.ana_validation import PersistentAnaBrowser
+
+    profile = tmp_path / "ana-profile" / "storage-state.json"
+    profile.parent.mkdir(mode=0o775)
+    profile.write_text('{"cookies": [], "origins": []}')
+    profile.chmod(0o664)
+    backup = profile.with_suffix(profile.suffix + ".bak")
+    backup.write_text('{"cookies": [], "origins": []}')
+    backup.chmod(0o664)
+    browser = PersistentAnaBrowser(
+        cdp_url="ws://127.0.0.1/devtools/browser/test",
+        profile_path=profile,
+        deadline_seconds=30,
+        reserve_submission=lambda: True,
+    )
+
+    class Session:
+        async def start(self):
+            return None
+
+        async def stop(self):
+            profile.chmod(0o664)
+
+    with patch("flight_search_demo.ana_validation.BrowserSession", return_value=Session()):
+        with browser:
+            assert os.stat(profile.parent).st_mode & 0o777 == 0o700
+            assert os.stat(profile).st_mode & 0o777 == 0o600
+            assert os.stat(backup).st_mode & 0o777 == 0o600
+
+    assert os.stat(profile.parent).st_mode & 0o777 == 0o700
+    assert os.stat(profile).st_mode & 0o777 == 0o600
+    assert os.stat(backup).st_mode & 0o777 == 0o600
+
+
+def test_persistent_ana_profile_rejects_non_ana_state_written_on_stop(tmp_path):
+    from flight_search_demo.ana_validation import PersistentAnaBrowser
+
+    profile = tmp_path / "ana-profile" / "storage-state.json"
+    browser = PersistentAnaBrowser(
+        cdp_url="ws://127.0.0.1/devtools/browser/test",
+        profile_path=profile,
+        deadline_seconds=30,
+        reserve_submission=lambda: True,
+    )
+
+    class Session:
+        async def start(self):
+            return None
+
+        async def stop(self):
+            profile.write_text(json.dumps({
+                "cookies": [{
+                    "name": "mixed", "value": "state",
+                    "domain": ".aircanada.com", "path": "/",
+                }],
+                "origins": [],
+            }))
+
+    with patch("flight_search_demo.ana_validation.BrowserSession", return_value=Session()):
+        with pytest.raises(ValueError, match="non-ANA"):
+            with browser:
+                pass
+
+    assert os.stat(profile).st_mode & 0o777 == 0o600
 
 
 def test_persistent_browser_runs_bounded_agent_and_reserves_at_single_submit(criteria):

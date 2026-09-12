@@ -14,6 +14,7 @@ import sqlite3
 import threading
 import time
 from typing import Any, Protocol
+from urllib.parse import urlparse
 
 from browser_use import Agent, BrowserSession, Controller
 
@@ -28,12 +29,53 @@ from .ana import (
 from .aeroplan import PageSnapshot, UnsupportedDeterministicLayout
 from .app import build_request_hash, emit_event, load_json, normalize_request, validate_confirmation
 from .live_run import build_agent_llms
-from .spike import discover_debugger_cdp_url
+from .spike import discover_debugger_cdp_url, ensure_storage_state_parent, secure_artifact_file
 
 
 OPERATION_DEADLINE_SECONDS = 90.0
 MAX_REPORTING_RESERVE_SECONDS = 1.0
 DEFAULT_ANA_PROFILE = Path(".artifacts/ana-browser-profile/storage-state.json")
+CI_ENVIRONMENT_VARIABLES = (
+    "CI", "GITHUB_ACTIONS", "GITLAB_CI", "BUILDKITE", "TF_BUILD",
+)
+
+
+def _running_in_ci() -> bool:
+    false_values = {"", "0", "false", "no", "off"}
+    return any(
+        os.environ.get(name, "").strip().casefold() not in false_values
+        for name in CI_ENVIRONMENT_VARIABLES
+    )
+
+
+def _is_ana_host(host: str) -> bool:
+    normalized = host.strip().lstrip(".").casefold()
+    approved = APPROVED_ANA_DOMAINS | REQUIRED_ANA_IDENTITY_DOMAINS
+    return any(normalized == domain or normalized.endswith(f".{domain}") for domain in approved)
+
+
+def _validate_ana_storage_state(path: Path) -> None:
+    if not path.exists():
+        return
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("persistent ANA profile is not valid storage-state JSON") from exc
+    if not isinstance(state, dict):
+        raise ValueError("persistent ANA profile must contain a storage-state object")
+    cookies = state.get("cookies", [])
+    origins = state.get("origins", [])
+    if not isinstance(cookies, list) or not isinstance(origins, list):
+        raise ValueError("persistent ANA profile has malformed cookies or origins")
+    for cookie in cookies:
+        domain = cookie.get("domain") if isinstance(cookie, dict) else None
+        if not isinstance(domain, str) or not _is_ana_host(domain):
+            raise ValueError("persistent ANA profile contains non-ANA cookie state")
+    for origin in origins:
+        value = origin.get("origin") if isinstance(origin, dict) else None
+        host = urlparse(value).hostname if isinstance(value, str) else None
+        if not host or not _is_ana_host(host):
+            raise ValueError("persistent ANA profile contains non-ANA origin state")
 
 
 @contextmanager
@@ -78,6 +120,18 @@ class PersistentAnaBrowser:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._session: BrowserSession | None = None
 
+    def _profile_artifacts(self) -> tuple[Path, Path]:
+        return (
+            self.profile_path,
+            self.profile_path.with_suffix(self.profile_path.suffix + ".bak"),
+        )
+
+    def _secure_and_validate_profile(self) -> None:
+        ensure_storage_state_parent(self.profile_path)
+        for artifact in self._profile_artifacts():
+            secure_artifact_file(artifact)
+            _validate_ana_storage_state(artifact)
+
     def _run(self, awaitable):
         if self._loop is None:
             raise RuntimeError("controlled ANA browser is not open")
@@ -86,7 +140,7 @@ class PersistentAnaBrowser:
         ))
 
     def __enter__(self):
-        self.profile_path.parent.mkdir(parents=True, exist_ok=True)
+        self._secure_and_validate_profile()
         self._loop = asyncio.new_event_loop()
         self._session = BrowserSession(
             cdp_url=self.cdp_url,
@@ -102,7 +156,11 @@ class PersistentAnaBrowser:
         try:
             if self._session is not None:
                 self._run(self._session.stop())
+            self._secure_and_validate_profile()
         finally:
+            ensure_storage_state_parent(self.profile_path)
+            for artifact in self._profile_artifacts():
+                secure_artifact_file(artifact)
             if self._loop is not None:
                 self._loop.close()
             self._loop = None
@@ -553,6 +611,8 @@ def main() -> int:
     )
     parser.add_argument("--acknowledge-account-and-terms-risk", action="store_true")
     args = parser.parse_args()
+    if _running_in_ci():
+        parser.error("controlled live ANA searches are disabled in CI")
     event = validate_controlled_ana_search(
         request=load_json(args.request), confirmation=load_json(args.confirmation),
         risk_acknowledged=args.acknowledge_account_and_terms_risk,
