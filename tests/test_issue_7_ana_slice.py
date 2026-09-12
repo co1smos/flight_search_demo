@@ -1084,6 +1084,35 @@ def test_controlled_validation_is_correlated_and_fail_closed(tmp_path):
     assert json.loads((tmp_path / "events.jsonl").read_text()) == event
 
 
+def test_controlled_validation_reports_unexpected_live_driver_failure(tmp_path):
+    from flight_search_demo.ana_validation import validate_controlled_ana_search
+
+    request, confirmation = _request_and_confirmation()
+
+    class Driver:
+        def execute(self, criteria, *, deadline_seconds, reserve_submission):
+            del criteria, deadline_seconds, reserve_submission
+            raise RuntimeError("browser process exited")
+
+    event = validate_controlled_ana_search(
+        request=request,
+        confirmation=confirmation,
+        risk_acknowledged=True,
+        event_log_path=tmp_path / "events.jsonl",
+        allowance_db_path=tmp_path / "usage.sqlite3",
+        current_date=date(2026, 9, 12),
+        live_driver=Driver(),
+    )
+
+    assert event["status"] == "MANUAL_SEARCH_ONLY"
+    assert event["blocking_reason"] == "LIVE_DRIVER_FAILED"
+    assert event["adapter_status"] == "UNVERIFIED"
+    assert event["continuous_live_execution_enabled"] is False
+    assert "RuntimeError" in event["detail"]
+    assert "browser process exited" not in event["detail"]
+    assert json.loads((tmp_path / "events.jsonl").read_text()) == event
+
+
 def test_live_availability_requires_submission_visible_validation_and_reusable_profile(tmp_path):
     from flight_search_demo.ana_validation import validate_controlled_ana_search
 

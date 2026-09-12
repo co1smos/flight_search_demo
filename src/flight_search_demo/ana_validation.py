@@ -657,6 +657,13 @@ def validate_controlled_ana_search(
             status = "SEARCH_TIMEOUT" if isinstance(exc, TimeoutError) else "VALIDATION_REJECTED"
             detail = str(exc)
             blocking_reason = status
+        except Exception as exc:
+            status = "MANUAL_SEARCH_ONLY"
+            detail = (
+                "Controlled ANA live driver failed safely: "
+                f"{type(exc).__name__}."
+            )
+            blocking_reason = "LIVE_DRIVER_FAILED"
 
     with _controller_deadline(deadline_at - time.monotonic()):
         return emit_event(
