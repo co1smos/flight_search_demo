@@ -7,7 +7,7 @@ from enum import Enum
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol, Sequence
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qsl, unquote, urlparse
 
 from .aeroplan import (
     PageSnapshot,
@@ -93,7 +93,11 @@ class AnaSearchPolicy:
         "/en/us/amc/international-flight-awards",
         "/en/us/amc/international-flight-awards/",
     })
-    _IDENTITY_PATH_PREFIXES = ("/international_asw/",)
+    _AWARD_FLOW_PATHS = frozenset({
+        "/international_asw/pages/award/search/roundtrip/"
+        "award_search_roundtrip_input.xhtml",
+    })
+    _AWARD_FLOW_QUERY = {"CONNECTION_KIND": "LAX", "LANG": "en"}
     _ACTIONS = frozenset({
         "navigate", "fill_search_field", "select_search_option", "submit_search",
         "read_results",
@@ -156,8 +160,24 @@ class AnaSearchPolicy:
         if parsed.hostname in APPROVED_ANA_DOMAINS:
             if decoded not in self._SEARCH_PATHS or parsed.query:
                 raise PolicyViolation("navigation is not an approved search-only ANA path")
-        elif not any(decoded.startswith(prefix) for prefix in self._IDENTITY_PATH_PREFIXES):
-            raise PolicyViolation("navigation is not a required ANA authentication path")
+        else:
+            normalized_path = decoded.rstrip("/") or "/"
+            if normalized_path not in self._AWARD_FLOW_PATHS:
+                raise PolicyViolation("navigation is not a required ANA award-flow path")
+            try:
+                parameters = parse_qsl(
+                    parsed.query,
+                    keep_blank_values=True,
+                    strict_parsing=True,
+                    max_num_fields=len(self._AWARD_FLOW_QUERY),
+                )
+            except ValueError as exc:
+                raise PolicyViolation("ANA award-flow query is malformed") from exc
+            if (
+                len(parameters) != len(self._AWARD_FLOW_QUERY)
+                or dict(parameters) != self._AWARD_FLOW_QUERY
+            ):
+                raise PolicyViolation("ANA award-flow query parameters are not permitted")
 
     def validate_action(self, action: Mapping[str, Any]) -> None:
         self._validate_action(action, record_submission=True)

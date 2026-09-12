@@ -165,6 +165,28 @@ def test_search_policy_confines_domains_paths_actions_and_criteria(criteria):
         policy.validate_criteria(criteria.__class__(**{**criteria.__dict__, "trip_type": "round_trip"}))
 
 
+def test_search_policy_confines_ana_award_flow_paths_and_query_parameters():
+    from flight_search_demo.ana import AnaSearchPolicy, PolicyViolation
+
+    policy = AnaSearchPolicy()
+    policy.validate_url(
+        "https://aswbe-i.ana.co.jp/international_asw/pages/award/search/roundtrip/"
+        "award_search_roundtrip_input.xhtml?CONNECTION_KIND=LAX&LANG=en"
+    )
+
+    for url in (
+        "https://aswbe-i.ana.co.jp/international_asw/account/delete?confirm=yes",
+        "https://aswbe-i.ana.co.jp/international_asw/pages/award/search/roundtrip/"
+        "award_search_roundtrip_input.xhtml?CONNECTION_KIND=LAX&LANG=en&confirm=yes",
+        "https://aswbe-i.ana.co.jp/international_asw/pages/award/search/roundtrip/"
+        "award_search_roundtrip_input.xhtml?CONNECTION_KIND=JPN&LANG=en",
+        "https://aswbe-i.ana.co.jp/international_asw/pages/award/search/roundtrip/"
+        "award_search_roundtrip_input.xhtml?CONNECTION_KIND=LAX&LANG=ja",
+    ):
+        with pytest.raises(PolicyViolation):
+            policy.validate_url(url)
+
+
 def test_search_policy_binds_actions_to_confirmed_values_and_one_submission(criteria):
     from flight_search_demo.ana import AnaSearchPolicy, PolicyViolation
 
