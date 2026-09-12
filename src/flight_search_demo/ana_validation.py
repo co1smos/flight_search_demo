@@ -22,6 +22,7 @@ from .ana import (
     REQUIRED_ANA_IDENTITY_DOMAINS,
     AnaAgentOutcome,
     AnaSearchAdapter,
+    OFFICIAL_ANA_AWARD_FLOW_TRANSITION_URL,
     OFFICIAL_ANA_SEARCH_ENTRY_URL,
 )
 from .aeroplan import PageSnapshot, UnsupportedDeterministicLayout
@@ -190,6 +191,27 @@ class PersistentAnaBrowser:
         ).lower()
         return ("button" in descriptor or "submit" in descriptor) and "search" in descriptor
 
+    async def _is_award_flow_transition_index(self, index: int) -> bool:
+        if self._session is None:
+            raise RuntimeError("controlled ANA browser is not open")
+        node = await self._session.get_element_by_index(index)
+        if node is None:
+            return False
+        attributes = getattr(node, "attributes", {})
+        if not isinstance(attributes, dict):
+            attributes = {}
+        text_getter = getattr(node, "get_all_children_text", None)
+        text = text_getter() if callable(text_getter) else ""
+        href = str(attributes.get("href", "")).strip()
+        return (
+            str(getattr(node, "tag_name", "")).casefold() == "a"
+            and "reserve/(purchase) apply" in str(text).casefold()
+            and href in {
+                "/other/int/meta/0771.html?CONNECTION_KIND=us&LANG=e",
+                OFFICIAL_ANA_AWARD_FLOW_TRANSITION_URL,
+            }
+        )
+
     def browser_agent_search(
         self, criteria: Any, *, goal: str, max_steps: int, max_actions_per_step: int,
         max_failures: int, allowed_domains: Any, authorize_action: Any,
@@ -236,6 +258,13 @@ class PersistentAnaBrowser:
                     action = {"action": "read_results"}
                 elif name == "done":
                     continue
+                elif name == "click" and await self._is_award_flow_transition_index(
+                    int(params["index"])
+                ):
+                    action = {
+                        "action": "enter_award_flow",
+                        "url": OFFICIAL_ANA_AWARD_FLOW_TRANSITION_URL,
+                    }
                 elif name == "click" and await self._is_submit_index(int(params["index"])):
                     if submitted:
                         raise ValueError("ANA search may be submitted at most once")
@@ -264,7 +293,9 @@ class PersistentAnaBrowser:
         task = (
             f"{goal} Exact immutable criteria: origin {criteria.origin}; destination "
             f"{criteria.destination}; departure {criteria.departure_date}; cabin {criteria.cabin}; "
-            f"adults {criteria.adults}; trip type {criteria.trip_type}. Submit exactly once, then "
+            f"adults {criteria.adults}; trip type {criteria.trip_type}. "
+            "On the public entry page, use only the Reserve/(Purchase) Apply CTA to enter the "
+            "official award flow before interacting with search fields. Submit exactly once, then "
             "stop after the official ANA availability page is visible. Do not log in, retry, "
             "change dates, open alternate routes, or perform any booking action. Use extract on "
             "the final page and return only JSON with page_kind and visible_text; for results also "

@@ -166,9 +166,12 @@ def test_search_policy_confines_domains_paths_actions_and_criteria(criteria):
 
 
 def test_search_policy_confines_ana_award_flow_paths_and_query_parameters():
-    from flight_search_demo.ana import AnaSearchPolicy, PolicyViolation
+    from flight_search_demo.ana import (
+        AnaSearchPolicy, OFFICIAL_ANA_AWARD_FLOW_TRANSITION_URL, PolicyViolation,
+    )
 
     policy = AnaSearchPolicy()
+    policy.validate_url(OFFICIAL_ANA_AWARD_FLOW_TRANSITION_URL)
     policy.validate_url(
         "https://aswbe-i.ana.co.jp/international_asw/pages/award/search/roundtrip/"
         "award_search_roundtrip_input.xhtml?CONNECTION_KIND=LAX&LANG=en"
@@ -182,9 +185,36 @@ def test_search_policy_confines_ana_award_flow_paths_and_query_parameters():
         "award_search_roundtrip_input.xhtml?CONNECTION_KIND=JPN&LANG=en",
         "https://aswbe-i.ana.co.jp/international_asw/pages/award/search/roundtrip/"
         "award_search_roundtrip_input.xhtml?CONNECTION_KIND=LAX&LANG=ja",
+        "https://www.ana.co.jp/other/int/meta/0771.html?CONNECTION_KIND=us&LANG=en",
+        "https://www.ana.co.jp/other/int/meta/0771.html?CONNECTION_KIND=us&LANG=e&retry=1",
     ):
         with pytest.raises(PolicyViolation):
             policy.validate_url(url)
+
+
+def test_search_policy_allows_only_one_cta_transition_before_search_interaction(criteria):
+    from flight_search_demo.ana import (
+        AnaSearchPolicy, OFFICIAL_ANA_AWARD_FLOW_TRANSITION_URL, PolicyViolation,
+    )
+
+    policy = AnaSearchPolicy()
+    policy.validate_criteria(criteria)
+    transition = {
+        "action": "enter_award_flow",
+        "url": OFFICIAL_ANA_AWARD_FLOW_TRANSITION_URL,
+    }
+    policy.validate_action(transition)
+    with pytest.raises(PolicyViolation, match="at most once"):
+        policy.validate_action(transition)
+
+    policy.validate_criteria(criteria)
+    with pytest.raises(PolicyViolation, match="approved CTA"):
+        policy.validate_action({
+            "action": "navigate", "url": OFFICIAL_ANA_AWARD_FLOW_TRANSITION_URL,
+        })
+    policy.validate_action({"action": "fill_search_field", "field": "origin", "value": "SFO"})
+    with pytest.raises(PolicyViolation, match="must precede"):
+        policy.validate_action(transition)
 
 
 def test_search_policy_binds_actions_to_confirmed_values_and_one_submission(criteria):
@@ -361,6 +391,101 @@ def test_persistent_browser_runs_bounded_agent_and_reserves_at_single_submit(cri
     assert captured["max_actions_per_step"] == 2
     assert captured["max_failures"] == 2
     assert "SFO" in captured["task"] and "NRT" in captured["task"]
+
+
+def test_persistent_browser_authorizes_real_entry_page_award_flow_transition_before_form_input(
+    criteria,
+):
+    from types import SimpleNamespace
+    from flight_search_demo.ana import AnaSearchPolicy
+    from flight_search_demo.ana_validation import PersistentAnaBrowser
+
+    entry_html = (FIXTURES / "official_entry.html").read_text()
+    assert "/other/int/meta/0771.html?CONNECTION_KIND=us&amp;LANG=e" in entry_html
+
+    class Node:
+        def __init__(self, *, tag_name="input", text="", **attributes):
+            self.attributes = attributes
+            self.tag_name = tag_name
+            self._text = text
+
+        def get_all_children_text(self):
+            return self._text
+
+    class Session:
+        async def get_element_by_index(self, index):
+            return {
+                1: Node(
+                    tag_name="a",
+                    text="Reserve/(Purchase) Apply",
+                    href="/other/int/meta/0771.html?CONNECTION_KIND=us&LANG=e",
+                ),
+                2: Node(name="origin"),
+            }[index]
+
+        async def get_current_page(self):
+            return SimpleNamespace(evaluate=lambda script: _async_value(
+                "https://www.ana.co.jp/other/int/meta/0771.html?CONNECTION_KIND=us&LANG=e"
+                if "location.href" in script else entry_html
+            ))
+
+    async def _async_value(value):
+        return value
+
+    class Agent:
+        def __init__(self, **kwargs):
+            self.multi_act = self._multi_act
+
+        async def _multi_act(self, actions):
+            return []
+
+        async def run(self, max_steps):
+            del max_steps
+            await self.multi_act([SimpleNamespace(model_dump=lambda **kwargs: {
+                "click": {"index": 1}
+            })])
+            await self.multi_act([SimpleNamespace(model_dump=lambda **kwargs: {
+                "input": {"index": 2, "text": "SFO"}
+            })])
+            return SimpleNamespace(
+                is_done=lambda: True, is_successful=lambda: True,
+                number_of_steps=lambda: 2, errors=lambda: [],
+                urls=lambda: [
+                    "https://www.ana.co.jp/en/us/amc/international-flight-awards/",
+                    "https://www.ana.co.jp/other/int/meta/0771.html?CONNECTION_KIND=us&LANG=e",
+                ],
+            )
+
+    browser = PersistentAnaBrowser(
+        cdp_url="ws://127.0.0.1/devtools/browser/test",
+        profile_path=Path("unused.json"), deadline_seconds=30,
+        reserve_submission=lambda: True,
+    )
+    browser._loop = __import__("asyncio").new_event_loop()
+    browser._session = Session()
+    policy = AnaSearchPolicy()
+    policy.validate_criteria(criteria)
+    try:
+        with patch("flight_search_demo.ana_validation.Agent", Agent), patch(
+            "flight_search_demo.ana_validation.build_agent_llms", return_value=(object(), object())
+        ):
+            outcome = browser.browser_agent_search(
+                criteria, goal="enter official award flow", max_steps=4,
+                max_actions_per_step=1, max_failures=1,
+                allowed_domains=sorted(policy.allowed_domains),
+                authorize_action=policy.validate_action,
+            )
+    finally:
+        browser._loop.close()
+
+    assert outcome.status == "completed"
+    assert outcome.actions == (
+        {
+            "action": "enter_award_flow",
+            "url": "https://www.ana.co.jp/other/int/meta/0771.html?CONNECTION_KIND=us&LANG=e",
+        },
+        {"action": "fill_search_field", "field": "origin", "value": "SFO"},
+    )
 
 
 def test_production_agent_extraction_validates_results_without_fixture_markers(criteria):

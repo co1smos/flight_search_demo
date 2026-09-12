@@ -24,6 +24,9 @@ from .app import NormalizedCriteria
 OFFICIAL_ANA_SEARCH_ENTRY_URL = (
     "https://www.ana.co.jp/en/us/amc/international-flight-awards/"
 )
+OFFICIAL_ANA_AWARD_FLOW_TRANSITION_URL = (
+    "https://www.ana.co.jp/other/int/meta/0771.html?CONNECTION_KIND=us&LANG=e"
+)
 APPROVED_ANA_DOMAINS = frozenset({"ana.co.jp", "www.ana.co.jp"})
 REQUIRED_ANA_IDENTITY_DOMAINS = frozenset({"aswbe-i.ana.co.jp"})
 
@@ -93,20 +96,23 @@ class AnaSearchPolicy:
         "/en/us/amc/international-flight-awards",
         "/en/us/amc/international-flight-awards/",
     })
+    _AWARD_FLOW_TRANSITION_PATH = "/other/int/meta/0771.html"
+    _AWARD_FLOW_TRANSITION_QUERY = {"CONNECTION_KIND": "us", "LANG": "e"}
     _AWARD_FLOW_PATHS = frozenset({
         "/international_asw/pages/award/search/roundtrip/"
         "award_search_roundtrip_input.xhtml",
     })
     _AWARD_FLOW_QUERY = {"CONNECTION_KIND": "LAX", "LANG": "en"}
     _ACTIONS = frozenset({
-        "navigate", "fill_search_field", "select_search_option", "submit_search",
-        "read_results",
+        "navigate", "enter_award_flow", "fill_search_field", "select_search_option",
+        "submit_search", "read_results",
     })
     _FIELDS = frozenset({
         "origin", "destination", "departure_date", "cabin", "adults", "trip_type",
     })
     _ACTION_KEYS = {
         "navigate": frozenset({"action", "url"}),
+        "enter_award_flow": frozenset({"action", "url"}),
         "fill_search_field": frozenset({"action", "field", "value"}),
         "select_search_option": frozenset({"action", "field", "value"}),
         "submit_search": frozenset({"action"}),
@@ -124,6 +130,7 @@ class AnaSearchPolicy:
         self._confirmed_values: dict[str, str | int] | None = None
         self._entered_fields: set[str] = set()
         self._submission_seen = False
+        self._award_transition_seen = False
 
     @staticmethod
     def _normalized_field_value(field: str, value: str | int) -> str:
@@ -158,8 +165,24 @@ class AnaSearchPolicy:
         if "\\" in decoded or any(part in {".", ".."} for part in decoded.split("/")):
             raise PolicyViolation("navigation path is malformed")
         if parsed.hostname in APPROVED_ANA_DOMAINS:
-            if decoded not in self._SEARCH_PATHS or parsed.query:
+            if decoded in self._SEARCH_PATHS and not parsed.query:
+                return
+            if decoded != self._AWARD_FLOW_TRANSITION_PATH:
                 raise PolicyViolation("navigation is not an approved search-only ANA path")
+            try:
+                parameters = parse_qsl(
+                    parsed.query,
+                    keep_blank_values=True,
+                    strict_parsing=True,
+                    max_num_fields=len(self._AWARD_FLOW_TRANSITION_QUERY),
+                )
+            except ValueError as exc:
+                raise PolicyViolation("ANA award-flow transition query is malformed") from exc
+            if (
+                len(parameters) != len(self._AWARD_FLOW_TRANSITION_QUERY)
+                or dict(parameters) != self._AWARD_FLOW_TRANSITION_QUERY
+            ):
+                raise PolicyViolation("ANA award-flow transition query parameters are not permitted")
         else:
             normalized_path = decoded.rstrip("/") or "/"
             if normalized_path not in self._AWARD_FLOW_PATHS:
@@ -199,9 +222,23 @@ class AnaSearchPolicy:
         if set(action) - self._ACTION_KEYS[name]:
             raise PolicyViolation("action contains unsupported automation fields")
         if name == "navigate":
-            self.validate_url(action.get("url", ""))
-            if urlparse(str(action.get("url", ""))).hostname in REQUIRED_ANA_IDENTITY_DOMAINS:
+            url = action.get("url", "")
+            self.validate_url(url)
+            if url == OFFICIAL_ANA_AWARD_FLOW_TRANSITION_URL:
+                raise PolicyViolation("ANA award-flow transition requires the approved CTA action")
+            if urlparse(str(url)).hostname in REQUIRED_ANA_IDENTITY_DOMAINS:
                 raise PolicyViolation("agent navigation to identity domains is not permitted")
+        elif name == "enter_award_flow":
+            url = action.get("url", "")
+            self.validate_url(url)
+            if url != OFFICIAL_ANA_AWARD_FLOW_TRANSITION_URL:
+                raise PolicyViolation("action does not target the approved ANA award-flow transition")
+            if record_submission:
+                if self._entered_fields or self._submission_seen:
+                    raise PolicyViolation("ANA award-flow transition must precede search interaction")
+                if self._award_transition_seen:
+                    raise PolicyViolation("ANA award-flow transition may be used at most once")
+                self._award_transition_seen = True
         elif name in {"fill_search_field", "select_search_option"}:
             field = str(action.get("field", "")).strip().lower().replace("-", "_")
             if field not in self._FIELDS or "value" not in action:
@@ -239,6 +276,7 @@ class AnaSearchPolicy:
         }
         self._entered_fields = set()
         self._submission_seen = False
+        self._award_transition_seen = False
 
 
 def classify_ana_page(page: PageSnapshot) -> AnaPageKind:
