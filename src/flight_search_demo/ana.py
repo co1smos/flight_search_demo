@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol, Sequence
 from urllib.parse import unquote, urlparse
@@ -36,6 +37,25 @@ class AnaPageKind(str, Enum):
     HEAVY_TRAFFIC = "heavy_traffic"
     VALIDATION_REJECTION = "validation_rejection"
     UNKNOWN = "unknown"
+
+
+class _AuthenticationFormParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self._form_depth = 0
+        self.has_password_form = False
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag == "form":
+            self._form_depth += 1
+        elif tag == "input" and self._form_depth:
+            attributes = dict(attrs)
+            if (attributes.get("type") or "").casefold() == "password":
+                self.has_password_form = True
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "form" and self._form_depth:
+            self._form_depth -= 1
 
 
 @dataclass(frozen=True)
@@ -216,7 +236,12 @@ def classify_ana_page(page: PageSnapshot) -> AnaPageKind:
     if parser.page_kind in explicit:
         return explicit[parser.page_kind]
     text = " ".join(parser.visible_text).lower()
-    if "log in" in text or "login required" in text:
+    authentication = _AuthenticationFormParser()
+    authentication.feed(page.html)
+    if (
+        urlparse(page.url).hostname in REQUIRED_ANA_IDENTITY_DOMAINS
+        or authentication.has_password_form
+    ):
         return AnaPageKind.AUTHENTICATION
     if "session has expired" in text or "session error" in text:
         return AnaPageKind.SESSION_ERROR

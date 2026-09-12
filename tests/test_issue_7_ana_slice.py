@@ -44,6 +44,21 @@ def test_browser_agent_completion_is_schema_validated(criteria):
     assert result["itineraries"][0]["segments"][0]["flight_number"] == "NH 107"
 
 
+def test_award_page_header_login_link_does_not_require_authentication(criteria):
+    from flight_search_demo.ana import AnaFixtureBrowser, AnaSearchAdapter
+
+    browser = AnaFixtureBrowser(
+        FIXTURES / "match.html",
+        initial_fixture=FIXTURES / "award_page_with_header_login.html",
+        deterministic_supported=False,
+    )
+
+    result = AnaSearchAdapter(browser=browser).execute(criteria, "ana-header-login")
+
+    assert result["status"] == "MATCH_FOUND"
+    assert result["browser_agent_used"] is True
+
+
 @pytest.mark.parametrize(
     ("field", "wrong_value"),
     [("origin", "LAX"), ("destination", "HND"), ("departure", "2026-09-18T01:20:00-07:00")],
