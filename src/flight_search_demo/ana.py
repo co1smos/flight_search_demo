@@ -47,6 +47,7 @@ class AnaAgentOutcome:
     visited_urls: tuple[str, ...]
     actions: tuple[Mapping[str, Any], ...]
     detail: str = ""
+    extraction: Mapping[str, Any] | None = None
 
 
 class AnaBrowser(Protocol):
@@ -284,6 +285,38 @@ def _validated_ana_itinerary(
     }, None
 
 
+def _parse_agent_extraction(
+    extraction: Mapping[str, Any],
+) -> tuple[AnaPageKind, list[Mapping[str, Any]], list[tuple[str, str]]]:
+    if not isinstance(extraction, Mapping):
+        raise ValueError("ANA browser-agent extraction is not structured data")
+    try:
+        kind = AnaPageKind(extraction.get("page_kind", ""))
+    except ValueError as exc:
+        raise ValueError("ANA browser-agent extraction has an invalid page kind") from exc
+    if kind != AnaPageKind.RESULTS:
+        return kind, [], []
+    itineraries = extraction.get("itineraries")
+    visible_items = extraction.get("visible_text")
+    if not isinstance(itineraries, list):
+        raise ValueError("ANA browser-agent extraction has no itinerary list")
+    if not isinstance(visible_items, list) or not visible_items:
+        raise ValueError("ANA browser-agent extraction has no visible result evidence")
+    visible_text: list[tuple[str, str]] = []
+    for item in visible_items:
+        if isinstance(item, str) and item.strip():
+            visible_text.append((item, item))
+        elif (
+            isinstance(item, Mapping)
+            and isinstance(item.get("text"), str) and item["text"].strip()
+            and isinstance(item.get("context"), str) and item["context"].strip()
+        ):
+            visible_text.append((item["text"], item["context"]))
+        else:
+            raise ValueError("ANA browser-agent visible result evidence is malformed")
+    return kind, itineraries, visible_text
+
+
 class AnaSearchAdapter:
     def __init__(
         self, *, browser: AnaBrowser, policy: AnaSearchPolicy | None = None,
@@ -311,6 +344,7 @@ class AnaSearchAdapter:
 
         kind = classify_ana_page(page)
         used_agent = False
+        agent_extraction: Mapping[str, Any] | None = None
         if kind not in {
             AnaPageKind.AUTHENTICATION, AnaPageKind.SESSION_ERROR,
             AnaPageKind.HEAVY_TRAFFIC, AnaPageKind.VALIDATION_REJECTION,
@@ -353,7 +387,16 @@ class AnaSearchAdapter:
             if outcome.status != "completed" or outcome.page is None:
                 return self._result("BROWSER_AGENT_FAILED", outcome.detail or "ANA browser agent failed")
             page = outcome.page
-            kind = classify_ana_page(page)
+            agent_extraction = outcome.extraction
+            if agent_extraction is not None:
+                try:
+                    kind, _, _ = _parse_agent_extraction(agent_extraction)
+                except ValueError as exc:
+                    return self._result(
+                        "VALIDATION_REJECTED", str(exc), browser_agent_used=True,
+                    )
+            else:
+                kind = classify_ana_page(page)
             used_agent = True
 
         terminal = {
@@ -370,7 +413,10 @@ class AnaSearchAdapter:
             return self._result(status, detail, browser_agent_used=used_agent)
 
         try:
-            raw_itineraries, visible_text = _parse_results(page)
+            if agent_extraction is not None:
+                _, raw_itineraries, visible_text = _parse_agent_extraction(agent_extraction)
+            else:
+                raw_itineraries, visible_text = _parse_results(page)
         except ValueError as exc:
             return self._result("VALIDATION_REJECTED", str(exc), browser_agent_used=used_agent)
         valid: list[dict[str, Any]] = []
@@ -425,6 +471,8 @@ class AnaSearchAdapter:
             self.policy.validate_url(outcome.page.url)
             if outcome.page.url not in outcome.visited_urls:
                 raise ValueError("ANA final page is absent from the navigation trace")
+        if outcome.extraction is not None and not isinstance(outcome.extraction, Mapping):
+            raise ValueError("ANA browser-agent extraction must be structured data")
 
     @staticmethod
     def _result(status: str, detail: str, **fields: Any) -> dict[str, Any]:

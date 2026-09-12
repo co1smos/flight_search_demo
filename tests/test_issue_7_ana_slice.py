@@ -326,6 +326,106 @@ def test_persistent_browser_runs_bounded_agent_and_reserves_at_single_submit(cri
     assert "SFO" in captured["task"] and "NRT" in captured["task"]
 
 
+def test_production_agent_extraction_validates_results_without_fixture_markers(criteria):
+    from types import SimpleNamespace
+    from flight_search_demo.aeroplan import PageSnapshot, UnsupportedDeterministicLayout
+    from flight_search_demo.ana import (
+        AnaSearchAdapter, AnaSearchPolicy, OFFICIAL_ANA_SEARCH_ENTRY_URL,
+    )
+    from flight_search_demo.ana_validation import PersistentAnaBrowser
+
+    extraction = {
+        "page_kind": "results",
+        "visible_text": [
+            "NH 107 SFO to NRT Business 75,000 miles + $43.10 USD"
+        ],
+        "itineraries": [{
+            "visible": True,
+            "complete_itinerary": True,
+            "price_kind": "exact",
+            "price_label": "75,000 miles",
+            "points_per_passenger": 75000,
+            "cash": {"displayed_total": "$43.10", "currency": "USD"},
+            "segments": [{
+                "origin": "SFO", "destination": "NRT",
+                "departure": "2026-09-17T01:20:00-07:00",
+                "arrival": "2026-09-18T04:30:00+09:00",
+                "flight_number": "NH 107", "marketing_carrier": "ANA",
+                "operating_carrier": "ANA", "cabin": "Business",
+            }],
+        }],
+    }
+
+    class Agent:
+        def __init__(self, **kwargs):
+            self.multi_act = self._multi_act
+
+        async def _multi_act(self, actions):
+            payload = actions[0].model_dump(exclude_none=True)
+            if "extract" in payload:
+                return [SimpleNamespace(extracted_content=json.dumps(extraction))]
+            return [SimpleNamespace(extracted_content=None)]
+
+        async def run(self, max_steps):
+            del max_steps
+            await self.multi_act([SimpleNamespace(model_dump=lambda **kwargs: {
+                "extract": {"query": "ANA award results as JSON", "extract_links": False}
+            })])
+            return SimpleNamespace(
+                is_done=lambda: True, is_successful=lambda: True,
+                number_of_steps=lambda: 1, errors=lambda: [],
+                urls=lambda: [OFFICIAL_ANA_SEARCH_ENTRY_URL],
+            )
+
+    browser = PersistentAnaBrowser(
+        cdp_url="ws://127.0.0.1/devtools/browser/test",
+        profile_path=Path("unused.json"), deadline_seconds=30,
+        reserve_submission=lambda: True,
+    )
+    browser._loop = __import__("asyncio").new_event_loop()
+    browser._session = SimpleNamespace()
+    browser._snapshot = lambda: PageSnapshot(
+        OFFICIAL_ANA_SEARCH_ENTRY_URL,
+        "<html><body><article>ANA award availability</article></body></html>",
+    )
+    policy = AnaSearchPolicy()
+    policy.validate_criteria(criteria)
+    try:
+        with patch("flight_search_demo.ana_validation.Agent", Agent), patch(
+            "flight_search_demo.ana_validation.Controller"
+        ) as controller, patch(
+            "flight_search_demo.ana_validation.build_agent_llms",
+            return_value=(object(), object()),
+        ):
+            controller.return_value.registry.registry.actions = {}
+            outcome = browser.browser_agent_search(
+                criteria, goal="read submitted results", max_steps=8,
+                max_actions_per_step=2, max_failures=2,
+                allowed_domains=sorted(policy.allowed_domains),
+                authorize_action=policy.validate_action,
+            )
+    finally:
+        browser._loop.close()
+
+    class ProductionOutcomeBrowser:
+        def open(self, url):
+            return PageSnapshot(url, "<html><body>ANA award search</body></html>")
+
+        def deterministic_search(self, criteria):
+            raise UnsupportedDeterministicLayout
+
+        def browser_agent_search(self, criteria, **kwargs):
+            return outcome
+
+    result = AnaSearchAdapter(browser=ProductionOutcomeBrowser()).execute(
+        criteria, "production-extraction"
+    )
+
+    assert outcome.extraction == extraction
+    assert result["status"] == "MATCH_FOUND"
+    assert result["itineraries"][0]["segments"][0]["flight_number"] == "NH 107"
+
+
 def test_persistent_browser_rejects_actions_before_agent_dispatch(criteria):
     from types import SimpleNamespace
     from flight_search_demo.ana import AnaSearchPolicy

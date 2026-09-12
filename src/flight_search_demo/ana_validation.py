@@ -202,6 +202,7 @@ class PersistentAnaBrowser:
 
         trace: list[dict[str, Any]] = []
         submitted = False
+        extraction: dict[str, Any] | None = None
 
         async def authorize_actions(model_actions: Any) -> None:
             nonlocal submitted
@@ -265,7 +266,12 @@ class PersistentAnaBrowser:
             f"{criteria.destination}; departure {criteria.departure_date}; cabin {criteria.cabin}; "
             f"adults {criteria.adults}; trip type {criteria.trip_type}. Submit exactly once, then "
             "stop after the official ANA availability page is visible. Do not log in, retry, "
-            "change dates, open alternate routes, or perform any booking action."
+            "change dates, open alternate routes, or perform any booking action. Use extract on "
+            "the final page and return only JSON with page_kind and visible_text; for results also "
+            "include itineraries containing visible, complete_itinerary, price_kind, price_label, "
+            "points_per_passenger, cash (displayed_total and currency), and complete segments "
+            "(origin, destination, departure, arrival, flight_number, marketing_carrier, "
+            "operating_carrier, cabin)."
         )
         agent = Agent(
             task=task, llm=primary, fallback_llm=fallback, browser_session=self._session,
@@ -277,8 +283,24 @@ class PersistentAnaBrowser:
         execute_actions = agent.multi_act
 
         async def authorized_multi_act(actions: Any):
+            nonlocal extraction
             await authorize_actions(actions)
-            return await execute_actions(actions)
+            results = await execute_actions(actions)
+            for action, result in zip(actions, results or []):
+                payload = action.model_dump(exclude_none=True)
+                if "extract" not in payload:
+                    continue
+                content = getattr(result, "extracted_content", None)
+                if not isinstance(content, str):
+                    raise ValueError("ANA browser-agent extraction returned no text")
+                try:
+                    decoded = json.loads(content)
+                except json.JSONDecodeError as exc:
+                    raise ValueError("ANA browser-agent extraction returned invalid JSON") from exc
+                if not isinstance(decoded, dict):
+                    raise ValueError("ANA browser-agent extraction returned non-object JSON")
+                extraction = decoded
+            return results
 
         agent.multi_act = authorized_multi_act
         history = self._run(agent.run(max_steps=max_steps))
@@ -299,7 +321,9 @@ class PersistentAnaBrowser:
         page = self._snapshot()
         if page.url not in urls:
             urls += (page.url,)
-        return AnaAgentOutcome("completed", page, steps, failures, urls, tuple(trace))
+        return AnaAgentOutcome(
+            "completed", page, steps, failures, urls, tuple(trace), extraction=extraction,
+        )
 
 
 class PersistentAnaDriver:
