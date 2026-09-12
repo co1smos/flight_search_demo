@@ -203,9 +203,8 @@ class PersistentAnaBrowser:
         trace: list[dict[str, Any]] = []
         submitted = False
 
-        async def authorize_step(_state: Any, output: Any, _step: int) -> None:
+        async def authorize_actions(model_actions: Any) -> None:
             nonlocal submitted
-            model_actions = getattr(output, "action", None)
             if not isinstance(model_actions, list) or len(model_actions) > max_actions_per_step:
                 raise ValueError("browser agent emitted an invalid action batch")
             decoded: list[tuple[str, dict[str, Any]]] = []
@@ -271,11 +270,17 @@ class PersistentAnaBrowser:
         agent = Agent(
             task=task, llm=primary, fallback_llm=fallback, browser_session=self._session,
             tools=tools, use_vision=False, use_judge=False,
-            register_new_step_callback=authorize_step,
             max_actions_per_step=max_actions_per_step, max_failures=max_failures,
             llm_timeout=max(1, int(self.deadline_at - time.monotonic())),
             step_timeout=max(1, int(self.deadline_at - time.monotonic())),
         )
+        execute_actions = agent.multi_act
+
+        async def authorized_multi_act(actions: Any):
+            await authorize_actions(actions)
+            return await execute_actions(actions)
+
+        agent.multi_act = authorized_multi_act
         history = self._run(agent.run(max_steps=max_steps))
         steps = int(self._history_value(history, "number_of_steps", 0))
         errors = self._history_value(history, "errors", []) or []

@@ -258,15 +258,23 @@ def test_persistent_browser_runs_bounded_agent_and_reserves_at_single_submit(cri
         return value
 
     reservations = []
+    executions = []
     captured = {}
 
     class Agent:
         def __init__(self, **kwargs):
             captured.update(kwargs)
+            self.multi_act = self._multi_act
+
+        async def _multi_act(self, actions):
+            for action in actions:
+                payload = action.model_dump(exclude_none=True)
+                name = next(iter(payload))
+                executions.append((name, list(reservations)))
+            return []
 
         async def run(self, max_steps):
             captured["max_steps"] = max_steps
-            callback = captured["register_new_step_callback"]
             actions = (
                 ("input", {"index": 1, "text": "SFO"}),
                 ("input", {"index": 2, "text": "NRT"}),
@@ -275,13 +283,13 @@ def test_persistent_browser_runs_bounded_agent_and_reserves_at_single_submit(cri
                 ("select_dropdown", {"index": 5, "text": "1"}),
                 ("select_dropdown", {"index": 6, "text": "one-way"}),
             )
-            for step, (name, params) in enumerate(actions, 1):
-                await callback(None, SimpleNamespace(action=[SimpleNamespace(
+            for name, params in actions:
+                await self.multi_act([SimpleNamespace(
                     model_dump=lambda name=name, params=params, **kwargs: {name: params}
-                )]), step)
-            await callback(None, SimpleNamespace(action=[SimpleNamespace(model_dump=lambda **kwargs: {
+                )])
+            await self.multi_act([SimpleNamespace(model_dump=lambda **kwargs: {
                 "click": {"index": 7}
-            })]), 7)
+            })])
             return SimpleNamespace(
                 is_done=lambda: True, is_successful=lambda: True,
                 number_of_steps=lambda: 7, errors=lambda: [], urls=lambda: [OFFICIAL_ANA_SEARCH_ENTRY_URL],
@@ -311,10 +319,61 @@ def test_persistent_browser_runs_bounded_agent_and_reserves_at_single_submit(cri
 
     assert outcome.status == "completed"
     assert reservations == ["reserved"]
+    assert executions[-1] == ("click", ["reserved"])
     assert captured["max_steps"] == 8
     assert captured["max_actions_per_step"] == 2
     assert captured["max_failures"] == 2
     assert "SFO" in captured["task"] and "NRT" in captured["task"]
+
+
+def test_persistent_browser_rejects_actions_before_agent_dispatch(criteria):
+    from types import SimpleNamespace
+    from flight_search_demo.ana import AnaSearchPolicy
+    from flight_search_demo.ana_validation import PersistentAnaBrowser
+
+    executions = []
+
+    class Session:
+        async def get_element_by_index(self, index):
+            return SimpleNamespace(attributes={"name": "origin"}, tag_name="input")
+
+    class Agent:
+        def __init__(self, **kwargs):
+            self.multi_act = self._multi_act
+
+        async def _multi_act(self, actions):
+            executions.extend(actions)
+            return []
+
+        async def run(self, max_steps):
+            del max_steps
+            await self.multi_act([SimpleNamespace(model_dump=lambda **kwargs: {
+                "input": {"index": 1, "text": "SFO", "clear": False}
+            })])
+
+    browser = PersistentAnaBrowser(
+        cdp_url="ws://127.0.0.1/devtools/browser/test",
+        profile_path=Path("unused.json"), deadline_seconds=30,
+        reserve_submission=lambda: True,
+    )
+    browser._loop = __import__("asyncio").new_event_loop()
+    browser._session = Session()
+    policy = AnaSearchPolicy()
+    policy.validate_criteria(criteria)
+    try:
+        with patch("flight_search_demo.ana_validation.Agent", Agent), patch(
+            "flight_search_demo.ana_validation.build_agent_llms", return_value=(object(), object())
+        ), pytest.raises(ValueError, match="replace, not append"):
+            browser.browser_agent_search(
+                criteria, goal="confirmed criteria only", max_steps=8,
+                max_actions_per_step=2, max_failures=2,
+                allowed_domains=sorted(policy.allowed_domains),
+                authorize_action=policy.validate_action,
+            )
+    finally:
+        browser._loop.close()
+
+    assert executions == []
 
 
 def test_controlled_validation_is_correlated_and_fail_closed(tmp_path):
