@@ -75,7 +75,7 @@ def test_live_driver_reserves_once_at_submission_and_preserves_non_availability_
 
     class Driver:
         def execute(self, criteria, *, deadline_seconds, reserve_submission):
-            assert deadline_seconds == 60
+            assert 0 < deadline_seconds <= 60
             assert criteria.origin == "JFK"
             assert reserve_submission() is True
             return {
@@ -282,4 +282,33 @@ def test_controller_enforces_one_deadline_and_emits_correlated_timeout(tmp_path,
     assert event["status"] == "SEARCH_TIMEOUT"
     assert event["blocking_reason"] == "SEARCH_TIMEOUT"
     assert event["request_id"] == request["request_id"]
+    assert json.loads((tmp_path / "events.jsonl").read_text()) == event
+
+
+def test_controller_deadline_interrupts_blocking_driver_cleanup(tmp_path, monkeypatch):
+    import flight_search_demo.aeroplan_validation as validation
+
+    request, confirmation = request_and_confirmation()
+
+    class BlockingCleanupDriver:
+        def execute(self, criteria, *, deadline_seconds, reserve_submission):
+            try:
+                time.sleep(1)
+            finally:
+                time.sleep(0.30)
+
+    monkeypatch.setattr(validation, "OPERATION_DEADLINE_SECONDS", 0.05)
+    started = time.monotonic()
+    event = validate_controlled_search(
+        request=request,
+        confirmation=confirmation,
+        risk_acknowledged=True,
+        event_log_path=tmp_path / "events.jsonl",
+        allowance_db_path=tmp_path / "usage.sqlite3",
+        current_date=date(2026, 9, 11),
+        live_driver=BlockingCleanupDriver(),
+    )
+
+    assert time.monotonic() - started < 0.20
+    assert event["status"] == "SEARCH_TIMEOUT"
     assert json.loads((tmp_path / "events.jsonl").read_text()) == event

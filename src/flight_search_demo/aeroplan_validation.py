@@ -32,11 +32,12 @@ from .spike import discover_debugger_cdp_url
 
 
 OPERATION_DEADLINE_SECONDS = 60.0
+MAX_REPORTING_RESERVE_SECONDS = 1.0
 
 
 @contextmanager
 def _controller_deadline(seconds: float):
-    """Interrupt the complete synchronous driver call at the controller seam."""
+    """Interrupt blocking work repeatedly until its deadline scope has unwound."""
     if threading.current_thread() is not threading.main_thread():
         raise RuntimeError("controlled live execution requires the main thread deadline guard")
     if seconds <= 0:
@@ -49,7 +50,8 @@ def _controller_deadline(seconds: float):
         raise TimeoutError("controlled Aeroplan operation exceeded its 60-second deadline")
 
     signal.signal(signal.SIGALRM, expire)
-    signal.setitimer(signal.ITIMER_REAL, seconds)
+    interrupt_interval = min(0.01, max(seconds / 10.0, 0.001))
+    signal.setitimer(signal.ITIMER_REAL, seconds, interrupt_interval)
     try:
         yield
     finally:
@@ -61,7 +63,7 @@ class ControlledAeroplanDriver(Protocol):
     """Narrow live-driver seam; implementations own browser cleanup and deadline enforcement."""
 
     def execute(
-        self, criteria: Any, *, deadline_seconds: int, reserve_submission: Any,
+        self, criteria: Any, *, deadline_seconds: float, reserve_submission: Any,
     ) -> dict[str, Any]: ...
 
 
@@ -261,18 +263,19 @@ class PersistentAeroplanDriver:
         self.steel_base_url = str(steel_base_url)
 
     def execute(
-        self, criteria: Any, *, deadline_seconds: int, reserve_submission: Any,
+        self, criteria: Any, *, deadline_seconds: float, reserve_submission: Any,
     ) -> dict[str, Any]:
         browser: PersistentAeroplanBrowser | None = None
+        deadline_at = time.monotonic() + float(deadline_seconds)
         try:
             cdp_url = discover_debugger_cdp_url(
                 self.steel_base_url,
                 os.environ.get("STEEL_API_KEY"),
-                timeout=max(float(deadline_seconds), 0.001),
+                timeout=max(deadline_at - time.monotonic(), 0.001),
             )
             browser = PersistentAeroplanBrowser(
                 cdp_url=cdp_url,
-                deadline_seconds=float(deadline_seconds),
+                deadline_seconds=max(deadline_at - time.monotonic(), 0.001),
                 reserve_submission=reserve_submission,
             )
             with browser:
@@ -347,6 +350,7 @@ def validate_controlled_search(
     live_driver: ControlledAeroplanDriver | None = None,
 ) -> dict[str, Any]:
     operation_started = time.monotonic()
+    operation_deadline_at = operation_started + OPERATION_DEADLINE_SECONDS
     request_id = str(request.get("request_id", "")).strip() if isinstance(request, dict) else ""
     original_text = str(request.get("original_text", "")).strip() if isinstance(request, dict) else ""
     criteria = None
@@ -396,64 +400,70 @@ def validate_controlled_search(
             return True
 
         try:
-            remaining = OPERATION_DEADLINE_SECONDS - (time.monotonic() - operation_started)
+            reporting_reserve = min(
+                MAX_REPORTING_RESERVE_SECONDS,
+                OPERATION_DEADLINE_SECONDS / 5.0,
+            )
+            driver_deadline_at = operation_deadline_at - reporting_reserve
+            remaining = driver_deadline_at - time.monotonic()
             with _controller_deadline(remaining):
                 result = live_driver.execute(
                     criteria,
-                    deadline_seconds=OPERATION_DEADLINE_SECONDS,
+                    deadline_seconds=remaining,
                     reserve_submission=reserve_submission,
                 )
-            if not isinstance(result, dict):
-                raise ValueError("live driver returned an unstructured result")
-            status = str(result.get("status", "PARSER_FAILED"))
-            detail = str(result.get("detail", "live driver returned no detail"))
-            blocking_reason = str(result.get("blocking_reason", status))
-            live_validation_performed = result.get("live_validation_performed") is True
-            visible_results_validated = result.get("visible_results_validated") is True
-            profile_reusable = result.get("profile_reusable") is True
-            availability_statuses = {
-                "MATCH_FOUND", "NO_AWARD_AVAILABILITY", "ABOVE_POINTS_LIMIT",
-            }
-            if status in availability_statuses and not (
-                live_search_submitted
-                and live_validation_performed
-                and visible_results_validated
-                and profile_reusable
-            ):
-                status = "PARSER_FAILED"
-                detail = (
-                    "live availability outcome lacked a submitted search, visible result "
-                    "validation, or reusable-profile evidence"
-                )
-                blocking_reason = status
-            elif status in availability_statuses:
-                adapter_status = "VERIFIED"
+                if not isinstance(result, dict):
+                    raise ValueError("live driver returned an unstructured result")
+                status = str(result.get("status", "PARSER_FAILED"))
+                detail = str(result.get("detail", "live driver returned no detail"))
+                blocking_reason = str(result.get("blocking_reason", status))
+                live_validation_performed = result.get("live_validation_performed") is True
+                visible_results_validated = result.get("visible_results_validated") is True
+                profile_reusable = result.get("profile_reusable") is True
+                availability_statuses = {
+                    "MATCH_FOUND", "NO_AWARD_AVAILABILITY", "ABOVE_POINTS_LIMIT",
+                }
+                if status in availability_statuses and not (
+                    live_search_submitted
+                    and live_validation_performed
+                    and visible_results_validated
+                    and profile_reusable
+                ):
+                    status = "PARSER_FAILED"
+                    detail = (
+                        "live availability outcome lacked a submitted search, visible result "
+                        "validation, or reusable-profile evidence"
+                    )
+                    blocking_reason = status
+                elif status in availability_statuses:
+                    adapter_status = "VERIFIED"
         except (TimeoutError, ValueError) as exc:
             status = "SEARCH_TIMEOUT" if isinstance(exc, TimeoutError) else "PARSER_FAILED"
             detail = str(exc)
             blocking_reason = status
         continuous_live_execution_enabled = False
-    return emit_event(
-        event_log_path=event_log_path, request_id=request_id, original_text=original_text,
-        atomic_task_id=task_id, normalized_criteria=asdict(criteria) if criteria else None,
-        status=status, detail=detail, extra_fields={
-            "request_hash": request_hash,
-            "risk_acknowledged": risk_acknowledged is True,
-            "request_confirmed": request_confirmed,
-            "blocking_reason": (
-                blocking_reason if status == "MANUAL_SEARCH_ONLY" else status
-            ),
-            "adapter_status": adapter_status,
-            "continuous_live_execution_enabled": continuous_live_execution_enabled,
-            "live_search_submitted": live_search_submitted,
-            "live_validation_performed": live_validation_performed,
-            "visible_results_validated": visible_results_validated,
-            "profile_reusable": profile_reusable,
-            "allowance_remaining": allowance.remaining,
-            "operation_deadline_seconds": OPERATION_DEADLINE_SECONDS,
-            "search_entry_url": OFFICIAL_SEARCH_ENTRY_URL,
-        },
-    )
+    with _controller_deadline(operation_deadline_at - time.monotonic()):
+        return emit_event(
+            event_log_path=event_log_path, request_id=request_id, original_text=original_text,
+            atomic_task_id=task_id, normalized_criteria=asdict(criteria) if criteria else None,
+            status=status, detail=detail, extra_fields={
+                "request_hash": request_hash,
+                "risk_acknowledged": risk_acknowledged is True,
+                "request_confirmed": request_confirmed,
+                "blocking_reason": (
+                    blocking_reason if status == "MANUAL_SEARCH_ONLY" else status
+                ),
+                "adapter_status": adapter_status,
+                "continuous_live_execution_enabled": continuous_live_execution_enabled,
+                "live_search_submitted": live_search_submitted,
+                "live_validation_performed": live_validation_performed,
+                "visible_results_validated": visible_results_validated,
+                "profile_reusable": profile_reusable,
+                "allowance_remaining": allowance.remaining,
+                "operation_deadline_seconds": OPERATION_DEADLINE_SECONDS,
+                "search_entry_url": OFFICIAL_SEARCH_ENTRY_URL,
+            },
+        )
 
 
 def main() -> int:
