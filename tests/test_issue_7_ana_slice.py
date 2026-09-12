@@ -60,6 +60,47 @@ def test_award_page_header_login_link_does_not_require_authentication(criteria):
     assert result["browser_agent_used"] is True
 
 
+def test_official_award_flow_results_host_is_not_misclassified_as_login(criteria):
+    from flight_search_demo.aeroplan import PageSnapshot, UnsupportedDeterministicLayout
+    from flight_search_demo.ana import AnaAgentOutcome, AnaSearchAdapter
+
+    award_url = (
+        "https://aswbe-i.ana.co.jp/international_asw/pages/award/search/roundtrip/"
+        "award_search_roundtrip_input.xhtml?CONNECTION_KIND=LAX&LANG=en"
+    )
+    extraction = {
+        "page_kind": "results",
+        "visible_text": ["NH 107 Business 75,000 miles + $43.10 USD"],
+        "itineraries": [json.loads(
+            (FIXTURES / "match.html").read_text().split(
+                '<script id="aeroplan-results-data" type="application/json">', 1
+            )[1].split("</script>", 1)[0]
+        )["itineraries"][0]],
+    }
+    final_page = PageSnapshot(
+        award_url,
+        ("<html><body><article>NH 107 Business 75,000 miles + "
+         "$43.10 USD</article></body></html>"),
+    )
+
+    class Browser:
+        def open(self, url):
+            return PageSnapshot(url, "<html><body>ANA award search</body></html>")
+
+        def deterministic_search(self, criteria):
+            raise UnsupportedDeterministicLayout
+
+        def browser_agent_search(self, criteria, **kwargs):
+            return AnaAgentOutcome(
+                status="completed", page=final_page, steps=1, failures=0,
+                visited_urls=(final_page.url,), actions=(), extraction=extraction,
+            )
+
+    result = AnaSearchAdapter(browser=Browser()).execute(criteria, "award-host-results")
+
+    assert result["status"] == "MATCH_FOUND"
+
+
 @pytest.mark.parametrize(
     ("field", "wrong_value"),
     [("origin", "LAX"), ("destination", "HND"), ("departure", "2026-09-18T01:20:00-07:00")],

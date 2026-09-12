@@ -29,6 +29,10 @@ OFFICIAL_ANA_AWARD_FLOW_TRANSITION_URL = (
 )
 APPROVED_ANA_DOMAINS = frozenset({"ana.co.jp", "www.ana.co.jp"})
 REQUIRED_ANA_IDENTITY_DOMAINS = frozenset({"aswbe-i.ana.co.jp"})
+ANA_AWARD_FLOW_PATHS = frozenset({
+    "/international_asw/pages/award/search/roundtrip/"
+    "award_search_roundtrip_input.xhtml",
+})
 
 
 class AnaPageKind(str, Enum):
@@ -98,10 +102,7 @@ class AnaSearchPolicy:
     })
     _AWARD_FLOW_TRANSITION_PATH = "/other/int/meta/0771.html"
     _AWARD_FLOW_TRANSITION_QUERY = {"CONNECTION_KIND": "us", "LANG": "e"}
-    _AWARD_FLOW_PATHS = frozenset({
-        "/international_asw/pages/award/search/roundtrip/"
-        "award_search_roundtrip_input.xhtml",
-    })
+    _AWARD_FLOW_PATHS = ANA_AWARD_FLOW_PATHS
     _AWARD_FLOW_QUERY = {"CONNECTION_KIND": "LAX", "LANG": "en"}
     _ACTIONS = frozenset({
         "navigate", "enter_award_flow", "fill_search_field", "select_search_option",
@@ -306,10 +307,12 @@ def classify_ana_page(page: PageSnapshot) -> AnaPageKind:
     text = " ".join(parser.visible_text).lower()
     authentication = _AuthenticationFormParser()
     authentication.feed(page.html)
-    if (
-        urlparse(page.url).hostname in REQUIRED_ANA_IDENTITY_DOMAINS
-        or authentication.has_password_form
-    ):
+    parsed_url = urlparse(page.url)
+    identity_login_page = (
+        parsed_url.hostname in REQUIRED_ANA_IDENTITY_DOMAINS
+        and parsed_url.path.rstrip("/") not in ANA_AWARD_FLOW_PATHS
+    )
+    if identity_login_page or authentication.has_password_form:
         return AnaPageKind.AUTHENTICATION
     if "session has expired" in text or "session error" in text:
         return AnaPageKind.SESSION_ERROR
