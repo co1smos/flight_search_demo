@@ -26,4 +26,4 @@ package-dir = {"" = "src"}
 where = ["src"]
 
 [tool.setuptools.package-data]
-flight_search_demo = ["fixtures/aeroplan/*.html"]
+flight_search_demo = ["fixtures/aeroplan/*.html", "fixtures/ana/*.html"]
