@@ -98,3 +98,25 @@ def test_unconfirmed_report_does_not_claim_operator_gate_passed(tmp_path):
         current_date=date(2026, 9, 11))
     assert event["request_confirmed"] is False
     assert event["blocking_reason"] == "CONFIRMATION_REQUIRED"
+
+
+def test_malformed_confirmation_fails_closed_with_a_correlated_report(tmp_path):
+    request, _ = request_and_confirmation()
+    event = validate_controlled_search(request=request, confirmation=[],
+        risk_acknowledged=True, event_log_path=tmp_path / "events.jsonl",
+        allowance_db_path=tmp_path / "usage.sqlite3", current_date=date(2026, 9, 11))
+    assert event["status"] == "CONFIRMATION_REQUIRED"
+    assert event["request_confirmed"] is False
+    assert event["live_search_submitted"] is False
+    assert event["allowance_remaining"] == 10
+    assert json.loads((tmp_path / "events.jsonl").read_text()) == event
+
+
+def test_malformed_request_fails_closed_without_consuming_allowance(tmp_path):
+    event = validate_controlled_search(request=[], confirmation={},
+        risk_acknowledged=True, event_log_path=tmp_path / "events.jsonl",
+        allowance_db_path=tmp_path / "usage.sqlite3", current_date=date(2026, 9, 11))
+    assert event["status"] == "UNSUPPORTED_REQUEST"
+    assert event["request_confirmed"] is False
+    assert event["live_search_submitted"] is False
+    assert event["allowance_remaining"] == 10

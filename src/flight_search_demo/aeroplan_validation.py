@@ -49,12 +49,12 @@ class AeroplanAllowance:
 
 
 def validate_controlled_search(
-    *, request: dict[str, Any], confirmation: dict[str, Any],
+    *, request: Any, confirmation: Any,
     risk_acknowledged: bool, event_log_path: Path, allowance_db_path: Path,
     current_date: date | None = None,
 ) -> dict[str, Any]:
-    request_id = str(request.get("request_id", "")).strip()
-    original_text = str(request.get("original_text", "")).strip()
+    request_id = str(request.get("request_id", "")).strip() if isinstance(request, dict) else ""
+    original_text = str(request.get("original_text", "")).strip() if isinstance(request, dict) else ""
     criteria = None
     task_id = None
     request_hash = None
@@ -63,12 +63,18 @@ def validate_controlled_search(
     detail = ("Controlled live validation is blocked: no validated persistent-profile Aeroplan "
               "browser driver is available. No live navigation, model call, or submission occurred.")
     try:
+        if not isinstance(request, dict):
+            raise ValueError("request must be a JSON object")
         criteria = normalize_request(request, current_date=current_date)
         if criteria.program != "aeroplan":
             raise ValueError("controlled validation supports Aeroplan only")
         request_hash = build_request_hash(request_id, original_text, criteria)
         task_id = f"aeroplan-{request_hash[:12]}"
-        error = validate_confirmation(confirmation, request_id, request_hash)
+        error = (
+            "confirmation must be a JSON object"
+            if not isinstance(confirmation, dict)
+            else validate_confirmation(confirmation, request_id, request_hash)
+        )
         request_confirmed = error is None
         if error:
             status, detail = "CONFIRMATION_REQUIRED", error
