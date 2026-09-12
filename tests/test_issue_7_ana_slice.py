@@ -318,6 +318,35 @@ def test_live_cli_fails_closed_in_ci_before_constructing_driver(tmp_path, monkey
     driver.assert_not_called()
 
 
+def test_controlled_validation_fails_closed_in_ci_before_executing_supplied_driver(
+    tmp_path, monkeypatch,
+):
+    from flight_search_demo.ana_validation import validate_controlled_ana_search
+
+    request, confirmation = _request_and_confirmation()
+    monkeypatch.setenv("CI", "true")
+
+    class Driver:
+        def execute(self, criteria, *, deadline_seconds, reserve_submission):
+            raise AssertionError("live ANA driver must not execute in CI")
+
+    event = validate_controlled_ana_search(
+        request=request,
+        confirmation=confirmation,
+        risk_acknowledged=True,
+        event_log_path=tmp_path / "events.jsonl",
+        allowance_db_path=tmp_path / "usage.sqlite3",
+        current_date=date(2026, 9, 12),
+        live_driver=Driver(),
+    )
+
+    assert event["status"] == "MANUAL_SEARCH_ONLY"
+    assert event["blocking_reason"] == "LIVE_SEARCH_DISABLED_IN_CI"
+    assert event["live_validation_performed"] is False
+    assert event["live_search_submitted"] is False
+    assert event["allowance_remaining"] == 10
+
+
 def test_persistent_ana_profile_rejects_non_ana_state_before_browser_start(tmp_path):
     from flight_search_demo.ana_validation import PersistentAnaBrowser
 
@@ -593,6 +622,73 @@ def test_persistent_browser_uses_separate_state_specific_agent_goals(criteria):
     assert "fill only the confirmed search criteria" in tasks[1]
     assert "submit the confirmed criteria exactly once" in tasks[2]
     assert "read the visible final ANA availability state" in tasks[3]
+
+
+@pytest.mark.parametrize("redirect_after", [1, 2])
+def test_persistent_browser_rejects_redirect_before_next_agent_phase(
+    criteria, redirect_after,
+):
+    from types import SimpleNamespace
+    from flight_search_demo.ana import AnaSearchPolicy, OFFICIAL_ANA_SEARCH_ENTRY_URL
+    from flight_search_demo.ana_validation import PersistentAnaBrowser
+
+    executed_phases = []
+    completed_phases = 0
+
+    class Agent:
+        def __init__(self, **kwargs):
+            self.task = kwargs["task"]
+            self.multi_act = self._multi_act
+
+        async def _multi_act(self, actions):
+            del actions
+            return []
+
+        async def run(self, max_steps):
+            nonlocal completed_phases
+            del max_steps
+            executed_phases.append(self.task)
+            completed_phases += 1
+            return SimpleNamespace(
+                is_done=lambda: True, is_successful=lambda: True,
+                number_of_steps=lambda: 1, errors=lambda: [],
+                urls=lambda: [OFFICIAL_ANA_SEARCH_ENTRY_URL],
+            )
+
+    browser = PersistentAnaBrowser(
+        cdp_url="ws://127.0.0.1/devtools/browser/test",
+        profile_path=Path("unused.json"), deadline_seconds=30,
+        reserve_submission=lambda: True,
+    )
+    browser._loop = __import__("asyncio").new_event_loop()
+    browser._session = SimpleNamespace()
+    browser._snapshot = lambda: __import__(
+        "flight_search_demo.aeroplan", fromlist=["PageSnapshot"]
+    ).PageSnapshot(
+        "https://www.ana.co.jp/en/us/shopping/"
+        if completed_phases == redirect_after else OFFICIAL_ANA_SEARCH_ENTRY_URL,
+        "<html><body>redirected</body></html>",
+    )
+    policy = AnaSearchPolicy()
+    policy.validate_criteria(criteria)
+    try:
+        with patch("flight_search_demo.ana_validation.Agent", Agent), patch(
+            "flight_search_demo.ana_validation.Controller"
+        ) as controller, patch(
+            "flight_search_demo.ana_validation.build_agent_llms",
+            return_value=(object(), object()),
+        ), pytest.raises(ValueError, match="expected ANA page"):
+            controller.return_value.registry.registry.actions = {}
+            browser.browser_agent_search(
+                criteria, goal="confirmed criteria only", max_steps=8,
+                max_actions_per_step=2, max_failures=2,
+                allowed_domains=sorted(policy.allowed_domains),
+                authorize_action=policy.validate_action,
+            )
+    finally:
+        browser._loop.close()
+
+    assert len(executed_phases) == redirect_after
 
 
 def test_persistent_browser_authorizes_real_entry_page_award_flow_transition_before_form_input(
@@ -876,7 +972,8 @@ def test_browser_agent_no_availability_must_be_visible_in_final_dom(criteria):
 
 def test_persistent_browser_rejects_actions_before_agent_dispatch(criteria):
     from types import SimpleNamespace
-    from flight_search_demo.ana import AnaSearchPolicy
+    from flight_search_demo.aeroplan import PageSnapshot
+    from flight_search_demo.ana import AnaSearchPolicy, OFFICIAL_ANA_SEARCH_ENTRY_URL
     from flight_search_demo.ana_validation import PersistentAnaBrowser
 
     executions = []
@@ -906,6 +1003,9 @@ def test_persistent_browser_rejects_actions_before_agent_dispatch(criteria):
     )
     browser._loop = __import__("asyncio").new_event_loop()
     browser._session = Session()
+    browser._snapshot = lambda: PageSnapshot(
+        OFFICIAL_ANA_SEARCH_ENTRY_URL, "<html><body>ANA award search</body></html>"
+    )
     policy = AnaSearchPolicy()
     policy.validate_criteria(criteria)
     try:

@@ -23,8 +23,10 @@ from .ana import (
     REQUIRED_ANA_IDENTITY_DOMAINS,
     AnaAgentOutcome,
     AnaSearchAdapter,
+    AnaSearchPolicy,
     OFFICIAL_ANA_AWARD_FLOW_TRANSITION_URL,
     OFFICIAL_ANA_SEARCH_ENTRY_URL,
+    PolicyViolation,
 )
 from .aeroplan import PageSnapshot, UnsupportedDeterministicLayout
 from .app import build_request_hash, emit_event, load_json, normalize_request, validate_confirmation
@@ -284,6 +286,16 @@ class PersistentAnaBrowser:
         submitted = False
         extraction: dict[str, Any] | None = None
 
+        def validate_phase_page(phase: str) -> PageSnapshot:
+            page = self._snapshot()
+            try:
+                AnaSearchPolicy(allowed_domains).validate_url(page.url)
+            except PolicyViolation as exc:
+                raise ValueError(
+                    f"ANA browser agent is not on an expected ANA page before {phase}"
+                ) from exc
+            return page
+
         async def authorize_actions(model_actions: Any, phase: str) -> None:
             nonlocal submitted
             if not isinstance(model_actions, list) or len(model_actions) > max_actions_per_step:
@@ -397,6 +409,9 @@ class PersistentAnaBrowser:
         failures = 0
         visited_urls: list[str] = []
         for phase, permitted_tools, task in phases:
+            phase_page = validate_phase_page(phase)
+            if phase_page.url not in visited_urls:
+                visited_urls.append(phase_page.url)
             remaining_steps = max_steps - steps
             remaining_failures = max_failures - failures
             if remaining_steps <= 0:
@@ -467,7 +482,7 @@ class PersistentAnaBrowser:
                 return AnaAgentOutcome(
                     "failed", None, steps, failures, tuple(visited_urls), tuple(trace)
                 )
-        page = self._snapshot()
+        page = validate_phase_page("completion")
         if page.url not in visited_urls:
             visited_urls.append(page.url)
         return AnaAgentOutcome(
@@ -598,7 +613,10 @@ def validate_controlled_ana_search(
     profile_reusable = False
     adapter_status = "UNVERIFIED"
     blocking_reason = "LIVE_DRIVER_UNAVAILABLE"
-    if status == "MANUAL_SEARCH_ONLY" and live_driver is not None:
+    if status == "MANUAL_SEARCH_ONLY" and live_driver is not None and _running_in_ci():
+        detail = "Controlled live ANA searches are disabled in CI."
+        blocking_reason = "LIVE_SEARCH_DISABLED_IN_CI"
+    elif status == "MANUAL_SEARCH_ONLY" and live_driver is not None:
         def reserve_submission() -> bool:
             nonlocal live_search_submitted
             if live_search_submitted or not allowance.consume_submission():
