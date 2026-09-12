@@ -495,9 +495,11 @@ class PersistentAnaDriver:
     def __init__(
         self, steel_base_url: str = "http://127.0.0.1:3001",
         profile_path: Path = DEFAULT_ANA_PROFILE,
+        debugger_port: int = 9224,
     ) -> None:
         self.steel_base_url = str(steel_base_url)
         self.profile_path = Path(profile_path)
+        self.debugger_port = debugger_port
 
     def execute(
         self, criteria: Any, *, deadline_seconds: float, reserve_submission: Any,
@@ -508,6 +510,7 @@ class PersistentAnaDriver:
             cdp_url = discover_debugger_cdp_url(
                 self.steel_base_url, os.environ.get("STEEL_API_KEY"),
                 timeout=max(deadline_at - time.monotonic(), 0.001),
+                debugger_port=self.debugger_port,
             )
             browser = PersistentAnaBrowser(
                 cdp_url=cdp_url, profile_path=self.profile_path,
@@ -688,6 +691,11 @@ def main() -> int:
     parser.add_argument(
         "--steel-base-url", default=os.environ.get("ANA_STEEL_BASE_URL", "http://127.0.0.1:3001")
     )
+    parser.add_argument(
+        "--steel-debugger-port", type=int,
+        default=int(os.environ.get("ANA_STEEL_DEBUGGER_PORT", "9224")),
+        help="Dedicated loopback Chrome debugger port for the ANA-only Steel instance.",
+    )
     parser.add_argument("--acknowledge-account-and-terms-risk", action="store_true")
     args = parser.parse_args()
     if _running_in_ci():
@@ -696,7 +704,9 @@ def main() -> int:
         request=load_json(args.request), confirmation=load_json(args.confirmation),
         risk_acknowledged=args.acknowledge_account_and_terms_risk,
         event_log_path=args.event_log, allowance_db_path=args.allowance_db,
-        live_driver=PersistentAnaDriver(args.steel_base_url, args.profile),
+        live_driver=PersistentAnaDriver(
+            args.steel_base_url, args.profile, args.steel_debugger_port
+        ),
     )
     return 0 if event["adapter_status"] == "VERIFIED" else 1
 

@@ -4,7 +4,7 @@ from datetime import date
 from pathlib import Path
 
 import pytest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from flight_search_demo.app import build_request_hash, normalize_request
 
@@ -292,8 +292,48 @@ def test_default_live_driver_uses_an_ana_only_browser_endpoint_and_profile():
 
     driver = PersistentAnaDriver()
     assert driver.steel_base_url == "http://127.0.0.1:3001"
+    assert driver.debugger_port == 9224
     assert driver.profile_path == DEFAULT_ANA_PROFILE
     assert "ana-browser-profile" in str(driver.profile_path)
+
+
+def test_live_driver_discovers_the_dedicated_ana_debugger_endpoint(tmp_path, monkeypatch):
+    from flight_search_demo import ana_validation
+
+    monkeypatch.delenv("STEEL_API_KEY", raising=False)
+    driver = ana_validation.PersistentAnaDriver(profile_path=tmp_path / "ana.json")
+
+    with patch.object(
+        ana_validation,
+        "discover_debugger_cdp_url",
+        side_effect=RuntimeError("endpoint unavailable"),
+    ) as discover:
+        result = driver.execute(object(), deadline_seconds=30, reserve_submission=lambda: True)
+
+    assert result["status"] == "MANUAL_SEARCH_ONLY"
+    assert discover.call_args.args[:2] == ("http://127.0.0.1:3001", None)
+    assert discover.call_args.kwargs["debugger_port"] == 9224
+
+
+def test_dedicated_ana_debugger_discovery_does_not_resolve_to_aeroplan_port():
+    from flight_search_demo.spike import discover_debugger_cdp_url
+
+    response = MagicMock()
+    response.__enter__.return_value = response
+    response.__exit__.return_value = False
+    response.read.return_value = (
+        b'{"webSocketDebuggerUrl":"ws://127.0.0.1/devtools/browser/ana"}'
+    )
+
+    with patch("flight_search_demo.spike.urllib.request.urlopen", return_value=response) as open_url:
+        cdp_url = discover_debugger_cdp_url(
+            "http://127.0.0.1:3001", None, debugger_port=9224
+        )
+
+    open_url.assert_called_once_with(
+        "http://127.0.0.1:9224/json/version", timeout=10.0
+    )
+    assert cdp_url == "ws://127.0.0.1:9224/devtools/browser/ana"
 
 
 def test_live_cli_fails_closed_in_ci_before_constructing_driver(tmp_path, monkeypatch):

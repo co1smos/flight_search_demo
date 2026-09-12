@@ -36,16 +36,25 @@ def build_cdp_url(websocket_url: str, steel_api_key: Optional[str]) -> str:
     return normalized
 
 
-def debugger_metadata_url(steel_base_url: str) -> str:
+def debugger_metadata_url(steel_base_url: str, *, debugger_port: int = 9223) -> str:
     parsed = urlparse(assert_private_url(steel_base_url))
     hostname = parsed.hostname or "127.0.0.1"
-    return f"http://{hostname}:9223/json/version"
+    if not 1 <= debugger_port <= 65535:
+        raise ValueError("debugger port must be between 1 and 65535")
+    return f"http://{hostname}:{debugger_port}/json/version"
 
 
-def build_debugger_cdp_url(debugger_websocket_url: str, steel_api_key: Optional[str]) -> str:
+def build_debugger_cdp_url(
+    debugger_websocket_url: str,
+    steel_api_key: Optional[str],
+    *,
+    debugger_port: int = 9223,
+) -> str:
     parsed = urlparse(assert_private_url(normalize_loopback_url(debugger_websocket_url)))
     hostname = parsed.hostname or "127.0.0.1"
-    netloc = f"{hostname}:9223"
+    if not 1 <= debugger_port <= 65535:
+        raise ValueError("debugger port must be between 1 and 65535")
+    netloc = f"{hostname}:{debugger_port}"
     if parsed.username:
         auth = parsed.username
         if parsed.password:
@@ -64,13 +73,17 @@ def discover_debugger_cdp_url(
     steel_api_key: Optional[str],
     *,
     timeout: float = 10.0,
+    debugger_port: int = 9223,
 ) -> str:
     with urllib.request.urlopen(
-        debugger_metadata_url(steel_base_url), timeout=max(timeout, 0.001)
+        debugger_metadata_url(steel_base_url, debugger_port=debugger_port),
+        timeout=max(timeout, 0.001),
     ) as response:
         payload = json.loads(response.read().decode("utf-8"))
     debugger_url = payload["webSocketDebuggerUrl"]
-    return build_debugger_cdp_url(debugger_url, steel_api_key)
+    return build_debugger_cdp_url(
+        debugger_url, steel_api_key, debugger_port=debugger_port
+    )
 
 
 def build_session_endpoints(session) -> SessionEndpoints:
