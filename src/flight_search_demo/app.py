@@ -423,11 +423,13 @@ class AeroplanFixtureAdapter:
 class AnaFixtureAdapter:
     def execute(
         self, criteria: NormalizedCriteria, atomic_task_id: str
-    ) -> Dict[str, str]:
-        return {
-            "status": "NO_AWARD_AVAILABILITY",
-            "detail": f"fixture found no qualifying itinerary via {atomic_task_id}",
-        }
+    ) -> Dict[str, Any]:
+        from .ana import AnaFixtureBrowser, AnaSearchAdapter
+
+        fixture = Path(__file__).parent / "fixtures" / "ana" / "no_availability.html"
+        return AnaSearchAdapter(browser=AnaFixtureBrowser(fixture)).execute(
+            criteria, atomic_task_id
+        )
 
 
 DEFAULT_ADAPTER_REGISTRY: Mapping[str, AwardProviderAdapter] = {
